@@ -5,8 +5,9 @@ cnc-ddraw can fix compatibility issues in older 2D games, such as black screen, 
 
 ### Features
 
- - Supports Windows ME, 2000, XP, Vista, 7, 8, 10, 11, Wine (Linux/macOS/Android) and Virtual Machines
+ - Supports Windows 10, Windows 11, Wine (Linux/macOS/Android) and Virtual Machines
  - GDI / OpenGL / Direct3D 9 renderer (With automatic renderer selection)
+ - Rust rewrite architecture prepared for future Vulkan / Direct3D 11 / Direct3D 12 backends
  - Upscaling via glsl shaders - https://imgur.com/a/kxsM1oY | https://imgur.com/a/wjrhpFV
  - Windowed Mode / Fullscreen Exclusive Mode / Borderless Mode
  - Alt+Enter support to switch quickly between Fullscreen and Windowed mode

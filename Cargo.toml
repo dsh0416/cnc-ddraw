@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ddraw-com",
+    "crates/ddraw-core",
+    "crates/ddraw-dll",
+    "crates/ddraw-hooks",
+    "crates/ddraw-platform",
+    "crates/ddraw-render",
+    "crates/ddraw-render-d3d9",
+    "crates/ddraw-render-gdi",
+    "crates/ddraw-render-opengl",
+]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/FunkyFr3sh/cnc-ddraw"
+rust-version = "1.80"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
