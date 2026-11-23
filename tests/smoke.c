@@ -2,6 +2,7 @@
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <initguid.h>
 #include <ddraw.h>
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +16,8 @@
 } } while (0)
 
 typedef HRESULT (WINAPI *CreateFn)(GUID *, IDirectDraw **, IUnknown *);
+typedef HRESULT (WINAPI *CreateExFn)(GUID *, void **, REFIID, IUnknown *);
+typedef HRESULT (WINAPI *CreateClipperFn)(DWORD, IDirectDrawClipper **, IUnknown *);
 
 static int exercise(IDirectDraw *draw, unsigned depth) {
     DDSURFACEDESC desc = {0}, lock = {0};
@@ -96,6 +99,141 @@ static int exercise(IDirectDraw *draw, unsigned depth) {
     return 0;
 }
 
+static int exercise_interfaces(HMODULE dll, HWND window) {
+    CreateExFn create_ex = (CreateExFn)GetProcAddress(dll, "DirectDrawCreateEx");
+    CreateClipperFn create_clipper = (CreateClipperFn)GetProcAddress(dll, "DirectDrawCreateClipper");
+    IDirectDraw7 *dd7 = NULL;
+    IDirectDraw4 *dd4 = NULL;
+    IDirectDraw2 *dd2 = NULL;
+    IDirectDraw *dd1 = NULL;
+    IDirectDrawSurface7 *surf7 = NULL, *from_dc = NULL;
+    IDirectDrawSurface4 *surf4 = NULL;
+    IDirectDrawSurface3 *surf3 = NULL;
+    IDirectDrawSurface2 *surf2 = NULL;
+    IDirectDrawGammaControl *gamma = NULL;
+    IDirectDrawClipper *clipper = NULL, *standalone_clipper = NULL, *attached_clipper = NULL;
+    DDSURFACEDESC2 desc2 = {0}, lock2 = {0};
+    DDSCAPS2 caps2 = {DDSCAPS_OFFSCREENPLAIN};
+    DDDEVICEIDENTIFIER2 devid2 = {0};
+    DDGAMMARAMP ramp = {0}, ramp_out = {0};
+    DDBLTFX fx = {0};
+    DWORD total = 0, free_mem = 0, uniq1 = 0, uniq2 = 0, prio = 0, lod = 0;
+    void *dd_iface = NULL;
+    HDC dc = NULL;
+    GUID tag = {0x11223344, 0x5566, 0x7788, {1, 2, 3, 4, 5, 6, 7, 8}};
+    DWORD payload = 0xdeadbeef, payload_out = 0, payload_size = sizeof(payload_out);
+    struct {
+        RGNDATAHEADER hdr;
+        RECT rc;
+    } rgn;
+
+    REQUIRE(create_ex && create_clipper);
+    CHECK(create_clipper(0, &standalone_clipper, NULL));
+    REQUIRE(IDirectDrawClipper_Release(standalone_clipper) == 0);
+
+    CHECK(create_ex(NULL, (void **)&dd7, &IID_IDirectDraw7, NULL));
+    CHECK(IDirectDraw7_QueryInterface(dd7, &IID_IDirectDraw4, (void **)&dd4));
+    CHECK(IDirectDraw7_QueryInterface(dd7, &IID_IDirectDraw2, (void **)&dd2));
+    CHECK(IDirectDraw7_QueryInterface(dd7, &IID_IDirectDraw, (void **)&dd1));
+    CHECK(IDirectDraw7_TestCooperativeLevel(dd7));
+    CHECK(IDirectDraw7_RestoreAllSurfaces(dd7));
+    CHECK(IDirectDraw7_GetDeviceIdentifier(dd7, &devid2, 0));
+    REQUIRE(strcmp(devid2.szDriver, "ddraw.dll") == 0);
+    CHECK(IDirectDraw7_GetAvailableVidMem(dd7, &caps2, &total, &free_mem));
+    REQUIRE(total > 0 && free_mem <= total);
+    CHECK(IDirectDraw7_SetDisplayMode(dd7, 64, 64, 32, 60, 0));
+    if (window) {
+        CHECK(IDirectDraw7_SetCooperativeLevel(dd7, window, DDSCL_NORMAL));
+    }
+
+    desc2.dwSize = sizeof(desc2);
+    desc2.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT;
+    desc2.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN;
+    desc2.dwWidth = 16;
+    desc2.dwHeight = 16;
+    CHECK(IDirectDraw7_CreateSurface(dd7, &desc2, &surf7, NULL));
+    CHECK(IDirectDrawSurface7_QueryInterface(surf7, &IID_IDirectDrawSurface4, (void **)&surf4));
+    CHECK(IDirectDrawSurface7_QueryInterface(surf7, &IID_IDirectDrawSurface3, (void **)&surf3));
+    CHECK(IDirectDrawSurface7_QueryInterface(surf7, &IID_IDirectDrawSurface2, (void **)&surf2));
+    CHECK(IDirectDrawSurface7_QueryInterface(surf7, &IID_IDirectDrawGammaControl, (void **)&gamma));
+
+    // Clipper: clip list + clipped colorfill Blt.
+    CHECK(IDirectDraw7_CreateClipper(dd7, 0, &clipper, NULL));
+    rgn.hdr.dwSize = sizeof(RGNDATAHEADER);
+    rgn.hdr.iType = RDH_RECTANGLES;
+    rgn.hdr.nCount = 1;
+    rgn.hdr.nRgnSize = sizeof(RECT);
+    rgn.hdr.rcBound.left = 2;
+    rgn.hdr.rcBound.top = 2;
+    rgn.hdr.rcBound.right = 6;
+    rgn.hdr.rcBound.bottom = 6;
+    rgn.rc = rgn.hdr.rcBound;
+    CHECK(IDirectDrawClipper_SetClipList(clipper, (RGNDATA *)&rgn, 0));
+    CHECK(IDirectDrawSurface7_SetClipper(surf7, clipper));
+    CHECK(IDirectDrawSurface7_GetClipper(surf7, &attached_clipper));
+    REQUIRE(attached_clipper == clipper);
+    IDirectDrawClipper_Release(attached_clipper);
+
+    fx.dwSize = sizeof(fx);
+    fx.dwFillColor = 0x00112233;
+    CHECK(IDirectDrawSurface7_Blt(surf7, NULL, NULL, NULL, DDBLT_COLORFILL, &fx));
+    lock2.dwSize = sizeof(lock2);
+    CHECK(IDirectDrawSurface7_Lock(surf7, NULL, &lock2, 0, NULL));
+    REQUIRE(((DWORD *)lock2.lpSurface)[0] == 0);
+    REQUIRE(*(DWORD *)((BYTE *)lock2.lpSurface + 2 * lock2.lPitch + 2 * 4) == 0x00112233);
+    CHECK(IDirectDrawSurface7_Unlock(surf7, NULL));
+
+    // Gamma control.
+    CHECK(IDirectDrawGammaControl_GetGammaRamp(gamma, 0, &ramp));
+    REQUIRE(ramp.red[255] == 0xffff && ramp.red[0] == 0);
+    ramp.red[10] = 0x4321;
+    CHECK(IDirectDrawGammaControl_SetGammaRamp(gamma, 0, &ramp));
+    CHECK(IDirectDrawGammaControl_GetGammaRamp(gamma, 0, &ramp_out));
+    REQUIRE(ramp_out.red[10] == 0x4321);
+
+    // GetSurfaceFromDC + GetDDInterface + PrivateData + Uniqueness + Priority + LOD.
+    CHECK(IDirectDrawSurface7_GetDC(surf7, &dc));
+    CHECK(IDirectDraw7_GetSurfaceFromDC(dd7, dc, &from_dc));
+    REQUIRE(from_dc != NULL);
+    IDirectDrawSurface7_Release(from_dc);
+    CHECK(IDirectDrawSurface7_ReleaseDC(surf7, dc));
+
+    CHECK(IDirectDrawSurface7_GetDDInterface(surf7, &dd_iface));
+    REQUIRE(dd_iface != NULL);
+    IUnknown_Release((IUnknown *)dd_iface);
+
+    CHECK(IDirectDrawSurface7_PageLock(surf7, 0));
+    CHECK(IDirectDrawSurface7_PageUnlock(surf7, 0));
+    CHECK(IDirectDrawSurface7_GetUniquenessValue(surf7, &uniq1));
+    CHECK(IDirectDrawSurface7_ChangeUniquenessValue(surf7));
+    CHECK(IDirectDrawSurface7_GetUniquenessValue(surf7, &uniq2));
+    REQUIRE(uniq2 != uniq1);
+    CHECK(IDirectDrawSurface7_SetPriority(surf7, 42));
+    CHECK(IDirectDrawSurface7_GetPriority(surf7, &prio));
+    REQUIRE(prio == 42);
+    CHECK(IDirectDrawSurface7_SetLOD(surf7, 3));
+    CHECK(IDirectDrawSurface7_GetLOD(surf7, &lod));
+    REQUIRE(lod == 3);
+    CHECK(IDirectDrawSurface7_SetPrivateData(surf7, &tag, &payload, sizeof(payload), 0));
+    CHECK(IDirectDrawSurface7_GetPrivateData(surf7, &tag, &payload_out, &payload_size));
+    REQUIRE(payload_out == payload && payload_size == sizeof(payload));
+    CHECK(IDirectDrawSurface7_FreePrivateData(surf7, &tag));
+    REQUIRE(FAILED(IDirectDrawSurface7_GetPrivateData(surf7, &tag, &payload_out, &payload_size)));
+
+    IDirectDrawClipper_Release(clipper);
+    IDirectDrawGammaControl_Release(gamma);
+    IDirectDrawSurface2_Release(surf2);
+    IDirectDrawSurface3_Release(surf3);
+    IDirectDrawSurface4_Release(surf4);
+    IDirectDrawSurface7_Release(surf7);
+    IDirectDraw_Release(dd1);
+    IDirectDraw2_Release(dd2);
+    IDirectDraw4_Release(dd4);
+    REQUIRE(IDirectDraw7_Release(dd7) == 0);
+    puts("passed DD2/4/7, Surface2/3/4/7, Clipper & GammaControl");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     wchar_t path[MAX_PATH];
     const DWORD len = GetModuleFileNameW(NULL, path, MAX_PATH);
@@ -146,6 +284,7 @@ int main(int argc, char **argv) {
     REQUIRE(exercise(draw, 32) == 0);
     CHECK(IDirectDraw_RestoreDisplayMode(draw));
     REQUIRE(IDirectDraw_Release(draw) == 0);
+    REQUIRE(exercise_interfaces(dll, window) == 0);
     if (window) DestroyWindow(window);
     FreeLibrary(dll);
     puts("x86 DirectDraw smoke test passed");

@@ -5,15 +5,16 @@ use std::ptr;
 use std::rc::{Rc, Weak};
 
 use windows::core::{
-    implement, s, w, Error, IUnknown, Interface, OutRef, Ref, Result, BOOL, GUID, HRESULT, PCWSTR,
+    implement, s, w, Error, IUnknown, IUnknownImpl, Interface, OutRef, Ref, Result, BOOL, GUID,
+    HRESULT, PCWSTR,
 };
 use windows::Win32::Foundation::{
     GetLastError, SetLastError, CLASS_E_NOAGGREGATION, ERROR_SUCCESS, E_FAIL, E_INVALIDARG,
-    E_NOINTERFACE, E_NOTIMPL, E_POINTER, HANDLE, HWND, S_OK,
+    E_NOINTERFACE, E_NOTIMPL, E_POINTER, HANDLE, HWND, SIZE, S_OK,
 };
 use windows::Win32::Graphics::DirectDraw::*;
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, DEVMODEW, ENUM_CURRENT_SETTINGS,
+    EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, DEVMODEW, ENUM_CURRENT_SETTINGS, HDC,
     HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, PALETTEENTRY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -23,11 +24,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_STATICEDGE, WS_EX_WINDOWEDGE, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
-use crate::{palette, renderer::Renderer, surface};
+use crate::{clipper, palette, renderer::Renderer, surface};
 
 const DEFAULT_MODE: (u32, u32, u32) = (640, 480, 32);
-const ALREADY_INITIALIZED: HRESULT = HRESULT(0x88760005_u32 as i32);
-const SURFACE_BUSY: HRESULT = HRESULT(0x887601ae_u32 as i32);
+const VIRTUAL_VIDMEM_BYTES: u32 = 64 * 1024 * 1024;
+const ALREADY_INITIALIZED: HRESULT = HRESULT(0x8876_0005_u32 as i32);
+const DDERR_CURRENTLYNOTAVAIL: HRESULT = HRESULT(0x8876_0028_u32 as i32);
+const DDERR_INVALIDOBJECT: HRESULT = HRESULT(0x8876_0082_u32 as i32);
+const DDERR_NOTFOUND: HRESULT = HRESULT(0x8876_00ff_u32 as i32);
+const SURFACE_BUSY: HRESULT = HRESULT(0x8876_01ae_u32 as i32);
 
 pub struct Display {
     pub width: u32,
@@ -36,9 +41,47 @@ pub struct Display {
     renderer: Option<Renderer>,
     rgba: Vec<u8>,
     pub primary: Weak<RefCell<surface::SurfaceData>>,
+    surfaces: Vec<(*mut c_void, Weak<RefCell<surface::SurfaceData>>)>,
 }
 
 impl Display {
+    pub fn register_surface(
+        &mut self,
+        raw: *mut c_void,
+        data: Weak<RefCell<surface::SurfaceData>>,
+    ) {
+        self.surfaces.retain(|(_, w)| w.upgrade().is_some());
+        self.surfaces.push((raw, data));
+    }
+
+    pub fn unregister_surface(&mut self, raw: *mut c_void) {
+        self.surfaces.retain(|(p, _)| *p != raw);
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        self.surfaces
+            .iter()
+            .filter_map(|(_, w)| w.upgrade())
+            .filter_map(|d| d.try_borrow().ok().map(|s| s.byte_len()))
+            .sum()
+    }
+
+    pub fn find_surface_by_dc(&self, hdc: HDC) -> Option<IDirectDrawSurface> {
+        if hdc.is_invalid() {
+            return None;
+        }
+        for (raw, weak) in &self.surfaces {
+            let Some(data) = weak.upgrade() else {
+                continue;
+            };
+            let matches = data.try_borrow().is_ok_and(|s| s.has_dc(hdc));
+            if matches {
+                return unsafe { IDirectDrawSurface::from_raw_borrowed(raw) }.cloned();
+            }
+        }
+        None
+    }
+
     pub fn refresh(&mut self) -> Result<()> {
         let (Some(renderer), Some(primary)) = (&mut self.renderer, self.primary.upgrade()) else {
             return Ok(());
@@ -155,7 +198,7 @@ impl SavedWindow {
     }
 }
 
-#[implement(IDirectDraw, Agile = false)]
+#[implement(IDirectDraw, IDirectDraw2, IDirectDraw4, IDirectDraw7, Agile = false)]
 struct Draw {
     display: Rc<RefCell<Display>>,
     hwnd: Cell<HWND>,
@@ -174,6 +217,7 @@ impl Draw {
                 renderer: None,
                 rgba: Vec::new(),
                 primary: Weak::new(),
+                surfaces: Vec::new(),
             })),
             hwnd: Cell::new(HWND::default()),
             fullscreen: Cell::new(None),
@@ -211,6 +255,13 @@ fn check_desc(desc: *const DDSURFACEDESC) -> Result<()> {
     Ok(())
 }
 
+fn check_desc2(desc: *const DDSURFACEDESC2) -> Result<()> {
+    if desc.is_null() || unsafe { (*desc).dwSize } != size_of::<DDSURFACEDESC2>() as u32 {
+        return Err(E_INVALIDARG.into());
+    }
+    Ok(())
+}
+
 fn put_interface<T>(out: OutRef<T>, make: impl FnOnce() -> Result<T>) -> Result<()>
 where
     T: Interface + windows_core::Type<T, Default = Option<T>>,
@@ -235,36 +286,29 @@ fn no_aggregation(outer: Ref<IUnknown>) -> Result<()> {
     }
 }
 
-#[allow(non_snake_case)]
-impl IDirectDraw_Impl for Draw_Impl {
-    fn Compact(&self) -> Result<()> {
-        Ok(())
+fn write_cstr(dst: &mut [i8], text: &str) {
+    dst.fill(0);
+    let max = dst.len().saturating_sub(1);
+    for (slot, byte) in dst.iter_mut().zip(text.bytes()).take(max) {
+        *slot = byte as i8;
+    }
+}
+
+fn fill_device_identifier() -> DDDEVICEIDENTIFIER {
+    let mut id = DDDEVICEIDENTIFIER::default();
+    write_cstr(&mut id.szDriver, "ddraw.dll");
+    write_cstr(&mut id.szDescription, "cnc-ddraw wgpu");
+    id.liDriverVersion = 0x0001_0000_0000_0000;
+    id.guidDeviceIdentifier = GUID::from_u128(0x636e6364_6472_6177_7767_707530303031);
+    id
+}
+
+impl Draw_Impl {
+    fn parent_interface(&self) -> IDirectDraw {
+        self.as_interface::<IDirectDraw>().to_owned()
     }
 
-    fn CreateClipper(
-        &self,
-        _: u32,
-        out: OutRef<IDirectDrawClipper>,
-        outer: Ref<IUnknown>,
-    ) -> Result<()> {
-        put_interface(out, || {
-            no_aggregation(outer)?;
-            Err(E_NOTIMPL.into())
-        })
-    }
-    fn CreatePalette(
-        &self,
-        flags: u32,
-        entries: *mut PALETTEENTRY,
-        out: OutRef<IDirectDrawPalette>,
-        outer: Ref<IUnknown>,
-    ) -> Result<()> {
-        put_interface(out, || {
-            no_aggregation(outer)?;
-            palette::create_palette(flags, entries, self.display.clone())
-        })
-    }
-    fn CreateSurface(
+    fn create_surface_v1(
         &self,
         desc: *mut DDSURFACEDESC,
         out: OutRef<IDirectDrawSurface>,
@@ -273,30 +317,42 @@ impl IDirectDraw_Impl for Draw_Impl {
         put_interface(out, || {
             no_aggregation(outer)?;
             check_desc(desc)?;
-            surface::create_surface(self.display.clone(), unsafe { &*desc })
+            surface::create_surface(
+                Some(self.parent_interface()),
+                self.display.clone(),
+                unsafe { &*desc },
+            )
         })
     }
-    fn DuplicateSurface(&self, _: Ref<IDirectDrawSurface>) -> Result<IDirectDrawSurface> {
-        Err(E_NOTIMPL.into())
+
+    fn create_surface_v2<S>(
+        &self,
+        desc: *mut DDSURFACEDESC2,
+        out: OutRef<S>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()>
+    where
+        S: Interface + windows_core::Type<S, Default = Option<S>>,
+    {
+        put_interface(out, || {
+            no_aggregation(outer)?;
+            check_desc2(desc)?;
+            let d1 = surface::desc2_to_desc(unsafe { &*desc })?;
+            let surf =
+                surface::create_surface(Some(self.parent_interface()), self.display.clone(), &d1)?;
+            surf.cast::<S>()
+        })
     }
 
-    fn EnumDisplayModes(
+    fn enum_display_modes_impl(
         &self,
         flags: u32,
-        filter: *mut DDSURFACEDESC,
-        context: *mut c_void,
-        callback: LPDDENUMMODESCALLBACK,
+        filter: DDSURFACEDESC,
+        mut emit: impl FnMut(&mut DDSURFACEDESC) -> i32,
     ) -> Result<()> {
         if flags != 0 {
             return Err(E_NOTIMPL.into());
         }
-        let callback = callback.ok_or(E_INVALIDARG)?;
-        let filter = if filter.is_null() {
-            DDSURFACEDESC::default()
-        } else {
-            check_desc(filter)?;
-            unsafe { *filter }
-        };
         if filter.dwFlags & !((DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT) as u32) != 0 {
             return Err(E_NOTIMPL.into());
         }
@@ -342,12 +398,100 @@ impl IDirectDraw_Impl for Draw_Impl {
                         continue;
                     }
                 }
-                if unsafe { callback(&mut mode, context) }.0 == DDENUMRET_CANCEL as i32 {
+                if emit(&mut mode) == DDENUMRET_CANCEL as i32 {
                     return Ok(());
                 }
             }
         }
         Ok(())
+    }
+
+    fn get_available_vid_mem_impl(&self, total: *mut u32, free: *mut u32) -> Result<()> {
+        if total.is_null() && free.is_null() {
+            return Err(E_INVALIDARG.into());
+        }
+        let used = self
+            .display
+            .try_borrow()
+            .map_err(|_| SURFACE_BUSY)?
+            .allocated_bytes()
+            .min(VIRTUAL_VIDMEM_BYTES as usize) as u32;
+        if let Some(total) = unsafe { total.as_mut() } {
+            *total = VIRTUAL_VIDMEM_BYTES;
+        }
+        if let Some(free) = unsafe { free.as_mut() } {
+            *free = VIRTUAL_VIDMEM_BYTES.saturating_sub(used);
+        }
+        Ok(())
+    }
+
+    fn get_surface_from_dc_impl<S: Interface>(&self, hdc: HDC) -> Result<S> {
+        let surface = self
+            .display
+            .try_borrow()
+            .map_err(|_| SURFACE_BUSY)?
+            .find_surface_by_dc(hdc)
+            .ok_or(DDERR_NOTFOUND)?;
+        surface.cast::<S>()
+    }
+}
+
+#[allow(non_snake_case)]
+impl IDirectDraw_Impl for Draw_Impl {
+    fn Compact(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn CreateClipper(
+        &self,
+        flags: u32,
+        out: OutRef<IDirectDrawClipper>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        put_interface(out, || {
+            no_aggregation(outer)?;
+            clipper::create_clipper(flags, Some(self.display.clone()))
+        })
+    }
+    fn CreatePalette(
+        &self,
+        flags: u32,
+        entries: *mut PALETTEENTRY,
+        out: OutRef<IDirectDrawPalette>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        put_interface(out, || {
+            no_aggregation(outer)?;
+            palette::create_palette(flags, entries, self.display.clone())
+        })
+    }
+    fn CreateSurface(
+        &self,
+        desc: *mut DDSURFACEDESC,
+        out: OutRef<IDirectDrawSurface>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        self.create_surface_v1(desc, out, outer)
+    }
+    fn DuplicateSurface(&self, _: Ref<IDirectDrawSurface>) -> Result<IDirectDrawSurface> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn EnumDisplayModes(
+        &self,
+        flags: u32,
+        filter: *mut DDSURFACEDESC,
+        context: *mut c_void,
+        callback: LPDDENUMMODESCALLBACK,
+    ) -> Result<()> {
+        let callback = callback.ok_or(E_INVALIDARG)?;
+        let filter = if filter.is_null() {
+            DDSURFACEDESC::default()
+        } else {
+            check_desc(filter)?;
+            unsafe { *filter }
+        };
+        self.enum_display_modes_impl(flags, filter, |mode| unsafe { callback(mode, context).0 })
     }
 
     fn EnumSurfaces(
@@ -398,8 +542,11 @@ impl IDirectDraw_Impl for Draw_Impl {
                     | DDCAPS_COLORKEY
                     | DDCAPS_CANBLTSYSMEM
                     | DDCAPS_PALETTE) as u32;
+                caps.dwCaps2 = DDCAPS2_PRIMARYGAMMA as u32;
                 caps.dwCKeyCaps = DDCKEYCAPS_SRCBLT as u32;
                 caps.dwPalCaps = (DDPCAPS_8BIT | DDPCAPS_ALLOW256) as u32;
+                caps.dwVidMemTotal = VIRTUAL_VIDMEM_BYTES;
+                caps.dwVidMemFree = VIRTUAL_VIDMEM_BYTES;
                 caps.ddsOldCaps.dwCaps = (DDSCAPS_PRIMARYSURFACE
                     | DDSCAPS_OFFSCREENPLAIN
                     | DDSCAPS_SYSTEMMEMORY
@@ -550,6 +697,404 @@ impl IDirectDraw_Impl for Draw_Impl {
     }
 }
 
+#[allow(non_snake_case)]
+impl IDirectDraw2_Impl for Draw_Impl {
+    fn Compact(&self) -> Result<()> {
+        IDirectDraw_Impl::Compact(self)
+    }
+    fn CreateClipper(
+        &self,
+        flags: u32,
+        out: OutRef<IDirectDrawClipper>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        IDirectDraw_Impl::CreateClipper(self, flags, out, outer)
+    }
+    fn CreatePalette(
+        &self,
+        flags: u32,
+        entries: *mut PALETTEENTRY,
+        out: OutRef<IDirectDrawPalette>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        IDirectDraw_Impl::CreatePalette(self, flags, entries, out, outer)
+    }
+    fn CreateSurface(
+        &self,
+        desc: *mut DDSURFACEDESC,
+        out: OutRef<IDirectDrawSurface>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        self.create_surface_v1(desc, out, outer)
+    }
+    fn DuplicateSurface(&self, src: Ref<IDirectDrawSurface>) -> Result<IDirectDrawSurface> {
+        IDirectDraw_Impl::DuplicateSurface(self, src)
+    }
+    fn EnumDisplayModes(
+        &self,
+        flags: u32,
+        filter: *mut DDSURFACEDESC,
+        context: *mut c_void,
+        callback: LPDDENUMMODESCALLBACK,
+    ) -> Result<()> {
+        IDirectDraw_Impl::EnumDisplayModes(self, flags, filter, context, callback)
+    }
+    fn EnumSurfaces(
+        &self,
+        flags: u32,
+        desc: *mut DDSURFACEDESC,
+        context: *mut c_void,
+        callback: LPDDENUMSURFACESCALLBACK,
+    ) -> Result<()> {
+        IDirectDraw_Impl::EnumSurfaces(self, flags, desc, context, callback)
+    }
+    fn FlipToGDISurface(&self) -> Result<()> {
+        IDirectDraw_Impl::FlipToGDISurface(self)
+    }
+    fn GetCaps(&self, driver: *mut DDCAPS_DX7, software: *mut DDCAPS_DX7) -> Result<()> {
+        IDirectDraw_Impl::GetCaps(self, driver, software)
+    }
+    fn GetDisplayMode(&self, desc: *mut DDSURFACEDESC) -> Result<()> {
+        IDirectDraw_Impl::GetDisplayMode(self, desc)
+    }
+    fn GetFourCCCodes(&self, count: *mut u32, codes: *mut u32) -> Result<()> {
+        IDirectDraw_Impl::GetFourCCCodes(self, count, codes)
+    }
+    fn GetGDISurface(&self) -> Result<IDirectDrawSurface> {
+        IDirectDraw_Impl::GetGDISurface(self)
+    }
+    fn GetMonitorFrequency(&self, output: *mut u32) -> Result<()> {
+        IDirectDraw_Impl::GetMonitorFrequency(self, output)
+    }
+    fn GetScanLine(&self, line: *mut u32) -> Result<()> {
+        IDirectDraw_Impl::GetScanLine(self, line)
+    }
+    fn GetVerticalBlankStatus(&self, status: *mut BOOL) -> Result<()> {
+        IDirectDraw_Impl::GetVerticalBlankStatus(self, status)
+    }
+    fn Initialize(&self, guid: *mut GUID) -> Result<()> {
+        IDirectDraw_Impl::Initialize(self, guid)
+    }
+    fn RestoreDisplayMode(&self) -> Result<()> {
+        IDirectDraw_Impl::RestoreDisplayMode(self)
+    }
+    fn SetCooperativeLevel(&self, hwnd: HWND, flags: u32) -> Result<()> {
+        IDirectDraw_Impl::SetCooperativeLevel(self, hwnd, flags)
+    }
+    fn SetDisplayMode(
+        &self,
+        width: u32,
+        height: u32,
+        bpp: u32,
+        _refresh_rate: u32,
+        _flags: u32,
+    ) -> Result<()> {
+        IDirectDraw_Impl::SetDisplayMode(self, width, height, bpp)
+    }
+    fn WaitForVerticalBlank(&self, flags: u32, event: HANDLE) -> Result<()> {
+        IDirectDraw_Impl::WaitForVerticalBlank(self, flags, event)
+    }
+    fn GetAvailableVidMem(
+        &self,
+        caps: *mut DDSCAPS,
+        total: *mut u32,
+        free: *mut u32,
+    ) -> Result<()> {
+        if caps.is_null() {
+            return Err(E_INVALIDARG.into());
+        }
+        self.get_available_vid_mem_impl(total, free)
+    }
+}
+
+#[allow(non_snake_case)]
+impl IDirectDraw4_Impl for Draw_Impl {
+    fn Compact(&self) -> Result<()> {
+        IDirectDraw_Impl::Compact(self)
+    }
+    fn CreateClipper(
+        &self,
+        flags: u32,
+        out: OutRef<IDirectDrawClipper>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        IDirectDraw_Impl::CreateClipper(self, flags, out, outer)
+    }
+    fn CreatePalette(
+        &self,
+        flags: u32,
+        entries: *mut PALETTEENTRY,
+        out: OutRef<IDirectDrawPalette>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        IDirectDraw_Impl::CreatePalette(self, flags, entries, out, outer)
+    }
+    fn CreateSurface(
+        &self,
+        desc: *mut DDSURFACEDESC2,
+        out: OutRef<IDirectDrawSurface4>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        self.create_surface_v2(desc, out, outer)
+    }
+    fn DuplicateSurface(&self, _: Ref<IDirectDrawSurface4>) -> Result<IDirectDrawSurface4> {
+        Err(E_NOTIMPL.into())
+    }
+    fn EnumDisplayModes(
+        &self,
+        flags: u32,
+        filter: *mut DDSURFACEDESC2,
+        context: *mut c_void,
+        callback: LPDDENUMMODESCALLBACK2,
+    ) -> Result<()> {
+        let callback = callback.ok_or(E_INVALIDARG)?;
+        let filter = if filter.is_null() {
+            DDSURFACEDESC::default()
+        } else {
+            check_desc2(filter)?;
+            surface::desc2_to_desc(unsafe { &*filter })?
+        };
+        self.enum_display_modes_impl(flags, filter, |mode| {
+            let mut mode2 = surface::desc_to_desc2(mode);
+            unsafe { callback(&mut mode2, context).0 }
+        })
+    }
+    fn EnumSurfaces(
+        &self,
+        _: u32,
+        _: *mut DDSURFACEDESC2,
+        _: *mut c_void,
+        _: LPDDENUMSURFACESCALLBACK2,
+    ) -> Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn FlipToGDISurface(&self) -> Result<()> {
+        IDirectDraw_Impl::FlipToGDISurface(self)
+    }
+    fn GetCaps(&self, driver: *mut DDCAPS_DX7, software: *mut DDCAPS_DX7) -> Result<()> {
+        IDirectDraw_Impl::GetCaps(self, driver, software)
+    }
+    fn GetDisplayMode(&self, desc: *mut DDSURFACEDESC2) -> Result<()> {
+        check_desc2(desc)?;
+        let d = self.display.try_borrow().map_err(|_| SURFACE_BUSY)?;
+        let mode = mode_description(d.width, d.height, d.bpp)?;
+        unsafe { desc.write(surface::desc_to_desc2(&mode)) };
+        Ok(())
+    }
+    fn GetFourCCCodes(&self, count: *mut u32, codes: *mut u32) -> Result<()> {
+        IDirectDraw_Impl::GetFourCCCodes(self, count, codes)
+    }
+    fn GetGDISurface(&self) -> Result<IDirectDrawSurface4> {
+        IDirectDraw_Impl::GetGDISurface(self)?.cast()
+    }
+    fn GetMonitorFrequency(&self, output: *mut u32) -> Result<()> {
+        IDirectDraw_Impl::GetMonitorFrequency(self, output)
+    }
+    fn GetScanLine(&self, line: *mut u32) -> Result<()> {
+        IDirectDraw_Impl::GetScanLine(self, line)
+    }
+    fn GetVerticalBlankStatus(&self, status: *mut BOOL) -> Result<()> {
+        IDirectDraw_Impl::GetVerticalBlankStatus(self, status)
+    }
+    fn Initialize(&self, guid: *mut GUID) -> Result<()> {
+        IDirectDraw_Impl::Initialize(self, guid)
+    }
+    fn RestoreDisplayMode(&self) -> Result<()> {
+        IDirectDraw_Impl::RestoreDisplayMode(self)
+    }
+    fn SetCooperativeLevel(&self, hwnd: HWND, flags: u32) -> Result<()> {
+        IDirectDraw_Impl::SetCooperativeLevel(self, hwnd, flags)
+    }
+    fn SetDisplayMode(
+        &self,
+        width: u32,
+        height: u32,
+        bpp: u32,
+        _refresh_rate: u32,
+        _flags: u32,
+    ) -> Result<()> {
+        IDirectDraw_Impl::SetDisplayMode(self, width, height, bpp)
+    }
+    fn WaitForVerticalBlank(&self, flags: u32, event: HANDLE) -> Result<()> {
+        IDirectDraw_Impl::WaitForVerticalBlank(self, flags, event)
+    }
+    fn GetAvailableVidMem(
+        &self,
+        caps: *mut DDSCAPS2,
+        total: *mut u32,
+        free: *mut u32,
+    ) -> Result<()> {
+        if caps.is_null() {
+            return Err(E_INVALIDARG.into());
+        }
+        self.get_available_vid_mem_impl(total, free)
+    }
+    fn GetSurfaceFromDC(&self, hdc: HDC) -> Result<IDirectDrawSurface4> {
+        self.get_surface_from_dc_impl(hdc)
+    }
+    fn RestoreAllSurfaces(&self) -> Result<()> {
+        Ok(())
+    }
+    fn TestCooperativeLevel(&self) -> Result<()> {
+        Ok(())
+    }
+    fn GetDeviceIdentifier(&self, out: *mut DDDEVICEIDENTIFIER, flags: u32) -> Result<()> {
+        if flags & !(DDGDI_GETHOSTIDENTIFIER as u32) != 0 {
+            return Err(E_INVALIDARG.into());
+        }
+        let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
+        *out = fill_device_identifier();
+        Ok(())
+    }
+}
+
+#[allow(non_snake_case)]
+impl IDirectDraw7_Impl for Draw_Impl {
+    fn Compact(&self) -> Result<()> {
+        IDirectDraw_Impl::Compact(self)
+    }
+    fn CreateClipper(
+        &self,
+        flags: u32,
+        out: OutRef<IDirectDrawClipper>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        IDirectDraw_Impl::CreateClipper(self, flags, out, outer)
+    }
+    fn CreatePalette(
+        &self,
+        flags: u32,
+        entries: *mut PALETTEENTRY,
+        out: OutRef<IDirectDrawPalette>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        IDirectDraw_Impl::CreatePalette(self, flags, entries, out, outer)
+    }
+    fn CreateSurface(
+        &self,
+        desc: *mut DDSURFACEDESC2,
+        out: OutRef<IDirectDrawSurface7>,
+        outer: Ref<IUnknown>,
+    ) -> Result<()> {
+        self.create_surface_v2(desc, out, outer)
+    }
+    fn DuplicateSurface(&self, _: Ref<IDirectDrawSurface7>) -> Result<IDirectDrawSurface7> {
+        Err(E_NOTIMPL.into())
+    }
+    fn EnumDisplayModes(
+        &self,
+        flags: u32,
+        filter: *mut DDSURFACEDESC2,
+        context: *mut c_void,
+        callback: LPDDENUMMODESCALLBACK2,
+    ) -> Result<()> {
+        IDirectDraw4_Impl::EnumDisplayModes(self, flags, filter, context, callback)
+    }
+    fn EnumSurfaces(
+        &self,
+        _: u32,
+        _: *mut DDSURFACEDESC2,
+        _: *mut c_void,
+        _: LPDDENUMSURFACESCALLBACK7,
+    ) -> Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn FlipToGDISurface(&self) -> Result<()> {
+        IDirectDraw_Impl::FlipToGDISurface(self)
+    }
+    fn GetCaps(&self, driver: *mut DDCAPS_DX7, software: *mut DDCAPS_DX7) -> Result<()> {
+        IDirectDraw_Impl::GetCaps(self, driver, software)
+    }
+    fn GetDisplayMode(&self, desc: *mut DDSURFACEDESC2) -> Result<()> {
+        IDirectDraw4_Impl::GetDisplayMode(self, desc)
+    }
+    fn GetFourCCCodes(&self, count: *mut u32, codes: *mut u32) -> Result<()> {
+        IDirectDraw_Impl::GetFourCCCodes(self, count, codes)
+    }
+    fn GetGDISurface(&self) -> Result<IDirectDrawSurface7> {
+        IDirectDraw_Impl::GetGDISurface(self)?.cast()
+    }
+    fn GetMonitorFrequency(&self, output: *mut u32) -> Result<()> {
+        IDirectDraw_Impl::GetMonitorFrequency(self, output)
+    }
+    fn GetScanLine(&self, line: *mut u32) -> Result<()> {
+        IDirectDraw_Impl::GetScanLine(self, line)
+    }
+    fn GetVerticalBlankStatus(&self, status: *mut BOOL) -> Result<()> {
+        IDirectDraw_Impl::GetVerticalBlankStatus(self, status)
+    }
+    fn Initialize(&self, guid: *mut GUID) -> Result<()> {
+        IDirectDraw_Impl::Initialize(self, guid)
+    }
+    fn RestoreDisplayMode(&self) -> Result<()> {
+        IDirectDraw_Impl::RestoreDisplayMode(self)
+    }
+    fn SetCooperativeLevel(&self, hwnd: HWND, flags: u32) -> Result<()> {
+        IDirectDraw_Impl::SetCooperativeLevel(self, hwnd, flags)
+    }
+    fn SetDisplayMode(
+        &self,
+        width: u32,
+        height: u32,
+        bpp: u32,
+        refresh_rate: u32,
+        flags: u32,
+    ) -> Result<()> {
+        IDirectDraw4_Impl::SetDisplayMode(self, width, height, bpp, refresh_rate, flags)
+    }
+    fn WaitForVerticalBlank(&self, flags: u32, event: HANDLE) -> Result<()> {
+        IDirectDraw_Impl::WaitForVerticalBlank(self, flags, event)
+    }
+    fn GetAvailableVidMem(
+        &self,
+        caps: *mut DDSCAPS2,
+        total: *mut u32,
+        free: *mut u32,
+    ) -> Result<()> {
+        IDirectDraw4_Impl::GetAvailableVidMem(self, caps, total, free)
+    }
+    fn GetSurfaceFromDC(&self, hdc: HDC) -> Result<IDirectDrawSurface7> {
+        self.get_surface_from_dc_impl(hdc)
+    }
+    fn RestoreAllSurfaces(&self) -> Result<()> {
+        Ok(())
+    }
+    fn TestCooperativeLevel(&self) -> Result<()> {
+        Ok(())
+    }
+    fn GetDeviceIdentifier(&self, out: *mut DDDEVICEIDENTIFIER2, flags: u32) -> Result<()> {
+        if flags & !(DDGDI_GETHOSTIDENTIFIER as u32) != 0 {
+            return Err(E_INVALIDARG.into());
+        }
+        let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
+        let base = fill_device_identifier();
+        *out = DDDEVICEIDENTIFIER2 {
+            szDriver: base.szDriver,
+            szDescription: base.szDescription,
+            liDriverVersion: base.liDriverVersion,
+            dwVendorId: base.dwVendorId,
+            dwDeviceId: base.dwDeviceId,
+            dwSubSysId: base.dwSubSysId,
+            dwRevision: base.dwRevision,
+            guidDeviceIdentifier: base.guidDeviceIdentifier,
+            dwWHQLLevel: 0,
+        };
+        Ok(())
+    }
+    fn StartModeTest(&self, _: *mut SIZE, _: u32, _: u32) -> Result<()> {
+        Err(DDERR_CURRENTLYNOTAVAIL.into())
+    }
+    fn EvaluateMode(&self, _: u32, _: *mut u32) -> Result<()> {
+        Err(DDERR_INVALIDOBJECT.into())
+    }
+}
+
+fn valid_device_guid(device: *const GUID) -> bool {
+    device.is_null()
+        || device as usize == DDCREATE_HARDWAREONLY as usize
+        || device as usize == DDCREATE_EMULATIONONLY as usize
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DirectDrawCreate(
     device: *const GUID,
@@ -563,7 +1108,7 @@ pub unsafe extern "system" fn DirectDrawCreate(
     if !outer.is_null() {
         return CLASS_E_NOAGGREGATION;
     }
-    if !device.is_null() {
+    if !valid_device_guid(device) {
         return E_INVALIDARG;
     }
     let device: IDirectDraw = Draw::new().into();
@@ -573,7 +1118,7 @@ pub unsafe extern "system" fn DirectDrawCreate(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DirectDrawCreateEx(
-    _: *const GUID,
+    device: *const GUID,
     out: *mut *mut c_void,
     iid: *const GUID,
     outer: *mut c_void,
@@ -588,13 +1133,21 @@ pub unsafe extern "system" fn DirectDrawCreateEx(
     if !outer.is_null() {
         return CLASS_E_NOAGGREGATION;
     }
-    // This entry point requires IDirectDraw7.
-    E_NOINTERFACE
+    if !valid_device_guid(device) {
+        return E_INVALIDARG;
+    }
+    let requested = unsafe { *iid };
+    if requested != IDirectDraw7::IID {
+        return E_NOINTERFACE;
+    }
+    let dd: IDirectDraw7 = Draw::new().into();
+    unsafe { out.write(dd.into_raw()) };
+    S_OK
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DirectDrawCreateClipper(
-    _: u32,
+    flags: u32,
     out: *mut *mut c_void,
     outer: *mut c_void,
 ) -> HRESULT {
@@ -605,7 +1158,13 @@ pub unsafe extern "system" fn DirectDrawCreateClipper(
     if !outer.is_null() {
         return CLASS_E_NOAGGREGATION;
     }
-    E_NOTIMPL
+    match clipper::create_clipper(flags, None) {
+        Ok(clipper) => {
+            unsafe { out.write(clipper.into_raw()) };
+            S_OK
+        }
+        Err(error) => error.code(),
+    }
 }
 
 #[unsafe(no_mangle)]
