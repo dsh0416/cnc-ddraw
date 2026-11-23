@@ -1,0 +1,22 @@
+[package]
+name = "cnc-ddraw"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "ddraw"
+crate-type = ["cdylib"]
+
+[dependencies]
+pollster = "0.4"
+raw-window-handle = "0.6.2"
+wgpu = { version = "27.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"] }
+windows-core = "0.62.2"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_DirectDraw",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
