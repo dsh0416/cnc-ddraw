@@ -1,8 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::mem::size_of;
+use std::mem::{size_of, ManuallyDrop};
 use std::ptr;
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 use windows::core::{
     implement, s, w, Error, IUnknown, IUnknownImpl, Interface, OutRef, Ref, Result, BOOL, GUID,
@@ -33,6 +34,7 @@ const DDERR_CURRENTLYNOTAVAIL: HRESULT = HRESULT(0x8876_0028_u32 as i32);
 const DDERR_INVALIDOBJECT: HRESULT = HRESULT(0x8876_0082_u32 as i32);
 const DDERR_NOTFOUND: HRESULT = HRESULT(0x8876_00ff_u32 as i32);
 const SURFACE_BUSY: HRESULT = HRESULT(0x8876_01ae_u32 as i32);
+const DDERR_VERTICALBLANKINPROGRESS: HRESULT = HRESULT(0x8876_0219_u32 as i32);
 
 pub struct Display {
     pub width: u32,
@@ -64,6 +66,28 @@ impl Display {
             .filter_map(|(_, w)| w.upgrade())
             .filter_map(|d| d.try_borrow().ok().map(|s| s.byte_len()))
             .sum()
+    }
+
+    pub fn live_surfaces(&self) -> Vec<IDirectDrawSurface> {
+        self.surfaces
+            .iter()
+            .filter_map(|(raw, weak)| {
+                weak.upgrade()?;
+                unsafe { IDirectDrawSurface::from_raw_borrowed(raw) }.cloned()
+            })
+            .collect()
+    }
+
+    pub fn primary_surface(&self) -> Option<IDirectDrawSurface> {
+        for (raw, weak) in &self.surfaces {
+            let Some(data) = weak.upgrade() else {
+                continue;
+            };
+            if data.try_borrow().is_ok_and(|s| s.is_primary()) {
+                return unsafe { IDirectDrawSurface::from_raw_borrowed(raw) }.cloned();
+            }
+        }
+        None
     }
 
     pub fn find_surface_by_dc(&self, hdc: HDC) -> Option<IDirectDrawSurface> {
@@ -204,6 +228,7 @@ struct Draw {
     hwnd: Cell<HWND>,
     fullscreen: Cell<Option<SavedWindow>>,
     changing_window: RefCell<()>,
+    vblank_epoch: Instant,
 }
 
 impl Draw {
@@ -222,6 +247,7 @@ impl Draw {
             hwnd: Cell::new(HWND::default()),
             fullscreen: Cell::new(None),
             changing_window: RefCell::new(()),
+            vblank_epoch: Instant::now(),
         }
     }
 }
@@ -308,6 +334,31 @@ impl Draw_Impl {
         self.as_interface::<IDirectDraw>().to_owned()
     }
 
+    fn monitor_hz(&self) -> u32 {
+        let mut hz = 0u32;
+        if IDirectDraw_Impl::GetMonitorFrequency(self, &mut hz).is_ok() && (24..=500).contains(&hz)
+        {
+            hz
+        } else {
+            60
+        }
+    }
+
+    /// Returns `(phase_us, active_end_us, frame_us, display_height)`.
+    fn frame_timing(&self) -> (u64, u64, u64, u32) {
+        let hz = self.monitor_hz() as u64;
+        let frame_us = (1_000_000 / hz).max(1_000);
+        let active_end_us = frame_us * 92 / 100;
+        let elapsed_us = self.vblank_epoch.elapsed().as_micros() as u64;
+        let phase_us = elapsed_us % frame_us;
+        let height = self
+            .display
+            .try_borrow()
+            .map(|d| d.height.max(1))
+            .unwrap_or(480);
+        (phase_us, active_end_us, frame_us, height)
+    }
+
     fn create_surface_v1(
         &self,
         desc: *mut DDSURFACEDESC,
@@ -344,21 +395,94 @@ impl Draw_Impl {
         })
     }
 
+    fn duplicate_surface_impl<S: Interface>(&self, src: Ref<S>) -> Result<S> {
+        let src_v1 = src.ok()?.cast::<IDirectDrawSurface>()?;
+        let dup = surface::duplicate_surface(
+            Some(self.parent_interface()),
+            self.display.clone(),
+            &src_v1,
+        )?;
+        dup.cast::<S>()
+    }
+
+    fn enum_surfaces_impl<S: Interface>(
+        &self,
+        flags: u32,
+        filter: Option<DDSURFACEDESC>,
+        mut emit: impl FnMut(S, &mut DDSURFACEDESC) -> i32,
+    ) -> Result<()> {
+        let allowed = (DDENUMSURFACES_ALL
+            | DDENUMSURFACES_MATCH
+            | DDENUMSURFACES_NOMATCH
+            | DDENUMSURFACES_CANBECREATED
+            | DDENUMSURFACES_DOESEXIST) as u32;
+        if flags & !allowed != 0 {
+            return Err(E_INVALIDARG.into());
+        }
+        let all = flags & DDENUMSURFACES_ALL as u32 != 0;
+        let matched = flags & DDENUMSURFACES_MATCH as u32 != 0;
+        let nomatch = flags & DDENUMSURFACES_NOMATCH as u32 != 0;
+        let can_create = flags & DDENUMSURFACES_CANBECREATED as u32 != 0;
+        let exists = flags & DDENUMSURFACES_DOESEXIST as u32 != 0;
+        if (all as u8 + matched as u8 + nomatch as u8) != 1
+            || (can_create as u8 + exists as u8) != 1
+        {
+            return Err(E_INVALIDARG.into());
+        }
+        if (matched || nomatch) && filter.is_none() {
+            return Err(E_INVALIDARG.into());
+        }
+        if can_create {
+            return Ok(());
+        }
+        let snapshot = self
+            .display
+            .try_borrow()
+            .map_err(|_| SURFACE_BUSY)?
+            .live_surfaces();
+        for surf in snapshot {
+            let keep = if all {
+                true
+            } else {
+                let is_match = surface::matches_desc(&surf, filter.as_ref().unwrap())?;
+                if matched {
+                    is_match
+                } else {
+                    !is_match
+                }
+            };
+            if !keep {
+                continue;
+            }
+            let mut desc = surface::surface_desc(&surf)?;
+            let typed = surf.cast::<S>()?;
+            if emit(typed, &mut desc) == DDENUMRET_CANCEL as i32 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn enum_display_modes_impl(
         &self,
         flags: u32,
         filter: DDSURFACEDESC,
         mut emit: impl FnMut(&mut DDSURFACEDESC) -> i32,
     ) -> Result<()> {
-        if flags != 0 {
-            return Err(E_NOTIMPL.into());
+        if flags & !((DDEDM_REFRESHRATES | DDEDM_STANDARDVGAMODES) as u32) != 0 {
+            return Err(E_INVALIDARG.into());
         }
-        if filter.dwFlags & !((DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT) as u32) != 0 {
-            return Err(E_NOTIMPL.into());
+        if filter.dwFlags
+            & !((DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT | DDSD_REFRESHRATE) as u32)
+            != 0
+        {
+            return Err(E_INVALIDARG.into());
         }
         let current = self.display.try_borrow().map_err(|_| SURFACE_BUSY)?;
         let current_size = (current.width, current.height);
         drop(current);
+        let refresh = self.monitor_hz();
+        let include_refresh = flags & DDEDM_REFRESHRATES as u32 != 0;
         let sizes = [
             (320, 200),
             (320, 240),
@@ -378,6 +502,16 @@ impl Draw_Impl {
             }
             for bpp in [8, 16, 32] {
                 let mut mode = mode_description(width, height, bpp)?;
+                if include_refresh {
+                    mode.dwFlags |= DDSD_REFRESHRATE as u32;
+                    mode.Anonymous2.dwRefreshRate = refresh;
+                }
+                if filter.dwFlags & DDSD_REFRESHRATE as u32 != 0 {
+                    let wanted = unsafe { filter.Anonymous2.dwRefreshRate };
+                    if wanted != 0 && wanted != refresh {
+                        continue;
+                    }
+                }
                 if filter.dwFlags & DDSD_PIXELFORMAT as u32 != 0 {
                     let requested = &filter.ddpfPixelFormat;
                     let format = &mode.ddpfPixelFormat;
@@ -473,8 +607,8 @@ impl IDirectDraw_Impl for Draw_Impl {
     ) -> Result<()> {
         self.create_surface_v1(desc, out, outer)
     }
-    fn DuplicateSurface(&self, _: Ref<IDirectDrawSurface>) -> Result<IDirectDrawSurface> {
-        Err(E_NOTIMPL.into())
+    fn DuplicateSurface(&self, src: Ref<IDirectDrawSurface>) -> Result<IDirectDrawSurface> {
+        self.duplicate_surface_impl(src)
     }
 
     fn EnumDisplayModes(
@@ -496,15 +630,26 @@ impl IDirectDraw_Impl for Draw_Impl {
 
     fn EnumSurfaces(
         &self,
-        _: u32,
-        _: *mut DDSURFACEDESC,
-        _: *mut c_void,
-        _: LPDDENUMSURFACESCALLBACK,
+        flags: u32,
+        desc: *mut DDSURFACEDESC,
+        context: *mut c_void,
+        callback: LPDDENUMSURFACESCALLBACK,
     ) -> Result<()> {
-        Err(E_NOTIMPL.into())
+        let callback = callback.ok_or(E_INVALIDARG)?;
+        let filter = if desc.is_null() {
+            None
+        } else {
+            check_desc(desc)?;
+            Some(unsafe { *desc })
+        };
+        self.enum_surfaces_impl::<IDirectDrawSurface>(flags, filter, |surf, d| {
+            let owned = ManuallyDrop::new(surf);
+            unsafe { callback((&*owned).into(), d, context).0 }
+        })
     }
     fn FlipToGDISurface(&self) -> Result<()> {
-        Err(E_NOTIMPL.into())
+        let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
+        display.refresh()
     }
 
     fn GetCaps(&self, driver: *mut DDCAPS_DX7, software: *mut DDCAPS_DX7) -> Result<()> {
@@ -541,17 +686,24 @@ impl IDirectDraw_Impl for Draw_Impl {
                     | DDCAPS_BLTCOLORFILL
                     | DDCAPS_COLORKEY
                     | DDCAPS_CANBLTSYSMEM
+                    | DDCAPS_OVERLAY
                     | DDCAPS_PALETTE) as u32;
                 caps.dwCaps2 = DDCAPS2_PRIMARYGAMMA as u32;
-                caps.dwCKeyCaps = DDCKEYCAPS_SRCBLT as u32;
+                caps.dwCKeyCaps = (DDCKEYCAPS_SRCBLT | DDCKEYCAPS_DESTBLT) as u32;
+                caps.dwFXCaps = (DDFXCAPS_BLTMIRRORLEFTRIGHT
+                    | DDFXCAPS_BLTMIRRORUPDOWN
+                    | DDFXCAPS_BLTSTRETCHX
+                    | DDFXCAPS_BLTSTRETCHY) as u32;
                 caps.dwPalCaps = (DDPCAPS_8BIT | DDPCAPS_ALLOW256) as u32;
                 caps.dwVidMemTotal = VIRTUAL_VIDMEM_BYTES;
                 caps.dwVidMemFree = VIRTUAL_VIDMEM_BYTES;
                 caps.ddsOldCaps.dwCaps = (DDSCAPS_PRIMARYSURFACE
                     | DDSCAPS_OFFSCREENPLAIN
                     | DDSCAPS_SYSTEMMEMORY
+                    | DDSCAPS_VIDEOMEMORY
                     | DDSCAPS_FLIP
                     | DDSCAPS_BACKBUFFER
+                    | DDSCAPS_OVERLAY
                     | DDSCAPS_COMPLEX) as u32;
                 caps.ddsCaps.dwCaps = caps.ddsOldCaps.dwCaps;
             }
@@ -580,7 +732,11 @@ impl IDirectDraw_Impl for Draw_Impl {
         Ok(())
     }
     fn GetGDISurface(&self) -> Result<IDirectDrawSurface> {
-        Err(E_NOTIMPL.into())
+        self.display
+            .try_borrow()
+            .map_err(|_| SURFACE_BUSY)?
+            .primary_surface()
+            .ok_or_else(|| Error::from(DDERR_NOTFOUND))
     }
     fn GetMonitorFrequency(&self, output: *mut u32) -> Result<()> {
         if output.is_null() {
@@ -613,11 +769,21 @@ impl IDirectDraw_Impl for Draw_Impl {
         unsafe { output.write(mode.dmDisplayFrequency) };
         Ok(())
     }
-    fn GetScanLine(&self, _: *mut u32) -> Result<()> {
-        Err(E_NOTIMPL.into())
+    fn GetScanLine(&self, line: *mut u32) -> Result<()> {
+        let out = unsafe { line.as_mut() }.ok_or(E_INVALIDARG)?;
+        let (phase_us, active_end_us, _, height) = self.frame_timing();
+        if phase_us >= active_end_us {
+            *out = 0;
+            return Err(DDERR_VERTICALBLANKINPROGRESS.into());
+        }
+        *out = ((phase_us * height as u64) / active_end_us.max(1)) as u32;
+        Ok(())
     }
-    fn GetVerticalBlankStatus(&self, _: *mut BOOL) -> Result<()> {
-        Err(E_NOTIMPL.into())
+    fn GetVerticalBlankStatus(&self, status: *mut BOOL) -> Result<()> {
+        let out = unsafe { status.as_mut() }.ok_or(E_INVALIDARG)?;
+        let (phase_us, active_end_us, _, _) = self.frame_timing();
+        *out = BOOL::from(phase_us >= active_end_us);
+        Ok(())
     }
     fn Initialize(&self, _: *mut GUID) -> Result<()> {
         Err(ALREADY_INITIALIZED.into())
@@ -639,9 +805,33 @@ impl IDirectDraw_Impl for Draw_Impl {
     }
 
     fn SetCooperativeLevel(&self, hwnd: HWND, flags: u32) -> Result<()> {
-        let exclusive = flags == (DDSCL_FULLSCREEN | DDSCL_EXCLUSIVE) as u32;
-        if !exclusive && flags != DDSCL_NORMAL as u32 {
-            return Err(E_NOTIMPL.into());
+        let known_flags = (DDSCL_NORMAL
+            | DDSCL_FULLSCREEN
+            | DDSCL_EXCLUSIVE
+            | DDSCL_ALLOWREBOOT
+            | DDSCL_ALLOWMODEX
+            | DDSCL_NOWINDOWCHANGES
+            | DDSCL_FPUSETUP
+            | DDSCL_FPUPRESERVE
+            | DDSCL_MULTITHREADED
+            | DDSCL_CREATEDEVICEWINDOW
+            | DDSCL_SETDEVICEWINDOW
+            | DDSCL_SETFOCUSWINDOW) as u32;
+        if flags & !known_flags != 0 {
+            return Err(E_INVALIDARG.into());
+        }
+        let normal = flags & DDSCL_NORMAL as u32 != 0;
+        let exclusive = flags & DDSCL_EXCLUSIVE as u32 != 0;
+        let fullscreen = flags & DDSCL_FULLSCREEN as u32 != 0;
+        let no_window_changes = flags & DDSCL_NOWINDOWCHANGES as u32 != 0;
+        let window_only = flags
+            & (DDSCL_SETFOCUSWINDOW | DDSCL_SETDEVICEWINDOW | DDSCL_CREATEDEVICEWINDOW) as u32
+            != 0;
+        if (normal && exclusive)
+            || (exclusive && !fullscreen)
+            || (!normal && !exclusive && !window_only)
+        {
+            return Err(E_INVALIDARG.into());
         }
         if (hwnd.is_invalid() && exclusive)
             || (!hwnd.is_invalid() && !unsafe { IsWindow(Some(hwnd)) }.as_bool())
@@ -653,8 +843,9 @@ impl IDirectDraw_Impl for Draw_Impl {
             .changing_window
             .try_borrow_mut()
             .map_err(|_| SURFACE_BUSY)?;
+        let want_fullscreen = exclusive && !no_window_changes;
         let change_hwnd = self.hwnd.get() != hwnd;
-        if !change_hwnd && self.fullscreen.get().is_some() == exclusive {
+        if !change_hwnd && self.fullscreen.get().is_some() == want_fullscreen {
             return Ok(());
         }
         let replacement = if change_hwnd && !hwnd.is_invalid() {
@@ -667,7 +858,7 @@ impl IDirectDraw_Impl for Draw_Impl {
             saved.restore()?;
             self.fullscreen.set(None);
         }
-        if exclusive {
+        if want_fullscreen {
             self.fullscreen.set(Some(SavedWindow::enter(hwnd)?));
         }
         if change_hwnd {
@@ -692,8 +883,27 @@ impl IDirectDraw_Impl for Draw_Impl {
         (display.width, display.height, display.bpp) = (width, height, bpp);
         Ok(())
     }
-    fn WaitForVerticalBlank(&self, _: u32, _: HANDLE) -> Result<()> {
-        Err(E_NOTIMPL.into())
+    fn WaitForVerticalBlank(&self, flags: u32, event: HANDLE) -> Result<()> {
+        if !event.is_invalid() {
+            return Err(E_NOTIMPL.into());
+        }
+        let (phase_us, active_end_us, frame_us, _) = self.frame_timing();
+        let wait_us = match flags as i32 {
+            DDWAITVB_BLOCKBEGIN => {
+                if phase_us < active_end_us {
+                    active_end_us - phase_us
+                } else {
+                    (frame_us - phase_us) + active_end_us
+                }
+            }
+            DDWAITVB_BLOCKEND => frame_us - phase_us,
+            DDWAITVB_BLOCKBEGINEVENT => return Err(E_NOTIMPL.into()),
+            _ => return Err(E_INVALIDARG.into()),
+        };
+        if wait_us > 0 {
+            std::thread::sleep(Duration::from_micros(wait_us.min(frame_us)));
+        }
+        Ok(())
     }
 }
 
@@ -728,7 +938,7 @@ impl IDirectDraw2_Impl for Draw_Impl {
         self.create_surface_v1(desc, out, outer)
     }
     fn DuplicateSurface(&self, src: Ref<IDirectDrawSurface>) -> Result<IDirectDrawSurface> {
-        IDirectDraw_Impl::DuplicateSurface(self, src)
+        self.duplicate_surface_impl(src)
     }
     fn EnumDisplayModes(
         &self,
@@ -837,8 +1047,8 @@ impl IDirectDraw4_Impl for Draw_Impl {
     ) -> Result<()> {
         self.create_surface_v2(desc, out, outer)
     }
-    fn DuplicateSurface(&self, _: Ref<IDirectDrawSurface4>) -> Result<IDirectDrawSurface4> {
-        Err(E_NOTIMPL.into())
+    fn DuplicateSurface(&self, src: Ref<IDirectDrawSurface4>) -> Result<IDirectDrawSurface4> {
+        self.duplicate_surface_impl(src)
     }
     fn EnumDisplayModes(
         &self,
@@ -861,12 +1071,23 @@ impl IDirectDraw4_Impl for Draw_Impl {
     }
     fn EnumSurfaces(
         &self,
-        _: u32,
-        _: *mut DDSURFACEDESC2,
-        _: *mut c_void,
-        _: LPDDENUMSURFACESCALLBACK2,
+        flags: u32,
+        desc: *mut DDSURFACEDESC2,
+        context: *mut c_void,
+        callback: LPDDENUMSURFACESCALLBACK2,
     ) -> Result<()> {
-        Err(E_NOTIMPL.into())
+        let callback = callback.ok_or(E_INVALIDARG)?;
+        let filter = if desc.is_null() {
+            None
+        } else {
+            check_desc2(desc)?;
+            Some(surface::desc2_to_desc(unsafe { &*desc })?)
+        };
+        self.enum_surfaces_impl::<IDirectDrawSurface4>(flags, filter, |surf, d| {
+            let mut d2 = surface::desc_to_desc2(d);
+            let owned = ManuallyDrop::new(surf);
+            unsafe { callback((&*owned).into(), &mut d2, context).0 }
+        })
     }
     fn FlipToGDISurface(&self) -> Result<()> {
         IDirectDraw_Impl::FlipToGDISurface(self)
@@ -978,8 +1199,8 @@ impl IDirectDraw7_Impl for Draw_Impl {
     ) -> Result<()> {
         self.create_surface_v2(desc, out, outer)
     }
-    fn DuplicateSurface(&self, _: Ref<IDirectDrawSurface7>) -> Result<IDirectDrawSurface7> {
-        Err(E_NOTIMPL.into())
+    fn DuplicateSurface(&self, src: Ref<IDirectDrawSurface7>) -> Result<IDirectDrawSurface7> {
+        self.duplicate_surface_impl(src)
     }
     fn EnumDisplayModes(
         &self,
@@ -992,12 +1213,23 @@ impl IDirectDraw7_Impl for Draw_Impl {
     }
     fn EnumSurfaces(
         &self,
-        _: u32,
-        _: *mut DDSURFACEDESC2,
-        _: *mut c_void,
-        _: LPDDENUMSURFACESCALLBACK7,
+        flags: u32,
+        desc: *mut DDSURFACEDESC2,
+        context: *mut c_void,
+        callback: LPDDENUMSURFACESCALLBACK7,
     ) -> Result<()> {
-        Err(E_NOTIMPL.into())
+        let callback = callback.ok_or(E_INVALIDARG)?;
+        let filter = if desc.is_null() {
+            None
+        } else {
+            check_desc2(desc)?;
+            Some(surface::desc2_to_desc(unsafe { &*desc })?)
+        };
+        self.enum_surfaces_impl::<IDirectDrawSurface7>(flags, filter, |surf, d| {
+            let mut d2 = surface::desc_to_desc2(d);
+            let owned = ManuallyDrop::new(surf);
+            unsafe { callback((&*owned).into(), &mut d2, context).0 }
+        })
     }
     fn FlipToGDISurface(&self) -> Result<()> {
         IDirectDraw_Impl::FlipToGDISurface(self)

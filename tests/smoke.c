@@ -19,6 +19,22 @@ typedef HRESULT (WINAPI *CreateFn)(GUID *, IDirectDraw **, IUnknown *);
 typedef HRESULT (WINAPI *CreateExFn)(GUID *, void **, REFIID, IUnknown *);
 typedef HRESULT (WINAPI *CreateClipperFn)(DWORD, IDirectDrawClipper **, IUnknown *);
 
+static HRESULT WINAPI count_modes_cb(DDSURFACEDESC2 *desc, void *ctx) {
+    unsigned *count = (unsigned *)ctx;
+    if (desc->dwFlags & DDSD_REFRESHRATE) {
+        (*count)++;
+    }
+    return DDENUMRET_OK;
+}
+
+static HRESULT WINAPI count_surfaces_cb(IDirectDrawSurface7 *surf, DDSURFACEDESC2 *desc, void *ctx) {
+    unsigned *count = (unsigned *)ctx;
+    (void)desc;
+    (*count)++;
+    IDirectDrawSurface7_Release(surf);
+    return DDENUMRET_OK;
+}
+
 static int exercise(IDirectDraw *draw, unsigned depth) {
     DDSURFACEDESC desc = {0}, lock = {0};
     IDirectDrawSurface *front = NULL, *back = NULL;
@@ -143,7 +159,8 @@ static int exercise_interfaces(HMODULE dll, HWND window) {
     REQUIRE(total > 0 && free_mem <= total);
     CHECK(IDirectDraw7_SetDisplayMode(dd7, 64, 64, 32, 60, 0));
     if (window) {
-        CHECK(IDirectDraw7_SetCooperativeLevel(dd7, window, DDSCL_NORMAL));
+        CHECK(IDirectDraw7_SetCooperativeLevel(
+            dd7, window, DDSCL_NORMAL | DDSCL_NOWINDOWCHANGES | DDSCL_FPUSETUP));
     }
 
     desc2.dwSize = sizeof(desc2);
@@ -234,6 +251,161 @@ static int exercise_interfaces(HMODULE dll, HWND window) {
     return 0;
 }
 
+static int exercise_compat(HMODULE dll) {
+    CreateExFn create_ex = (CreateExFn)GetProcAddress(dll, "DirectDrawCreateEx");
+    IDirectDraw7 *dd7 = NULL;
+    IDirectDrawSurface7 *primary = NULL, *back1 = NULL, *back2 = NULL, *gdi = NULL;
+    IDirectDrawSurface7 *off = NULL, *dup = NULL, *extra = NULL, *overlay = NULL;
+    DDSURFACEDESC2 desc = {0}, lock = {0};
+    DDSCAPS2 back_caps = {DDSCAPS_BACKBUFFER};
+    DDBLTFX fx = {0};
+    DDBLTBATCH batch = {0};
+    BOOL in_vb = FALSE;
+    DWORD scanline = 0;
+    LONG ox = 0, oy = 0;
+    unsigned mode_count = 0, surf_count = 0;
+    HRESULT hr;
+
+    CHECK(create_ex(NULL, (void **)&dd7, &IID_IDirectDraw7, NULL));
+    CHECK(IDirectDraw7_SetDisplayMode(dd7, 32, 32, 32, 60, 0));
+
+    // EnumDisplayModes with refresh rates flag.
+    CHECK(IDirectDraw7_EnumDisplayModes(
+        dd7, DDEDM_REFRESHRATES | DDEDM_STANDARDVGAMODES, NULL, &mode_count, count_modes_cb));
+    REQUIRE(mode_count > 0);
+
+    // VBlank & ScanLine queries.
+    CHECK(IDirectDraw7_GetVerticalBlankStatus(dd7, &in_vb));
+    hr = IDirectDraw7_GetScanLine(dd7, &scanline);
+    REQUIRE(SUCCEEDED(hr) || hr == DDERR_VERTICALBLANKINPROGRESS);
+    CHECK(IDirectDraw7_WaitForVerticalBlank(dd7, DDWAITVB_BLOCKBEGIN, NULL));
+
+    // Triple buffering (2 backbuffers) + video memory caps.
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DDSD_CAPS | DDSD_BACKBUFFERCOUNT;
+    desc.ddsCaps.dwCaps =
+        DDSCAPS_PRIMARYSURFACE | DDSCAPS_FLIP | DDSCAPS_COMPLEX | DDSCAPS_VIDEOMEMORY;
+    desc.dwBackBufferCount = 2;
+    CHECK(IDirectDraw7_CreateSurface(dd7, &desc, &primary, NULL));
+    CHECK(IDirectDrawSurface7_GetAttachedSurface(primary, &back_caps, &back1));
+    CHECK(IDirectDrawSurface7_GetAttachedSurface(back1, &back_caps, &back2));
+
+    // Fill front=1, back1=2, back2=3 and rotate via Flip.
+    fx.dwSize = sizeof(fx);
+    fx.dwFillColor = 0x00010101;
+    CHECK(IDirectDrawSurface7_Blt(primary, NULL, NULL, NULL, DDBLT_COLORFILL, &fx));
+    fx.dwFillColor = 0x00020202;
+    CHECK(IDirectDrawSurface7_Blt(back1, NULL, NULL, NULL, DDBLT_COLORFILL, &fx));
+    fx.dwFillColor = 0x00030303;
+    CHECK(IDirectDrawSurface7_Blt(back2, NULL, NULL, NULL, DDBLT_COLORFILL, &fx));
+    CHECK(IDirectDrawSurface7_Flip(primary, NULL, DDFLIP_WAIT));
+    lock.dwSize = sizeof(lock);
+    CHECK(IDirectDrawSurface7_Lock(primary, NULL, &lock, 0, NULL));
+    REQUIRE(((DWORD *)lock.lpSurface)[0] == 0x00020202);
+    CHECK(IDirectDrawSurface7_Unlock(primary, NULL));
+    CHECK(IDirectDrawSurface7_Flip(primary, NULL, DDFLIP_WAIT));
+    CHECK(IDirectDrawSurface7_Lock(primary, NULL, &lock, 0, NULL));
+    REQUIRE(((DWORD *)lock.lpSurface)[0] == 0x00030303);
+    CHECK(IDirectDrawSurface7_Unlock(primary, NULL));
+
+    // GetGDISurface + FlipToGDISurface + DuplicateSurface rejected for primary.
+    CHECK(IDirectDraw7_GetGDISurface(dd7, &gdi));
+    REQUIRE(gdi != NULL);
+    IDirectDrawSurface7_Release(gdi);
+    CHECK(IDirectDraw7_FlipToGDISurface(dd7));
+    REQUIRE(IDirectDraw7_DuplicateSurface(dd7, primary, &dup) == DDERR_CANTDUPLICATE);
+
+    // Offscreen surface + DuplicateSurface + Add/DeleteAttachedSurface.
+    memset(&desc, 0, sizeof(desc));
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT;
+    desc.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_VIDEOMEMORY;
+    desc.dwWidth = 8;
+    desc.dwHeight = 8;
+    CHECK(IDirectDraw7_CreateSurface(dd7, &desc, &off, NULL));
+    fx.dwFillColor = 0x00aabbcc;
+    CHECK(IDirectDrawSurface7_Blt(off, NULL, NULL, NULL, DDBLT_COLORFILL | DDBLT_ASYNC, &fx));
+    CHECK(IDirectDraw7_DuplicateSurface(dd7, off, &dup));
+    CHECK(IDirectDrawSurface7_Lock(dup, NULL, &lock, 0, NULL));
+    REQUIRE(((DWORD *)lock.lpSurface)[0] == 0x00aabbcc);
+    CHECK(IDirectDrawSurface7_Unlock(dup, NULL));
+
+    CHECK(IDirectDraw7_CreateSurface(dd7, &desc, &extra, NULL));
+    CHECK(IDirectDrawSurface7_AddAttachedSurface(off, extra));
+    CHECK(IDirectDrawSurface7_DeleteAttachedSurface(off, 0, extra));
+
+    // Blt with DDBLT_ROP (BLACKNESS/WHITENESS), KEYSRCOVERRIDE, MIRRORLEFTRIGHT, BltBatch.
+    memset(&fx, 0, sizeof(fx));
+    fx.dwSize = sizeof(fx);
+    fx.dwROP = WHITENESS;
+    CHECK(IDirectDrawSurface7_Blt(extra, NULL, NULL, NULL, DDBLT_ROP, &fx));
+    CHECK(IDirectDrawSurface7_Lock(extra, NULL, &lock, 0, NULL));
+    REQUIRE(((DWORD *)lock.lpSurface)[0] == 0xffffffff);
+    CHECK(IDirectDrawSurface7_Unlock(extra, NULL));
+
+    memset(&fx, 0, sizeof(fx));
+    fx.dwSize = sizeof(fx);
+    fx.dwDDFX = DDBLTFX_MIRRORLEFTRIGHT;
+    fx.ddckSrcColorkey.dwColorSpaceLowValue = 0x00aabbcc;
+    fx.ddckSrcColorkey.dwColorSpaceHighValue = 0x00aabbcc;
+    CHECK(IDirectDrawSurface7_Blt(
+        extra, NULL, off, NULL, DDBLT_DDFX | DDBLT_KEYSRCOVERRIDE, &fx));
+    CHECK(IDirectDrawSurface7_Lock(extra, NULL, &lock, 0, NULL));
+    // All source pixels matched source key -> destination stayed white.
+    REQUIRE(((DWORD *)lock.lpSurface)[0] == 0xffffffff);
+    CHECK(IDirectDrawSurface7_Unlock(extra, NULL));
+
+    memset(&fx, 0, sizeof(fx));
+    fx.dwSize = sizeof(fx);
+    fx.dwROP = BLACKNESS;
+    batch.dwFlags = DDBLT_ROP;
+    batch.lpDDBltFx = &fx;
+    CHECK(IDirectDrawSurface7_BltBatch(extra, &batch, 1, 0));
+    CHECK(IDirectDrawSurface7_Lock(extra, NULL, &lock, 0, NULL));
+    REQUIRE(((DWORD *)lock.lpSurface)[0] == 0);
+    CHECK(IDirectDrawSurface7_Unlock(extra, NULL));
+
+    // EnumSurfaces.
+    CHECK(IDirectDraw7_EnumSurfaces(
+        dd7, DDENUMSURFACES_ALL | DDENUMSURFACES_DOESEXIST, NULL, &surf_count, count_surfaces_cb));
+    REQUIRE(surf_count >= 6);
+
+    // Overlay surface vs non-overlay surface.
+    REQUIRE(IDirectDrawSurface7_GetOverlayPosition(off, &ox, &oy) == DDERR_NOTAOVERLAYSURFACE);
+    memset(&desc, 0, sizeof(desc));
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT;
+    desc.ddsCaps.dwCaps = DDSCAPS_OVERLAY | DDSCAPS_VIDEOMEMORY;
+    desc.dwWidth = 4;
+    desc.dwHeight = 4;
+    CHECK(IDirectDraw7_CreateSurface(dd7, &desc, &overlay, NULL));
+    fx.dwSize = sizeof(fx);
+    fx.dwFillColor = 0x00445566;
+    CHECK(IDirectDrawSurface7_Blt(overlay, NULL, NULL, NULL, DDBLT_COLORFILL, &fx));
+    CHECK(IDirectDrawSurface7_SetOverlayPosition(overlay, 3, 5));
+    CHECK(IDirectDrawSurface7_GetOverlayPosition(overlay, &ox, &oy));
+    REQUIRE(ox == 3 && oy == 5);
+    {
+        RECT dst_rect = {4, 4, 8, 8};
+        CHECK(IDirectDrawSurface7_UpdateOverlay(
+            overlay, NULL, primary, &dst_rect, DDOVER_SHOW, NULL));
+        CHECK(IDirectDrawSurface7_Lock(primary, NULL, &lock, 0, NULL));
+        REQUIRE(*(DWORD *)((BYTE *)lock.lpSurface + 4 * lock.lPitch + 4 * 4) == 0x00445566);
+        CHECK(IDirectDrawSurface7_Unlock(primary, NULL));
+    }
+
+    IDirectDrawSurface7_Release(overlay);
+    IDirectDrawSurface7_Release(extra);
+    IDirectDrawSurface7_Release(dup);
+    IDirectDrawSurface7_Release(off);
+    IDirectDrawSurface7_Release(back2);
+    IDirectDrawSurface7_Release(back1);
+    IDirectDrawSurface7_Release(primary);
+    REQUIRE(IDirectDraw7_Release(dd7) == 0);
+    puts("passed compatibility methods, multi-backbuffer, Blt/FX/ROP, EnumSurfaces & Overlays");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     wchar_t path[MAX_PATH];
     const DWORD len = GetModuleFileNameW(NULL, path, MAX_PATH);
@@ -285,6 +457,7 @@ int main(int argc, char **argv) {
     CHECK(IDirectDraw_RestoreDisplayMode(draw));
     REQUIRE(IDirectDraw_Release(draw) == 0);
     REQUIRE(exercise_interfaces(dll, window) == 0);
+    REQUIRE(exercise_compat(dll) == 0);
     if (window) DestroyWindow(window);
     FreeLibrary(dll);
     puts("x86 DirectDraw smoke test passed");
