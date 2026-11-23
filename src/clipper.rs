@@ -60,6 +60,7 @@ pub struct Clipper {
     hwnd: Cell<HWND>,
     region: RefCell<Option<OwnedRgn>>,
     display: Option<Weak<RefCell<Display>>>,
+    initialized: Cell<bool>,
 }
 
 pub fn create_clipper(
@@ -73,8 +74,19 @@ pub fn create_clipper(
         hwnd: Cell::new(HWND::default()),
         region: RefCell::new(None),
         display: display.map(|d| Rc::downgrade(&d)),
+        initialized: Cell::new(true),
     }
     .into())
+}
+
+pub fn create_uninitialized_clipper() -> IDirectDrawClipper {
+    Clipper {
+        hwnd: Cell::new(HWND::default()),
+        region: RefCell::new(None),
+        display: None,
+        initialized: Cell::new(false),
+    }
+    .into()
 }
 
 impl Clipper {
@@ -226,8 +238,15 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
         Ok(())
     }
 
-    fn Initialize(&self, _: Ref<IDirectDraw>, _: u32) -> Result<()> {
-        Err(DDERR_ALREADYINITIALIZED.into())
+    fn Initialize(&self, _: Ref<IDirectDraw>, flags: u32) -> Result<()> {
+        if self.initialized.get() {
+            return Err(DDERR_ALREADYINITIALIZED.into());
+        }
+        if flags != 0 {
+            return Err(E_INVALIDARG.into());
+        }
+        self.initialized.set(true);
+        Ok(())
     }
 
     fn IsClipListChanged(&self, out: *mut BOOL) -> Result<()> {

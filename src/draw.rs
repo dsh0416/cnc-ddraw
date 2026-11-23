@@ -3,6 +3,7 @@ use std::ffi::c_void;
 use std::mem::{size_of, ManuallyDrop};
 use std::ptr;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::core::{
@@ -35,6 +36,12 @@ const DDERR_INVALIDOBJECT: HRESULT = HRESULT(0x8876_0082_u32 as i32);
 const DDERR_NOTFOUND: HRESULT = HRESULT(0x8876_00ff_u32 as i32);
 const SURFACE_BUSY: HRESULT = HRESULT(0x8876_01ae_u32 as i32);
 const DDERR_VERTICALBLANKINPROGRESS: HRESULT = HRESULT(0x8876_0219_u32 as i32);
+
+static FULLSCREEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn is_fullscreen_active() -> bool {
+    FULLSCREEN_COUNT.load(Ordering::Relaxed) > 0
+}
 
 pub struct Display {
     pub width: u32,
@@ -229,10 +236,11 @@ struct Draw {
     fullscreen: Cell<Option<SavedWindow>>,
     changing_window: RefCell<()>,
     vblank_epoch: Instant,
+    initialized: Cell<bool>,
 }
 
 impl Draw {
-    fn new() -> Self {
+    fn new_with_init(initialized: bool) -> Self {
         let (width, height, bpp) = DEFAULT_MODE;
         Self {
             display: Rc::new(RefCell::new(Display {
@@ -248,13 +256,33 @@ impl Draw {
             fullscreen: Cell::new(None),
             changing_window: RefCell::new(()),
             vblank_epoch: Instant::now(),
+            initialized: Cell::new(initialized),
         }
     }
+
+    fn new() -> Self {
+        Self::new_with_init(true)
+    }
+
+    fn set_fullscreen(&self, saved: Option<SavedWindow>) {
+        let was = self.fullscreen.replace(saved).is_some();
+        let now = saved.is_some();
+        if !was && now {
+            FULLSCREEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else if was && !now {
+            FULLSCREEN_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn create_uninitialized_draw() -> IDirectDraw {
+    Draw::new_with_init(false).into()
 }
 
 impl Drop for Draw {
     fn drop(&mut self) {
         if let Some(saved) = self.fullscreen.take() {
+            FULLSCREEN_COUNT.fetch_sub(1, Ordering::Relaxed);
             let _ = saved.restore();
         }
     }
@@ -785,8 +813,15 @@ impl IDirectDraw_Impl for Draw_Impl {
         *out = BOOL::from(phase_us >= active_end_us);
         Ok(())
     }
-    fn Initialize(&self, _: *mut GUID) -> Result<()> {
-        Err(ALREADY_INITIALIZED.into())
+    fn Initialize(&self, device: *mut GUID) -> Result<()> {
+        if self.initialized.get() {
+            return Err(ALREADY_INITIALIZED.into());
+        }
+        if !valid_device_guid(device) {
+            return Err(E_INVALIDARG.into());
+        }
+        self.initialized.set(true);
+        Ok(())
     }
     fn RestoreDisplayMode(&self) -> Result<()> {
         let _transition = self
@@ -795,7 +830,7 @@ impl IDirectDraw_Impl for Draw_Impl {
             .map_err(|_| SURFACE_BUSY)?;
         if let Some(saved) = self.fullscreen.get() {
             saved.restore()?;
-            self.fullscreen.set(None);
+            self.set_fullscreen(None);
         }
         let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
         if display.primary.upgrade().is_none() {
@@ -856,10 +891,10 @@ impl IDirectDraw_Impl for Draw_Impl {
         let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
         if let Some(saved) = self.fullscreen.get() {
             saved.restore()?;
-            self.fullscreen.set(None);
+            self.set_fullscreen(None);
         }
         if want_fullscreen {
-            self.fullscreen.set(Some(SavedWindow::enter(hwnd)?));
+            self.set_fullscreen(Some(SavedWindow::enter(hwnd)?));
         }
         if change_hwnd {
             display.renderer = replacement;

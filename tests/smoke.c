@@ -18,6 +18,16 @@
 typedef HRESULT (WINAPI *CreateFn)(GUID *, IDirectDraw **, IUnknown *);
 typedef HRESULT (WINAPI *CreateExFn)(GUID *, void **, REFIID, IUnknown *);
 typedef HRESULT (WINAPI *CreateClipperFn)(DWORD, IDirectDrawClipper **, IUnknown *);
+typedef DWORD (WINAPI *ThreadLockFn)(void);
+typedef DWORD (WINAPI *SysmemFn)(DWORD);
+typedef HRESULT (WINAPI *ParseCmdFn)(void *, void **);
+typedef DWORD (WINAPI *InternalLockFn)(DWORD, DWORD);
+typedef DWORD (WINAPI *InternalUnlockFn)(DWORD);
+typedef BOOL (__cdecl *IsWindowedFn)(void);
+typedef void (__cdecl *EnableZoomFn)(void);
+typedef FARPROC (WINAPI *DdGetProcAddressFn)(HMODULE, LPCSTR);
+typedef HRESULT (WINAPI *DllGetClassObjectFn)(REFCLSID, REFIID, void **);
+typedef HRESULT (WINAPI *DllCanUnloadNowFn)(void);
 
 static HRESULT WINAPI count_modes_cb(DDSURFACEDESC2 *desc, void *ctx) {
     unsigned *count = (unsigned *)ctx;
@@ -406,6 +416,67 @@ static int exercise_compat(HMODULE dll) {
     return 0;
 }
 
+static int exercise_exports(HMODULE dll) {
+    ThreadLockFn acquire = (ThreadLockFn)GetProcAddress(dll, MAKEINTRESOURCEA(1));
+    SysmemFn sysmem = (SysmemFn)GetProcAddress(dll, MAKEINTRESOURCEA(2));
+    ParseCmdFn parse_cmd = (ParseCmdFn)GetProcAddress(dll, MAKEINTRESOURCEA(3));
+    InternalLockFn ilock = (InternalLockFn)GetProcAddress(dll, MAKEINTRESOURCEA(5));
+    InternalUnlockFn iunlock = (InternalUnlockFn)GetProcAddress(dll, MAKEINTRESOURCEA(6));
+    CreateFn create_ord = (CreateFn)GetProcAddress(dll, MAKEINTRESOURCEA(8));
+    CreateClipperFn clipper_ord = (CreateClipperFn)GetProcAddress(dll, MAKEINTRESOURCEA(9));
+    CreateExFn create_ex_ord = (CreateExFn)GetProcAddress(dll, MAKEINTRESOURCEA(10));
+    ThreadLockFn release = (ThreadLockFn)GetProcAddress(dll, MAKEINTRESOURCEA(21));
+    IsWindowedFn is_windowed = (IsWindowedFn)GetProcAddress(dll, "DDIsWindowed");
+    EnableZoomFn enable_zoom = (EnableZoomFn)GetProcAddress(dll, "DDEnableZoom");
+    DdGetProcAddressFn dd_get_proc = (DdGetProcAddressFn)GetProcAddress(dll, "DDGetProcAddress");
+    DllGetClassObjectFn get_class = (DllGetClassObjectFn)GetProcAddress(dll, "DllGetClassObject");
+    DllCanUnloadNowFn can_unload = (DllCanUnloadNowFn)GetProcAddress(dll, "DllCanUnloadNow");
+    IClassFactory *factory = NULL;
+    IDirectDraw7 *dd7 = NULL;
+    IDirectDrawClipper *clipper = NULL;
+    void *ret_cmd = (void *)0x1;
+
+    REQUIRE(acquire && sysmem && parse_cmd && ilock && iunlock);
+    REQUIRE(create_ord && clipper_ord && create_ex_ord && release);
+    REQUIRE(is_windowed && enable_zoom && dd_get_proc && get_class && can_unload);
+    REQUIRE(GetProcAddress(dll, MAKEINTRESOURCEA(11)) == GetProcAddress(dll, "DirectDrawEnumerateA"));
+    REQUIRE(GetProcAddress(dll, MAKEINTRESOURCEA(12)) == GetProcAddress(dll, "DirectDrawEnumerateExA"));
+    REQUIRE(GetProcAddress(dll, MAKEINTRESOURCEA(13)) == GetProcAddress(dll, "DirectDrawEnumerateExW"));
+    REQUIRE(GetProcAddress(dll, MAKEINTRESOURCEA(14)) == GetProcAddress(dll, "DirectDrawEnumerateW"));
+    REQUIRE(dd_get_proc(dll, "DirectDrawCreate") == (FARPROC)create_ord);
+
+    REQUIRE(acquire() == 0);
+    REQUIRE(acquire() == 0);
+    REQUIRE(release() == 0);
+    REQUIRE(release() == 0);
+    REQUIRE(sysmem(0) == 0);
+    REQUIRE(ilock(0, 0) == 0);
+    REQUIRE(iunlock(0) == 0);
+    REQUIRE(FAILED(parse_cmd(NULL, &ret_cmd)) && ret_cmd == NULL);
+    REQUIRE(is_windowed() == TRUE);
+    enable_zoom();
+    REQUIRE(can_unload() == S_FALSE);
+
+    // COM class factory for CLSID_DirectDraw7 + Initialize.
+    CHECK(get_class(&CLSID_DirectDraw7, &IID_IClassFactory, (void **)&factory));
+    CHECK(IClassFactory_CreateInstance(factory, NULL, &IID_IDirectDraw7, (void **)&dd7));
+    CHECK(IDirectDraw7_Initialize(dd7, NULL));
+    REQUIRE(IDirectDraw7_Initialize(dd7, NULL) == DDERR_ALREADYINITIALIZED);
+    IDirectDraw7_Release(dd7);
+    IClassFactory_Release(factory);
+
+    // COM class factory for CLSID_DirectDrawClipper + Initialize.
+    CHECK(get_class(&CLSID_DirectDrawClipper, &IID_IClassFactory, (void **)&factory));
+    CHECK(IClassFactory_CreateInstance(factory, NULL, &IID_IDirectDrawClipper, (void **)&clipper));
+    CHECK(IDirectDrawClipper_Initialize(clipper, NULL, 0));
+    REQUIRE(IDirectDrawClipper_Initialize(clipper, NULL, 0) == DDERR_ALREADYINITIALIZED);
+    IDirectDrawClipper_Release(clipper);
+    IClassFactory_Release(factory);
+
+    puts("passed DLL export ordinals, thread lock, helpers & COM class factory");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     wchar_t path[MAX_PATH];
     const DWORD len = GetModuleFileNameW(NULL, path, MAX_PATH);
@@ -458,6 +529,7 @@ int main(int argc, char **argv) {
     REQUIRE(IDirectDraw_Release(draw) == 0);
     REQUIRE(exercise_interfaces(dll, window) == 0);
     REQUIRE(exercise_compat(dll) == 0);
+    REQUIRE(exercise_exports(dll) == 0);
     if (window) DestroyWindow(window);
     FreeLibrary(dll);
     puts("x86 DirectDraw smoke test passed");
