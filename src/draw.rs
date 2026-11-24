@@ -328,6 +328,7 @@ struct Draw {
     manage_window: Cell<bool>,
     changing_window: RefCell<()>,
     vblank_epoch: Instant,
+    cached_hz: Cell<u32>,
     initialized: Cell<bool>,
 }
 
@@ -355,6 +356,7 @@ impl Draw {
             manage_window: Cell::new(false),
             changing_window: RefCell::new(()),
             vblank_epoch: Instant::now(),
+            cached_hz: Cell::new(0),
             initialized: Cell::new(initialized),
         }
     }
@@ -459,13 +461,25 @@ impl Draw_Impl {
         self.as_interface::<IDirectDraw>().to_owned()
     }
 
-    fn monitor_hz(&self) -> u32 {
+    fn refresh_cached_hz(&self) -> u32 {
         let mut hz = 0u32;
-        if IDirectDraw_Impl::GetMonitorFrequency(self, &mut hz).is_ok() && (24..=500).contains(&hz)
+        let resolved = if IDirectDraw_Impl::GetMonitorFrequency(self, &mut hz).is_ok()
+            && (24..=500).contains(&hz)
         {
             hz
         } else {
             60
+        };
+        self.cached_hz.set(resolved);
+        resolved
+    }
+
+    fn monitor_hz(&self) -> u32 {
+        let cached = self.cached_hz.get();
+        if cached != 0 {
+            cached
+        } else {
+            self.refresh_cached_hz()
         }
     }
 
@@ -1027,6 +1041,7 @@ impl IDirectDraw_Impl for Draw_Impl {
             display.renderer = replacement;
             display.consecutive_present_failures = 0;
             self.hwnd.set(hwnd);
+            self.cached_hz.set(0);
             let prev_id = self.bind_id.get();
             if hwnd.is_invalid() {
                 window::unbind_window(prev_id);

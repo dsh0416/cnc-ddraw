@@ -443,6 +443,19 @@ pub fn colorfill_rect(
     dst_key: Option<KeyRange>,
 ) {
     let row_bytes = width * bytes;
+    if dst_key.is_none() && bytes == 1 {
+        let color = color_le[0];
+        if left == 0 && row_bytes == pitch {
+            let start = top * pitch;
+            pixels[start..start + height * pitch].fill(color);
+        } else {
+            for y in 0..height {
+                let start = (top + y) * pitch + left;
+                pixels[start..start + row_bytes].fill(color);
+            }
+        }
+        return;
+    }
     let level = Level::new();
     match bytes {
         1 => dispatch!(level, simd => {
@@ -454,19 +467,50 @@ pub fn colorfill_rect(
         }),
         2 => dispatch!(level, simd => {
             let color = u16::from_le_bytes([color_le[0], color_le[1]]);
-            for y in 0..height {
-                let start = (top + y) * pitch + left * 2;
-                fill_row_u16_simd(simd, &mut pixels[start..start + row_bytes], color, dst_key);
+            if dst_key.is_none() && left == 0 && row_bytes == pitch {
+                let start = top * pitch;
+                fill_row_u16_simd(simd, &mut pixels[start..start + height * pitch], color, None);
+            } else {
+                for y in 0..height {
+                    let start = (top + y) * pitch + left * 2;
+                    fill_row_u16_simd(simd, &mut pixels[start..start + row_bytes], color, dst_key);
+                }
             }
         }),
         _ => dispatch!(level, simd => {
             let color = u32::from_le_bytes(color_le);
-            for y in 0..height {
-                let start = (top + y) * pitch + left * 4;
-                fill_row_u32_simd(simd, &mut pixels[start..start + row_bytes], color, dst_key);
+            if dst_key.is_none() && left == 0 && row_bytes == pitch {
+                let start = top * pitch;
+                fill_row_u32_simd(simd, &mut pixels[start..start + height * pitch], color, None);
+            } else {
+                for y in 0..height {
+                    let start = (top + y) * pitch + left * 4;
+                    fill_row_u32_simd(simd, &mut pixels[start..start + row_bytes], color, dst_key);
+                }
             }
         }),
     }
+}
+
+#[inline(always)]
+fn copy_row_simd<S: Simd>(simd: S, src: &[u8], dst: &mut [u8]) {
+    let mut s_chunks = src.chunks_exact(S::u8s::LEN);
+    let mut d_chunks = dst.chunks_exact_mut(S::u8s::LEN);
+    for (sc, dc) in (&mut s_chunks).zip(&mut d_chunks) {
+        S::u8s::from_slice(simd, sc).store_slice(dc);
+    }
+    let sr = s_chunks.remainder();
+    let dr = d_chunks.into_remainder();
+    if !sr.is_empty() {
+        dr.copy_from_slice(sr);
+    }
+}
+
+/// Copies a contiguous byte slice using runtime-dispatched SIMD (AVX2 / SSE).
+pub fn copy_bytes(src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len());
+    let level = Level::new();
+    dispatch!(level, simd => copy_row_simd(simd, src, dst));
 }
 
 /// Blits an unstretched-X, same-format, non-horizontally-mirrored rectangle with optional
@@ -491,6 +535,55 @@ pub fn blit_rect_same_format(
 ) {
     let row_bytes = width * bytes;
     let level = Level::new();
+    if src_key.is_none() && dst_key.is_none() {
+        dispatch!(level, simd => {
+            if !mirror_ud
+                && dh == sh
+                && dst_left == 0
+                && src_left == 0
+                && row_bytes == dst_pitch
+                && dst_pitch == src_pitch
+            {
+                let total = dh * dst_pitch;
+                let s_start = src_top * src_pitch;
+                let d_start = dst_top * dst_pitch;
+                copy_row_simd(
+                    simd,
+                    &src_pixels[s_start..s_start + total],
+                    &mut dst_pixels[d_start..d_start + total],
+                );
+                return;
+            }
+            let y_step = if dh == sh {
+                0u64
+            } else {
+                ((sh as u64) << 16) / (dh as u64)
+            };
+            let mut y_acc = 0u64;
+            for y in 0..dh {
+                let src_y_rel = if dh == sh {
+                    y
+                } else {
+                    let r = (y_acc >> 16) as usize;
+                    y_acc += y_step;
+                    r
+                };
+                let sy = if mirror_ud {
+                    src_top + (sh - 1 - src_y_rel)
+                } else {
+                    src_top + src_y_rel
+                };
+                let s_start = sy * src_pitch + src_left * bytes;
+                let d_start = (dst_top + y) * dst_pitch + dst_left * bytes;
+                copy_row_simd(
+                    simd,
+                    &src_pixels[s_start..s_start + row_bytes],
+                    &mut dst_pixels[d_start..d_start + row_bytes],
+                );
+            }
+        });
+        return;
+    }
     match bytes {
         1 => dispatch!(level, simd => {
             for y in 0..dh {

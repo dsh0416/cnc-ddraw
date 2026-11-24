@@ -11,9 +11,9 @@ use windows::core::{implement, Error, IUnknown, Interface, OutRef, Ref, Result, 
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, HANDLE, RECT};
 use windows::Win32::Graphics::DirectDraw::*;
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, SelectObject,
-    BITMAPINFO, BITMAPINFOHEADER, BI_BITFIELDS, BI_RGB, BLACKNESS, DIB_RGB_COLORS, HBITMAP, HDC,
-    HGDIOBJ, PALETTEENTRY, PATCOPY, SRCCOPY, WHITENESS,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, RestoreDC, SaveDC,
+    SelectObject, SetDIBColorTable, BITMAPINFO, BITMAPINFOHEADER, BI_BITFIELDS, BI_RGB, BLACKNESS,
+    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PALETTEENTRY, PATCOPY, RGBQUAD, SRCCOPY, WHITENESS,
 };
 
 use crate::clipper;
@@ -264,7 +264,7 @@ pub fn pixel_format(bpp: u32) -> Result<DDPIXELFORMAT> {
 enum Access {
     Ready,
     Locked { rect: RECT },
-    Gdi(SurfaceDc),
+    Gdi { handle: HDC, saved_state: i32 },
 }
 
 enum PrivateData {
@@ -291,6 +291,7 @@ struct SurfaceDc {
     bitmap: HBITMAP,
     previous: HGDIOBJ,
     bits: *mut c_void,
+    synced_uniqueness: u32,
 }
 
 impl SurfaceDc {
@@ -333,6 +334,7 @@ impl SurfaceDc {
             bitmap: HBITMAP::default(),
             previous: HGDIOBJ::default(),
             bits: std::ptr::null_mut(),
+            synced_uniqueness: 0,
         };
         if dc.handle.is_invalid() {
             return Err(DDERR_CANTCREATEDC.into());
@@ -351,13 +353,28 @@ impl SurfaceDc {
             if dc.bits.is_null() || dc.previous.is_invalid() {
                 return Err(DDERR_CANTCREATEDC.into());
             }
-            std::ptr::copy_nonoverlapping(
-                surface.pixel_slice().as_ptr(),
-                dc.bits.cast(),
-                surface.image_len,
-            );
         }
         Ok(dc)
+    }
+
+    fn bits_slice(&self, len: usize) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.bits.cast::<u8>(), len) }
+    }
+
+    fn bits_slice_mut(&mut self, len: usize) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.bits.cast::<u8>(), len) }
+    }
+
+    fn sync_palette(&self, entries: &[PALETTEENTRY; 256]) {
+        let mut quads = [RGBQUAD::default(); 256];
+        for (q, e) in quads.iter_mut().zip(entries.iter()) {
+            q.rgbBlue = e.peBlue;
+            q.rgbGreen = e.peGreen;
+            q.rgbRed = e.peRed;
+        }
+        unsafe {
+            let _ = SetDIBColorTable(self.handle, 0, &quads);
+        }
     }
 }
 
@@ -387,6 +404,7 @@ pub struct SurfaceData {
     format: Format,
     caps: u32,
     pixels: Vec<u8>,
+    cached_dc: Option<SurfaceDc>,
     palette: Option<IDirectDrawPalette>,
     clipper: Option<IDirectDrawClipper>,
     source_key: Option<DDCOLORKEY>,
@@ -427,6 +445,7 @@ impl SurfaceData {
             format,
             caps,
             pixels: zeros(alloc_len)?,
+            cached_dc: None,
             palette: None,
             clipper: None,
             access: Access::Ready,
@@ -468,12 +487,19 @@ impl SurfaceData {
         self.pixels.as_ptr().wrapping_add(self.pixel_offset)
     }
 
+    fn ensure_cached_dc(&mut self) -> Result<()> {
+        if self.cached_dc.is_none() {
+            self.cached_dc = Some(SurfaceDc::new(self)?);
+        }
+        Ok(())
+    }
+
     pub fn byte_len(&self) -> usize {
         self.image_len
     }
 
     pub fn has_dc(&self, hdc: HDC) -> bool {
-        matches!(&self.access, Access::Gdi(dc) if dc.handle == hdc)
+        matches!(self.access, Access::Gdi { handle, .. } if handle == hdc)
     }
 
     pub fn is_primary(&self) -> bool {
@@ -1568,6 +1594,7 @@ impl Surface {
                 std::mem::swap(&mut front.pixels, &mut back_data.pixels);
                 std::mem::swap(&mut front.pixel_offset, &mut back_data.pixel_offset);
                 std::mem::swap(&mut front.image_len, &mut back_data.image_len);
+                std::mem::swap(&mut front.cached_dc, &mut back_data.cached_dc);
                 front.bump_uniqueness();
                 back_data.bump_uniqueness();
             }
@@ -1585,6 +1612,7 @@ impl Surface {
         let mut carried_pixels = std::mem::take(&mut front.pixels);
         let mut carried_offset = front.pixel_offset;
         let mut carried_len = front.image_len;
+        let mut carried_dc = front.cached_dc.take();
         drop(front);
         for surf in chain.iter().rev() {
             let obj = surf.cast_object_ref::<Surface>()?;
@@ -1592,12 +1620,14 @@ impl Surface {
             std::mem::swap(&mut data.pixels, &mut carried_pixels);
             std::mem::swap(&mut data.pixel_offset, &mut carried_offset);
             std::mem::swap(&mut data.image_len, &mut carried_len);
+            std::mem::swap(&mut data.cached_dc, &mut carried_dc);
             data.bump_uniqueness();
         }
         let mut front = self.write()?;
         front.pixels = carried_pixels;
         front.pixel_offset = carried_offset;
         front.image_len = carried_len;
+        front.cached_dc = carried_dc;
         front.bump_uniqueness();
         drop(front);
         self.present_now()
@@ -1761,6 +1791,7 @@ impl Surface {
         data.pixel_offset = top_guard;
         data.image_len = image_len;
         data.pixels = zeros(alloc_len)?;
+        data.cached_dc = None;
         if desc.dwFlags & DDSD_LPSURFACE as u32 != 0 && !desc.lpSurface.is_null() {
             let dst_ptr = data.surface_ptr();
             unsafe {
@@ -2016,10 +2047,97 @@ fn blit(
         );
         return;
     }
+    // Fast 16.16 fixed-point DDA stretch blit for same-format non-keyed copies, with row reuse.
+    if same_format && opts.src_key.is_none() && opts.dst_key.is_none() && !opts.mirror_lr {
+        let dst_pitch = dst.pitch;
+        let dst_pixels = dst.pixel_slice_mut();
+        let x_step = ((sw as u64) << 16) / (dw as u64);
+        let y_step = if dh == sh {
+            0u64
+        } else {
+            ((sh as u64) << 16) / (dh as u64)
+        };
+        let row_bytes = dw * dst_bytes;
+        let mut y_acc = 0u64;
+        let mut prev_sy = usize::MAX;
+        for y in 0..dh {
+            let src_y_rel = if dh == sh {
+                y
+            } else {
+                let r = (y_acc >> 16) as usize;
+                y_acc += y_step;
+                r
+            };
+            let sy = if opts.mirror_ud {
+                src.top as usize + (sh - 1 - src_y_rel)
+            } else {
+                src.top as usize + src_y_rel
+            };
+            let dst_start = (dest.top as usize + y) * dst_pitch + dest.left as usize * dst_bytes;
+            if y > 0 && sy == prev_sy {
+                let prev_start = dst_start - dst_pitch;
+                dst_pixels.copy_within(prev_start..prev_start + row_bytes, dst_start);
+                continue;
+            }
+            prev_sy = sy;
+            let src_start = sy * pitch + src.left as usize * src_bytes;
+            let s_row = &source[src_start..src_start + sw * src_bytes];
+            let d_row = &mut dst_pixels[dst_start..dst_start + row_bytes];
+            let step32 = x_step as u32;
+            let max_src_idx = (((dw - 1) as u64 * x_step) >> 16) as usize;
+            let mut acc = 0u32;
+            match dst_bytes {
+                1 => {
+                    assert!(max_src_idx < s_row.len());
+                    for out_px in d_row.iter_mut() {
+                        // SAFETY: max_src_idx < s_row.len() and acc is monotonically bounded by (dw - 1) * x_step.
+                        *out_px = unsafe { *s_row.get_unchecked((acc >> 16) as usize) };
+                        acc = acc.wrapping_add(step32);
+                    }
+                }
+                2 => {
+                    let s_u16 = s_row.as_chunks::<2>().0;
+                    assert!(max_src_idx < s_u16.len());
+                    for out_px in d_row.as_chunks_mut::<2>().0.iter_mut() {
+                        // SAFETY: max_src_idx < s_u16.len() and acc is monotonically bounded by (dw - 1) * x_step.
+                        *out_px = unsafe { *s_u16.get_unchecked((acc >> 16) as usize) };
+                        acc = acc.wrapping_add(step32);
+                    }
+                }
+                _ => {
+                    let s_u32 = s_row.as_chunks::<4>().0;
+                    assert!(max_src_idx < s_u32.len());
+                    for out_px in d_row.as_chunks_mut::<4>().0.iter_mut() {
+                        // SAFETY: max_src_idx < s_u32.len() and acc is monotonically bounded by (dw - 1) * x_step.
+                        *out_px = unsafe { *s_u32.get_unchecked((acc >> 16) as usize) };
+                        acc = acc.wrapping_add(step32);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     let default_pal = [PALETTEENTRY::default(); 256];
     let pal = src_palette.unwrap_or(&default_pal);
+    let dst_format = dst.format;
+    let dst_pitch = dst.pitch;
+    let dst_pixels = dst.pixel_slice_mut();
+    let x_step = ((sw as u64) << 16) / (dw as u64);
+    let y_step = if dh == sh {
+        0u64
+    } else {
+        ((sh as u64) << 16) / (dh as u64)
+    };
+    let mut y_acc = 0u64;
     for y in 0..dh {
-        let src_y_rel = (y as u64 * sh as u64 / dh as u64) as usize;
+        let src_y_rel = if dh == sh {
+            y
+        } else {
+            let r = (y_acc >> 16) as usize;
+            y_acc += y_step;
+            r
+        };
         let sy = if opts.mirror_ud {
             src.top as usize + (sh - 1 - src_y_rel)
         } else {
@@ -2027,11 +2145,12 @@ fn blit(
         };
         let start = sy * pitch + src.left as usize * src_bytes;
         let row = &source[start..start + sw * src_bytes];
-        let start =
-            dst.pixel_offset + (dest.top as usize + y) * dst.pitch + dest.left as usize * dst_bytes;
-        let out = &mut dst.pixels[start..start + dw * dst_bytes];
-        for (x, target) in out.chunks_exact_mut(dst_bytes).enumerate() {
-            let src_x_rel = (x as u64 * sw as u64 / dw as u64) as usize;
+        let d_start = (dest.top as usize + y) * dst_pitch + dest.left as usize * dst_bytes;
+        let out = &mut dst_pixels[d_start..d_start + dw * dst_bytes];
+        let mut x_acc = 0u64;
+        for target in out.chunks_exact_mut(dst_bytes) {
+            let src_x_rel = (x_acc >> 16) as usize;
+            x_acc += x_step;
             let sx = if opts.mirror_lr {
                 (sw - 1 - src_x_rel) * src_bytes
             } else {
@@ -2052,7 +2171,7 @@ fn blit(
                 target.copy_from_slice(pixel);
             } else {
                 let rgb = src_format.decode_rgb(pixel, pal);
-                dst.format.encode_rgb(rgb, target);
+                dst_format.encode_rgb(rgb, target);
             }
         }
     }
@@ -2302,36 +2421,78 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
             out.write(HDC::default());
         }
         let mut data = self.write()?;
-        if matches!(data.access, Access::Gdi(_)) {
+        if matches!(data.access, Access::Gdi { .. }) {
             return Err(DDERR_DCALREADYCREATED.into());
         }
         data.ready()?;
-        let dc = SurfaceDc::new(&data)?;
-        unsafe {
-            out.write(dc.handle);
+        let entries = if data.format == Format::Indexed {
+            Some(data.palette_entries()?)
+        } else {
+            None
+        };
+        let own_dc = data.caps & DDSCAPS_OWNDC as u32 != 0;
+        let uniqueness = data.uniqueness;
+        let len = data.image_len;
+        data.ensure_cached_dc()?;
+        let src_start = data.pixel_offset;
+        let SurfaceData {
+            ref pixels,
+            ref mut cached_dc,
+            ..
+        } = *data;
+        let dc = cached_dc.as_mut().expect("cached_dc initialized");
+        if dc.synced_uniqueness != uniqueness {
+            simd_blit::copy_bytes(&pixels[src_start..src_start + len], dc.bits_slice_mut(len));
+            dc.synced_uniqueness = uniqueness;
         }
-        data.access = Access::Gdi(dc);
+        if let Some(ref entries) = entries {
+            dc.sync_palette(entries);
+        }
+        let handle = dc.handle;
+        let saved_state = if own_dc { 0 } else { unsafe { SaveDC(handle) } };
+        unsafe {
+            out.write(handle);
+        }
+        data.access = Access::Gdi {
+            handle,
+            saved_state,
+        };
         Ok(())
     }
 
     fn ReleaseDC(&self, handle: HDC) -> Result<()> {
         let mut data = self.write()?;
-        let Access::Gdi(dc) = &data.access else {
+        let Access::Gdi {
+            handle: dc_handle,
+            saved_state,
+        } = data.access
+        else {
             return Err(DDERR_NODC.into());
         };
-        if handle != dc.handle {
+        if handle != dc_handle {
             return Err(E_INVALIDARG.into());
         }
-        let bits = dc.bits;
-        let len = data.image_len;
-        let dst_ptr = data.surface_ptr();
         unsafe {
-            // GDI queues draws on the calling thread. Flush before reading the DIB.
+            // GDI queues draws on the calling thread; flush before copying back to stable surface RAM.
             let _ = GdiFlush();
-            std::ptr::copy_nonoverlapping(bits.cast(), dst_ptr, len);
+            if saved_state != 0 {
+                let _ = RestoreDC(dc_handle, saved_state);
+            }
+        }
+        let len = data.image_len;
+        let dst_start = data.pixel_offset;
+        data.bump_uniqueness();
+        let new_uniqueness = data.uniqueness;
+        let SurfaceData {
+            ref mut pixels,
+            ref mut cached_dc,
+            ..
+        } = *data;
+        if let Some(dc) = cached_dc.as_mut() {
+            simd_blit::copy_bytes(dc.bits_slice(len), &mut pixels[dst_start..dst_start + len]);
+            dc.synced_uniqueness = new_uniqueness;
         }
         data.access = Access::Ready;
-        data.bump_uniqueness();
         drop(data);
         self.refresh()
     }
@@ -3160,5 +3321,16 @@ mod tests {
         assert_eq!(surface.image_len, 1280 * 480);
         assert!(surface.pixel_offset >= 1280 * 64);
         assert!(surface.pixels.len() - (surface.pixel_offset + surface.image_len) >= 1280 * 200);
+    }
+
+    #[test]
+    fn get_dc_preserves_stable_surface_pointer_and_guard_padding() {
+        let mut surface = SurfaceData::new(1024, 768, Format::Rgb565, 0).unwrap();
+        let ptr_before = surface.surface_ptr();
+        let offset_before = surface.pixel_offset;
+        surface.ensure_cached_dc().unwrap();
+        assert_eq!(surface.surface_ptr(), ptr_before);
+        assert_eq!(surface.pixel_offset, offset_before);
+        assert!(surface.pixel_offset >= surface.pitch * 64);
     }
 }
