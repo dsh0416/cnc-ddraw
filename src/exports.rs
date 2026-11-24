@@ -48,7 +48,7 @@ unsafe impl Sync for ThreadLock {}
 
 fn dd_thread_lock() -> &'static ThreadLock {
     static LOCK: OnceLock<&'static ThreadLock> = OnceLock::new();
-    *LOCK.get_or_init(|| {
+    LOCK.get_or_init(|| {
         let boxed = Box::leak(Box::new(ThreadLock(UnsafeCell::new(
             CRITICAL_SECTION::default(),
         ))));

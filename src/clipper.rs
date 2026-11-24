@@ -155,9 +155,7 @@ impl Clipper {
         let header = unsafe { &*buf.as_ptr().cast::<RGNDATAHEADER>() };
         let count = header.nCount as usize;
         let offset = header.dwSize as usize;
-        let rects_end = offset
-            .checked_add(count.checked_mul(size_of::<RECT>()).unwrap_or(usize::MAX))
-            .unwrap_or(usize::MAX);
+        let rects_end = offset.saturating_add(count.saturating_mul(size_of::<RECT>()));
         if rects_end > written {
             return Ok(Some(Vec::new()));
         }

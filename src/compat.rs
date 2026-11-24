@@ -58,7 +58,10 @@ fn nt_query_information_thread() -> Option<NtQueryInformationThreadFn> {
     *NT_QUERY_THREAD.get_or_init(|| unsafe {
         let ntdll = GetModuleHandleW(w!("ntdll.dll")).ok()?;
         let proc = GetProcAddress(ntdll, s!("NtQueryInformationThread"))?;
-        Some(std::mem::transmute::<_, NtQueryInformationThreadFn>(proc))
+        Some(std::mem::transmute::<
+            unsafe extern "system" fn() -> isize,
+            NtQueryInformationThreadFn,
+        >(proc))
     })
 }
 

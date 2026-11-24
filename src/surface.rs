@@ -18,6 +18,7 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::clipper;
 use crate::draw::Display;
+use crate::simd_blit::{self, KeyRange};
 
 const fn dd_hresult(code: u32) -> HRESULT {
     HRESULT((0x8876_0000 | code) as i32)
@@ -133,15 +134,18 @@ pub fn desc_to_desc2(d: &DDSURFACEDESC) -> DDSURFACEDESC2 {
     d2
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Format {
-    Indexed,
-    Rgb555,
-    Rgb565,
-    Xrgb,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PixelFormat {
+    Indexed = 0,
+    Rgb555 = 1,
+    Rgb565 = 2,
+    Xrgb = 3,
 }
 
-impl Format {
+type Format = PixelFormat;
+
+impl PixelFormat {
     fn from_depth(bpp: u32) -> Result<Self> {
         match bpp {
             8 => Ok(Self::Indexed),
@@ -173,7 +177,7 @@ impl Format {
         }
     }
 
-    fn bytes(self) -> usize {
+    pub fn bytes(self) -> usize {
         match self {
             Self::Indexed => 1,
             Self::Rgb565 | Self::Rgb555 => 2,
@@ -439,8 +443,16 @@ impl SurfaceData {
         })
     }
 
-    fn pixel_slice(&self) -> &[u8] {
+    pub fn pixel_slice(&self) -> &[u8] {
         &self.pixels[self.pixel_offset..self.pixel_offset + self.image_len]
+    }
+
+    pub fn pixel_format(&self) -> PixelFormat {
+        self.format
+    }
+
+    pub fn pitch(&self) -> u32 {
+        self.pitch as u32
     }
 
     fn pixel_slice_mut(&mut self) -> &mut [u8] {
@@ -580,8 +592,47 @@ impl SurfaceData {
         }
         Ok(entries)
     }
+
+    /// Builds the 256-entry RGBA lookup table uploaded to the WGSL presentation shader.
+    /// For `Indexed`, this contains the 256-color palette (with optional gamma pre-baked).
+    /// For RGB formats, this contains the per-channel gamma ramp (or identity 0..=255).
+    pub fn build_lut(&self) -> Result<[[u8; 4]; 256]> {
+        let gamma = self.gamma.as_ref();
+        let mut lut = [[0u8; 4]; 256];
+        if self.format == Format::Indexed {
+            let entries = self.palette_entries()?;
+            for (slot, e) in lut.iter_mut().zip(entries.iter()) {
+                let (r, g, b) = if let Some(ramp) = gamma {
+                    (
+                        (ramp.red[e.peRed as usize] >> 8) as u8,
+                        (ramp.green[e.peGreen as usize] >> 8) as u8,
+                        (ramp.blue[e.peBlue as usize] >> 8) as u8,
+                    )
+                } else {
+                    (e.peRed, e.peGreen, e.peBlue)
+                };
+                *slot = [r, g, b, 255];
+            }
+        } else if let Some(ramp) = gamma {
+            for (i, slot) in lut.iter_mut().enumerate() {
+                *slot = [
+                    (ramp.red[i] >> 8) as u8,
+                    (ramp.green[i] >> 8) as u8,
+                    (ramp.blue[i] >> 8) as u8,
+                    255,
+                ];
+            }
+        } else {
+            for (i, slot) in lut.iter_mut().enumerate() {
+                let v = i as u8;
+                *slot = [v, v, v, 255];
+            }
+        }
+        Ok(lut)
+    }
 }
 
+#[cfg(test)]
 const LUT5: [u8; 32] = {
     let mut table = [0u8; 32];
     let mut i = 0;
@@ -592,6 +643,7 @@ const LUT5: [u8; 32] = {
     table
 };
 
+#[cfg(test)]
 const LUT6: [u8; 64] = {
     let mut table = [0u8; 64];
     let mut i = 0;
@@ -602,6 +654,7 @@ const LUT6: [u8; 64] = {
     table
 };
 
+#[cfg(test)]
 pub fn frame_rgba(data: &SurfaceData, rgba: &mut Vec<u8>) -> Result<()> {
     data.ready()?;
     let width = data.width as usize;
@@ -1227,19 +1280,24 @@ impl Surface {
         dst.ready()?;
         let bytes = dst.format.bytes();
         let pitch = dst.pitch;
+        let width = (rect.right - rect.left) as usize;
+        let height = (rect.bottom - rect.top) as usize;
+        let dk = dst_key.map(|k| KeyRange {
+            lo: k.dwColorSpaceLowValue,
+            hi: k.dwColorSpaceHighValue,
+        });
         let pixels = dst.pixel_slice_mut();
-        for y in rect.top as usize..rect.bottom as usize {
-            let row = &mut pixels
-                [y * pitch + rect.left as usize * bytes..y * pitch + rect.right as usize * bytes];
-            for pixel in row.chunks_exact_mut(bytes) {
-                if let Some(range) = dst_key {
-                    if !pixel_in_key(pixel, range) {
-                        continue;
-                    }
-                }
-                pixel.copy_from_slice(&color[..bytes]);
-            }
-        }
+        simd_blit::colorfill_rect(
+            pixels,
+            pitch,
+            rect.left as usize,
+            rect.top as usize,
+            width,
+            height,
+            bytes,
+            color,
+            dk,
+        );
         dst.bump_uniqueness();
         Ok(())
     }
@@ -1928,67 +1986,34 @@ fn blit(
         (src.right - src.left) as usize,
         (src.bottom - src.top) as usize,
     );
-    if same_format && dw == sw && !opts.mirror_lr && opts.dst_key.is_none() {
-        for y in 0..dh {
-            let src_y_rel = if dh == sh {
-                y
-            } else {
-                (y as u64 * sh as u64 / dh as u64) as usize
-            };
-            let sy = if opts.mirror_ud {
-                src.top as usize + (sh - 1 - src_y_rel)
-            } else {
-                src.top as usize + src_y_rel
-            };
-            let start = sy * pitch + src.left as usize * src_bytes;
-            let row = &source[start..start + sw * src_bytes];
-            let start = dst.pixel_offset
-                + (dest.top as usize + y) * dst.pitch
-                + dest.left as usize * dst_bytes;
-            let out = &mut dst.pixels[start..start + dw * dst_bytes];
-            let Some(range) = opts.src_key else {
-                out.copy_from_slice(row);
-                continue;
-            };
-            let (lo, hi) = (range.dwColorSpaceLowValue, range.dwColorSpaceHighValue);
-            match dst_bytes {
-                1 => {
-                    let (lo, hi) = (lo as u8, hi as u8);
-                    for (&sp, dp) in row.iter().zip(out.iter_mut()) {
-                        if sp < lo || sp > hi {
-                            *dp = sp;
-                        }
-                    }
-                }
-                2 => {
-                    let (lo, hi) = (lo as u16, hi as u16);
-                    for (sp, dp) in row
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .zip(out.as_chunks_mut::<2>().0.iter_mut())
-                    {
-                        let v = u16::from_le_bytes(*sp);
-                        if v < lo || v > hi {
-                            *dp = *sp;
-                        }
-                    }
-                }
-                _ => {
-                    for (sp, dp) in row
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .zip(out.as_chunks_mut::<4>().0.iter_mut())
-                    {
-                        let v = u32::from_le_bytes(*sp);
-                        if v < lo || v > hi {
-                            *dp = *sp;
-                        }
-                    }
-                }
-            }
-        }
+    if same_format && dw == sw && !opts.mirror_lr {
+        let sk = opts.src_key.map(|k| KeyRange {
+            lo: k.dwColorSpaceLowValue,
+            hi: k.dwColorSpaceHighValue,
+        });
+        let dk = opts.dst_key.map(|k| KeyRange {
+            lo: k.dwColorSpaceLowValue,
+            hi: k.dwColorSpaceHighValue,
+        });
+        let dst_pitch = dst.pitch;
+        let dst_pixels = dst.pixel_slice_mut();
+        simd_blit::blit_rect_same_format(
+            dst_pixels,
+            dst_pitch,
+            dest.left as usize,
+            dest.top as usize,
+            source,
+            pitch,
+            src.left as usize,
+            src.top as usize,
+            dw,
+            dh,
+            sh,
+            opts.mirror_ud,
+            dst_bytes,
+            sk,
+            dk,
+        );
         return;
     }
     let default_pal = [PALETTEENTRY::default(); 256];

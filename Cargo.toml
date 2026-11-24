@@ -10,6 +10,7 @@ name = "ddraw"
 crate-type = ["cdylib"]
 
 [dependencies]
+fearless_simd = "1.2.0"
 pollster = "0.4"
 raw-window-handle = "0.6.2"
 wgpu = { version = "27.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"] }

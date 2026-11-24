@@ -1,5 +1,5 @@
-//! Pure wgpu presentation backend. All Win32 overlay lifecycle and Z-order management lives
-//! in `crate::window::OverlayWindow`.
+//! Pure wgpu presentation backend with GPU-side pixel unpacking (Indexed / RGB555 / RGB565 / XRGB)
+//! and palette/gamma LUT evaluation. All Win32 overlay management lives in `crate::window::OverlayWindow`.
 use std::num::NonZeroIsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use windows::Win32::Foundation::HWND;
 
 use crate::compat;
 use crate::config::{self, RendererBackend};
+use crate::surface::PixelFormat;
 use crate::window::{compute_viewport, OverlayWindow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,9 +34,37 @@ impl std::fmt::Display for PresentError {
     }
 }
 
+pub struct FrameView<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub format: PixelFormat,
+    pub pixels: &'a [u8],
+    pub lut: &'a [[u8; 4]; 256],
+}
+
+fn raw_texture_format(format: PixelFormat) -> wgpu::TextureFormat {
+    match format {
+        PixelFormat::Indexed => wgpu::TextureFormat::R8Uint,
+        PixelFormat::Rgb555 | PixelFormat::Rgb565 => wgpu::TextureFormat::R16Uint,
+        PixelFormat::Xrgb => wgpu::TextureFormat::R32Uint,
+    }
+}
+
+fn params_bytes(format: PixelFormat) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&(format as u32).to_le_bytes());
+    out
+}
+
 struct UploadedFrame {
-    texture: wgpu::Texture,
+    raw_texture: wgpu::Texture,
+    raw_format: wgpu::TextureFormat,
+    lut_texture: wgpu::Texture,
+    params_buffer: wgpu::Buffer,
     bindings: wgpu::BindGroup,
+    last_format: Option<PixelFormat>,
+    last_lut: Option<[[u8; 4]; 256]>,
 }
 
 impl UploadedFrame {
@@ -44,33 +73,73 @@ impl UploadedFrame {
         pipeline: &wgpu::RenderPipeline,
         target_format: wgpu::TextureFormat,
         size: wgpu::Extent3d,
+        raw_format: wgpu::TextureFormat,
     ) -> Self {
-        // Match the transfer function of the target to preserve the game's byte colors.
-        let format = if target_format.is_srgb() {
-            wgpu::TextureFormat::Rgba8UnormSrgb
-        } else {
-            wgpu::TextureFormat::Rgba8Unorm
-        };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("DirectDraw primary pixels"),
+        let raw_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("DirectDraw raw primary pixels"),
             size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format,
+            format: raw_format,
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let view = texture.create_view(&Default::default());
+        // Match the transfer function of the target to preserve exact game byte colors.
+        let lut_format = if target_format.is_srgb() {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
+        let lut_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("DirectDraw palette/gamma LUT"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: lut_format,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("DirectDraw present params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let raw_view = raw_texture.create_view(&Default::default());
+        let lut_view = lut_texture.create_view(&Default::default());
         let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("DirectDraw frame bindings"),
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&raw_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&lut_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
         });
-        UploadedFrame { texture, bindings }
+        UploadedFrame {
+            raw_texture,
+            raw_format,
+            lut_texture,
+            params_buffer,
+            bindings,
+            last_format: None,
+            last_lut: None,
+        }
     }
 }
 
@@ -172,7 +241,7 @@ impl Renderer {
         surface_cfg.present_mode = pick_present_mode(&caps, config::get().vsync);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("DirectDraw nearest-neighbor blit"),
+            label: Some("DirectDraw GPU unpack and blit"),
             source: wgpu::ShaderSource::Wgsl(include_str!("present.wgsl").into()),
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -216,26 +285,26 @@ impl Renderer {
         let _ = self.overlay.sync_to_owner();
     }
 
-    pub fn present(
-        &mut self,
-        width: u32,
-        height: u32,
-        rgba: &[u8],
-    ) -> Result<PresentOutcome, PresentError> {
+    pub fn present(&mut self, view_in: FrameView<'_>) -> Result<PresentOutcome, PresentError> {
         if self.device_lost.load(Ordering::Relaxed) {
             return Err(PresentError::DeviceLost("GPU device lost".into()));
         }
         let limit = self.device.limits().max_texture_dimension_2d;
+        let (width, height) = (view_in.width, view_in.height);
         if width == 0 || height == 0 || width > limit || height > limit {
             return Err(PresentError::Fatal(format!(
                 "unsupported frame dimensions {width}x{height}"
             )));
         }
-        let pitch = width
-            .checked_mul(4)
+        let min_row = width
+            .checked_mul(view_in.format.bytes() as u32)
             .ok_or_else(|| PresentError::Fatal("frame row size overflow".into()))?;
-        if (pitch as usize).checked_mul(height as usize) != Some(rgba.len()) {
-            return Err(PresentError::Fatal("incorrect RGBA frame length".into()));
+        if view_in.pitch < min_row
+            || (view_in.pitch as usize).checked_mul(height as usize) != Some(view_in.pixels.len())
+        {
+            return Err(PresentError::Fatal(
+                "incorrect raw frame buffer length".into(),
+            ));
         }
         let Some((target_w, target_h)) = self
             .overlay
@@ -304,22 +373,52 @@ impl Renderer {
             height,
             depth_or_array_layers: 1,
         };
+        let raw_format = raw_texture_format(view_in.format);
         if self
             .frame
             .as_ref()
-            .is_some_and(|frame| frame.texture.size() != size)
+            .is_some_and(|frame| frame.raw_texture.size() != size || frame.raw_format != raw_format)
         {
             self.frame = None;
         }
         let frame = self.frame.get_or_insert_with(|| {
-            UploadedFrame::new(&self.device, &self.pipeline, self.config.format, size)
+            UploadedFrame::new(
+                &self.device,
+                &self.pipeline,
+                self.config.format,
+                size,
+                raw_format,
+            )
         });
+        if frame.last_format != Some(view_in.format) {
+            self.queue
+                .write_buffer(&frame.params_buffer, 0, &params_bytes(view_in.format));
+            frame.last_format = Some(view_in.format);
+        }
+        if frame.last_lut.as_ref() != Some(view_in.lut) {
+            let lut_bytes = view_in.lut.as_flattened();
+            self.queue.write_texture(
+                frame.lut_texture.as_image_copy(),
+                lut_bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256 * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: 256,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            frame.last_lut = Some(*view_in.lut);
+        }
         self.queue.write_texture(
-            frame.texture.as_image_copy(),
-            rgba,
+            frame.raw_texture.as_image_copy(),
+            view_in.pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(pitch),
+                bytes_per_row: Some(view_in.pitch),
                 rows_per_image: None,
             },
             size,

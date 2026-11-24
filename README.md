@@ -56,7 +56,8 @@ Press **Alt+Enter** at any time to toggle between borderless fullscreen and wind
 - `src/clipper.rs` implements `IDirectDrawClipper` backed by Win32 GDI regions (`SetClipList`/`GetClipList`/`SetHWnd`/`GetHWnd`).
 - `src/palette.rs` stores the 256-entry `IDirectDrawPalette`. Changing an attached palette refreshes the primary image even when the pixel indices stay the same.
 - `src/exports.rs`, `exports.def`, and `build.rs` provide standard DirectDraw export ordinals (`@1`..`@21`), reentrant `AcquireDDThreadLock`/`ReleaseDDThreadLock`, legacy stubs (`CompleteCreateSysmemSurface`, `D3DParseUnknownCommand`, `DDInternalLock`/`DDInternalUnlock`), helper exports (`DDIsWindowed`, `DDGetProcAddress`, `DDEnableZoom`), and `DllGetClassObject`/`IClassFactory` for `CLSID_DirectDraw`, `CLSID_DirectDraw7`, and `CLSID_DirectDrawClipper`.
-- `src/renderer.rs` and `src/present.wgsl` share one presentation pipeline across Vulkan and DX12. Indexed, RGB555, RGB565 and XRGB8888 pixels are expanded on the CPU via LUTs (with optional gamma) and uploaded as RGBA. The shader scales with nearest-neighbor sampling into a centered, aspect-preserving (or stretched) viewport.
+- `src/renderer.rs` and `src/present.wgsl` share one presentation pipeline across Vulkan and DX12. Raw primary surface bytes (`R8Uint` indexed, `R16Uint` RGB555/RGB565, `R32Uint` XRGB8888) are uploaded directly without CPU conversion and unpacked in WGSL with a 256-entry palette/gamma LUT texture into a centered, aspect-preserving (or stretched) viewport.
+- `src/simd_blit.rs` uses `fearless_simd` for runtime-dispatched (SSE2 / SSE4.2 / AVX2 / AVX-512) branchless CPU color-keyed blits and rectangular color fills on CPU-backed surfaces.
 
 The implemented DirectDraw COM objects are single-threaded. Release the display and its surfaces, or detach the HWND with `SetCooperativeLevel(NULL, DDSCL_NORMAL)`, before destroying the window. Direct3D 3D game rendering remains outside this experiment's scope.
 

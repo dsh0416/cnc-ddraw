@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
 use crate::{
     clipper, compat, config, palette,
-    renderer::{PresentError, PresentOutcome, Renderer},
+    renderer::{FrameView, PresentError, PresentOutcome, Renderer},
     surface,
     window::{self, HostWindow, PresentationMode},
 };
@@ -122,7 +122,6 @@ pub struct Display {
     bound_hwnd: HWND,
     renderer: Option<Renderer>,
     host: Option<HostWindow>,
-    rgba: Vec<u8>,
     pub primary: Weak<RefCell<surface::SurfaceData>>,
     surfaces: Vec<(*mut c_void, Weak<RefCell<surface::SurfaceData>>)>,
     dirty: bool,
@@ -234,16 +233,23 @@ impl Display {
         if primary.locked() {
             return Ok(());
         }
-        surface::frame_rgba(&primary, &mut self.rgba)?;
+        let lut = primary.build_lut()?;
         let (width, height) = (primary.width, primary.height);
-        drop(primary);
         window::sync_presented_size(width, height);
 
         let result = self
             .renderer
             .as_mut()
             .expect("renderer checked above")
-            .present(width, height, &self.rgba);
+            .present(FrameView {
+                width,
+                height,
+                pitch: primary.pitch(),
+                format: primary.pixel_format(),
+                pixels: primary.pixel_slice(),
+                lut: &lut,
+            });
+        drop(primary);
         match result {
             Ok(PresentOutcome::Presented | PresentOutcome::Hidden) => {
                 self.dirty = false;
@@ -336,7 +342,6 @@ impl Draw {
                 bound_hwnd: HWND::default(),
                 renderer: None,
                 host: None,
-                rgba: Vec::new(),
                 primary: Weak::new(),
                 surfaces: Vec::new(),
                 dirty: false,

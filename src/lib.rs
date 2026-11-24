@@ -11,5 +11,6 @@ mod draw;
 mod exports;
 mod palette;
 mod renderer;
+mod simd_blit;
 mod surface;
 mod window;
