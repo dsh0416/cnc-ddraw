@@ -21,9 +21,10 @@ use windows::Win32::System::Threading::{
     EnterCriticalSection, InitializeCriticalSection, LeaveCriticalSection, CRITICAL_SECTION,
 };
 
-use crate::{clipper, draw, window};
+use crate::{clipper, compat, draw, window};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
+const DLL_THREAD_ATTACH: u32 = 2;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DllMain(
@@ -34,6 +35,8 @@ pub unsafe extern "system" fn DllMain(
     if reason == DLL_PROCESS_ATTACH {
         // Must run before WinMain creates any HWND so process DPI awareness is consistent.
         window::enable_dpi_awareness();
+    } else if reason == DLL_THREAD_ATTACH {
+        compat::on_thread_attach();
     }
     BOOL(1)
 }

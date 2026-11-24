@@ -259,7 +259,7 @@ pub fn pixel_format(bpp: u32) -> Result<DDPIXELFORMAT> {
 // A DirectDraw lock and a GDI DC both grant exclusive write access.
 enum Access {
     Ready,
-    Locked { offset: usize, rect: RECT },
+    Locked { rect: RECT },
     Gdi(SurfaceDc),
 }
 
@@ -1593,17 +1593,22 @@ impl Surface {
         let offset = r.top as usize * data.pitch + r.left as usize * data.format.bytes();
         desc.lpSurface = data.surface_ptr().wrapping_add(offset).cast();
         desc.dwFlags |= DDSD_LPSURFACE as u32;
-        data.access = Access::Locked { offset, rect: r };
+        data.access = Access::Locked { rect: r };
         Ok(desc)
     }
 
     fn unlock_ptr_impl(&self, address: *mut c_void) -> Result<()> {
         let mut data = self.write()?;
-        let Access::Locked { offset, .. } = data.access else {
+        let Access::Locked { .. } = data.access else {
             return Err(DDERR_NOTLOCKED.into());
         };
-        if !address.is_null() && address != data.surface_ptr().wrapping_add(offset).cast() {
-            return Err(E_INVALIDARG.into());
+        if !address.is_null() {
+            let base = data.surface_ptr() as usize;
+            let end = base.saturating_add(data.image_len);
+            let ptr = address as usize;
+            if ptr < base || ptr >= end {
+                return Err(E_INVALIDARG.into());
+            }
         }
         data.access = Access::Ready;
         data.bump_uniqueness();
@@ -1613,7 +1618,7 @@ impl Surface {
 
     fn unlock_rect_impl(&self, rect: *mut RECT) -> Result<()> {
         let mut data = self.write()?;
-        let Access::Locked { rect: locked, .. } = data.access else {
+        let Access::Locked { rect: locked } = data.access else {
             return Err(DDERR_NOTLOCKED.into());
         };
         if let Some(r) = unsafe { rect.as_ref() } {

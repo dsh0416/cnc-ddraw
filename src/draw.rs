@@ -22,8 +22,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
 use crate::{
-    clipper, config, palette,
-    renderer::Renderer,
+    clipper, compat, config, palette,
+    renderer::{PresentError, PresentOutcome, Renderer},
     surface,
     window::{self, HostWindow, PresentationMode},
 };
@@ -119,6 +119,7 @@ pub struct Display {
     pub width: u32,
     pub height: u32,
     pub bpp: u32,
+    bound_hwnd: HWND,
     renderer: Option<Renderer>,
     host: Option<HostWindow>,
     rgba: Vec<u8>,
@@ -127,6 +128,7 @@ pub struct Display {
     dirty: bool,
     flush_scheduled: bool,
     last_present: Option<Instant>,
+    consecutive_present_failures: u32,
 }
 
 impl Display {
@@ -202,11 +204,32 @@ impl Display {
     }
 
     pub fn present_now(&mut self) -> Result<()> {
-        let (Some(renderer), Some(primary)) = (&mut self.renderer, self.primary.upgrade()) else {
+        let Some(primary) = self.primary.upgrade() else {
             self.dirty = false;
             self.flush_scheduled = false;
             return Ok(());
         };
+        if self.renderer.is_none() {
+            if self.bound_hwnd.is_invalid() || !unsafe { IsWindow(Some(self.bound_hwnd)) }.as_bool()
+            {
+                self.dirty = false;
+                self.flush_scheduled = false;
+                return Ok(());
+            }
+            match Renderer::new(self.bound_hwnd.0 as isize) {
+                Ok(renderer) => {
+                    self.renderer = Some(renderer);
+                    self.consecutive_present_failures = 0;
+                    compat::log_msg("recreated wgpu renderer after device/surface loss");
+                }
+                Err(err) => {
+                    compat::log_msg(&format!("renderer recreate deferred: {err}"));
+                    self.dirty = true;
+                    window::arm_flush_timer(50);
+                    return Ok(());
+                }
+            }
+        }
         let primary = primary.try_borrow().map_err(|_| SURFACE_BUSY)?;
         if primary.locked() {
             return Ok(());
@@ -214,18 +237,60 @@ impl Display {
         surface::frame_rgba(&primary, &mut self.rgba)?;
         let (width, height) = (primary.width, primary.height);
         drop(primary);
-        self.dirty = false;
-        self.flush_scheduled = false;
-        self.last_present = Some(Instant::now());
-        window::disarm_flush_timer();
         window::sync_presented_size(width, height);
-        renderer
-            .present(width, height, &self.rgba)
-            .map_err(|message| Error::new(E_FAIL, message))
+
+        let result = self
+            .renderer
+            .as_mut()
+            .expect("renderer checked above")
+            .present(width, height, &self.rgba);
+        match result {
+            Ok(PresentOutcome::Presented | PresentOutcome::Hidden) => {
+                self.dirty = false;
+                self.flush_scheduled = false;
+                self.consecutive_present_failures = 0;
+                self.last_present = Some(Instant::now());
+                window::disarm_flush_timer();
+                Ok(())
+            }
+            Ok(PresentOutcome::Timeout) => {
+                self.dirty = true;
+                self.flush_scheduled = false;
+                window::arm_flush_timer(16);
+                Ok(())
+            }
+            Err(PresentError::Recoverable(msg)) => {
+                self.consecutive_present_failures =
+                    self.consecutive_present_failures.saturating_add(1);
+                compat::log_msg(&format!(
+                    "recoverable present error (#{}): {msg}",
+                    self.consecutive_present_failures
+                ));
+                if self.consecutive_present_failures >= 3 {
+                    // Drop and recreate the swapchain/device on the next tick.
+                    self.renderer = None;
+                }
+                self.dirty = true;
+                self.flush_scheduled = false;
+                window::arm_flush_timer(16);
+                Ok(())
+            }
+            Err(PresentError::DeviceLost(msg)) => {
+                compat::log_msg(&format!("device lost during present, rebuilding: {msg}"));
+                self.renderer = None;
+                self.dirty = true;
+                self.flush_scheduled = false;
+                window::arm_flush_timer(50);
+                Ok(())
+            }
+            Err(PresentError::Fatal(msg)) => Err(Error::new(E_FAIL, msg)),
+        }
     }
 
     pub fn refresh(&mut self) -> Result<()> {
-        if self.renderer.is_none() || self.primary.upgrade().is_none() {
+        if (self.renderer.is_none() && self.bound_hwnd.is_invalid())
+            || self.primary.upgrade().is_none()
+        {
             return Ok(());
         }
         self.dirty = true;
@@ -268,6 +333,7 @@ impl Draw {
                 width,
                 height,
                 bpp,
+                bound_hwnd: HWND::default(),
                 renderer: None,
                 host: None,
                 rgba: Vec::new(),
@@ -276,6 +342,7 @@ impl Draw {
                 dirty: false,
                 flush_scheduled: false,
                 last_present: None,
+                consecutive_present_failures: 0,
             })),
             hwnd: Cell::new(HWND::default()),
             bind_id: Cell::new(0),
@@ -951,13 +1018,16 @@ impl IDirectDraw_Impl for Draw_Impl {
         self.exclusive.set(exclusive);
         self.manage_window.set(manage_window);
         if change_hwnd {
+            display.bound_hwnd = hwnd;
             display.renderer = replacement;
+            display.consecutive_present_failures = 0;
             self.hwnd.set(hwnd);
             let prev_id = self.bind_id.get();
             if hwnd.is_invalid() {
                 window::unbind_window(prev_id);
                 self.bind_id.set(0);
             } else {
+                compat::apply_single_cpu_affinity();
                 let id = window::bind_window(hwnd, exclusive);
                 self.bind_id.set(id);
                 ACTIVE_DISPLAY.with(|slot| *slot.borrow_mut() = Rc::downgrade(&self.display));

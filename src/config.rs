@@ -33,6 +33,9 @@ pub struct Config {
     pub maxfps: i32,
     pub renderer: RendererBackend,
     pub toggle_fullscreen_vk: u32,
+    pub singlecpu: bool,
+    pub noactivateapp: bool,
+    pub log: bool,
 }
 
 impl Default for Config {
@@ -50,8 +53,29 @@ impl Default for Config {
             maxfps: 0,
             renderer: RendererBackend::Auto,
             toggle_fullscreen_vk: VK_RETURN_CODE,
+            singlecpu: true,
+            noactivateapp: false,
+            log: false,
         }
     }
+}
+
+fn preset_noactivateapp(exe_stem: Option<&str>) -> bool {
+    let Some(stem) = exe_stem else {
+        return false;
+    };
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "game"
+            | "ra2"
+            | "red alert 2"
+            | "gamemd"
+            | "ra2md"
+            | "gamemd-spawn"
+            | "yuri's revenge"
+            | "sun"
+            | "ts"
+    )
 }
 
 impl Config {
@@ -63,8 +87,15 @@ impl Config {
         }
     }
 
+    pub fn for_executable(exe_stem: Option<&str>) -> Self {
+        Self {
+            noactivateapp: preset_noactivateapp(exe_stem),
+            ..Self::default()
+        }
+    }
+
     pub fn parse_ini(text: &str, exe_section: Option<&str>) -> Self {
-        let mut cfg = Self::default();
+        let mut cfg = Self::for_executable(exe_section);
         let mut ddraw_pairs: Vec<(String, String)> = Vec::new();
         let mut game_pairs: Vec<(String, String)> = Vec::new();
         let mut section = String::new();
@@ -178,6 +209,21 @@ impl Config {
                     self.toggle_fullscreen_vk = vk;
                 }
             }
+            "singlecpu" => {
+                if let Some(b) = parse_bool(value) {
+                    self.singlecpu = b;
+                }
+            }
+            "noactivateapp" => {
+                if let Some(b) = parse_bool(value) {
+                    self.noactivateapp = b;
+                }
+            }
+            "log" => {
+                if let Some(b) = parse_bool(value) {
+                    self.log = b;
+                }
+            }
             _ => {}
         }
     }
@@ -229,6 +275,10 @@ fn dll_directory() -> Option<PathBuf> {
     }
 }
 
+pub fn dll_or_exe_directory() -> Option<PathBuf> {
+    dll_directory().or_else(|| module_path(None).and_then(|p| p.parent().map(Path::to_path_buf)))
+}
+
 fn load_from_disk() -> Config {
     let exe_path = module_path(None);
     let exe_stem = exe_path
@@ -253,7 +303,7 @@ fn load_from_disk() -> Config {
             return Config::parse_ini(&text, exe_stem.as_deref());
         }
     }
-    Config::default()
+    Config::for_executable(exe_stem.as_deref())
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -303,6 +353,8 @@ mod tests {
         assert_eq!(cfg.min_frame_interval_ms(), 16);
         assert_eq!(cfg.renderer, RendererBackend::Dx12);
         assert_eq!(cfg.toggle_fullscreen_vk, 0x0D);
+        assert!(cfg.singlecpu);
+        assert!(cfg.noactivateapp);
     }
 
     #[test]
@@ -313,8 +365,25 @@ mod tests {
         assert!(cfg.resizable);
         assert!(cfg.maintas);
         assert!(!cfg.vsync);
+        assert!(cfg.singlecpu);
+        assert!(!cfg.noactivateapp);
         assert_eq!(cfg.min_frame_interval_ms(), 4);
         assert_eq!(cfg.renderer, RendererBackend::Auto);
         assert_eq!(cfg.toggle_fullscreen_vk, 0x0D);
+    }
+
+    #[test]
+    fn preset_enables_noactivateapp_for_ra2_and_allows_ini_override() {
+        let preset = Config::for_executable(Some("game"));
+        assert!(preset.noactivateapp);
+        assert!(preset.singlecpu);
+
+        let overridden = Config::parse_ini(
+            "[ddraw]\nsinglecpu=false\nnoactivateapp=false\nlog=true\n",
+            Some("game"),
+        );
+        assert!(!overridden.singlecpu);
+        assert!(!overridden.noactivateapp);
+        assert!(overridden.log);
     }
 }

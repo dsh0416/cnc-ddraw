@@ -1,13 +1,37 @@
 //! Pure wgpu presentation backend. All Win32 overlay lifecycle and Z-order management lives
 //! in `crate::window::OverlayWindow`.
 use std::num::NonZeroIsize;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use raw_window_handle::{Win32WindowHandle, WindowsDisplayHandle};
 use windows::Win32::Foundation::HWND;
 
+use crate::compat;
 use crate::config::{self, RendererBackend};
 use crate::window::{compute_viewport, OverlayWindow};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentOutcome {
+    Presented,
+    Hidden,
+    Timeout,
+}
+
+#[derive(Debug)]
+pub enum PresentError {
+    Recoverable(String),
+    DeviceLost(String),
+    Fatal(String),
+}
+
+impl std::fmt::Display for PresentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Recoverable(m) | Self::DeviceLost(m) | Self::Fatal(m) => f.write_str(m),
+        }
+    }
+}
 
 struct UploadedFrame {
     texture: wgpu::Texture,
@@ -86,7 +110,7 @@ pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    gpu_error: Arc<OnceLock<String>>,
+    device_lost: Arc<AtomicBool>,
     config: wgpu::SurfaceConfiguration,
     configured: bool,
     pipeline: wgpu::RenderPipeline,
@@ -124,15 +148,20 @@ impl Renderer {
         }))
         .map_err(|err| format!("creating GPU device: {err}"))?;
 
-        // wgpu's default error handler panics. A DLL must report GPU failures to its caller.
-        let gpu_error = Arc::new(OnceLock::new());
-        let errors = Arc::clone(&gpu_error);
+        // wgpu's default error handler panics. Log non-fatal errors and only mark device_lost
+        // when the GPU device is actually lost so transient glitches never permanently freeze.
+        let device_lost = Arc::new(AtomicBool::new(false));
+        let lost_flag = Arc::clone(&device_lost);
         device.on_uncaptured_error(Arc::new(move |err: wgpu::Error| {
-            let _ = errors.set(err.to_string());
+            compat::log_msg(&format!("wgpu uncaptured error: {err}"));
+            if matches!(err, wgpu::Error::OutOfMemory { .. }) {
+                lost_flag.store(true, Ordering::Relaxed);
+            }
         }));
-        let errors = Arc::clone(&gpu_error);
+        let lost_flag = Arc::clone(&device_lost);
         device.set_device_lost_callback(move |reason, message| {
-            let _ = errors.set(format!("device lost ({reason:?}): {message}"));
+            compat::log_msg(&format!("wgpu device lost ({reason:?}): {message}"));
+            lost_flag.store(true, Ordering::Relaxed);
         });
 
         // Delay the first configure until the HWND has a drawable client area.
@@ -167,14 +196,14 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
-        if let Some(message) = gpu_error.get() {
-            return Err(message.clone());
+        if device_lost.load(Ordering::Relaxed) {
+            return Err("GPU device lost during initialization".into());
         }
         Ok(Self {
             surface,
             device,
             queue,
-            gpu_error,
+            device_lost,
             config: surface_cfg,
             configured: false,
             pipeline,
@@ -183,55 +212,91 @@ impl Renderer {
         })
     }
 
-    fn check_device(&self) -> Result<(), String> {
-        self.gpu_error
-            .get()
-            .map_or(Ok(()), |message| Err(message.clone()))
-    }
-
     pub fn sync_overlay(&mut self) {
         let _ = self.overlay.sync_to_owner();
     }
 
-    pub fn present(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
-        self.check_device()?;
+    pub fn present(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<PresentOutcome, PresentError> {
+        if self.device_lost.load(Ordering::Relaxed) {
+            return Err(PresentError::DeviceLost("GPU device lost".into()));
+        }
         let limit = self.device.limits().max_texture_dimension_2d;
         if width == 0 || height == 0 || width > limit || height > limit {
-            return Err(format!("unsupported frame dimensions {width}x{height}"));
+            return Err(PresentError::Fatal(format!(
+                "unsupported frame dimensions {width}x{height}"
+            )));
         }
-        let pitch = width.checked_mul(4).ok_or("frame row size overflow")?;
+        let pitch = width
+            .checked_mul(4)
+            .ok_or_else(|| PresentError::Fatal("frame row size overflow".into()))?;
         if (pitch as usize).checked_mul(height as usize) != Some(rgba.len()) {
-            return Err("incorrect RGBA frame length".into());
+            return Err(PresentError::Fatal("incorrect RGBA frame length".into()));
         }
-        let Some((target_w, target_h)) = self.overlay.sync_to_owner()? else {
-            return Ok(());
+        let Some((target_w, target_h)) = self
+            .overlay
+            .sync_to_owner()
+            .map_err(PresentError::Recoverable)?
+        else {
+            return Ok(PresentOutcome::Hidden);
         };
         if target_w > limit || target_h > limit {
-            return Err(format!(
+            return Err(PresentError::Fatal(format!(
                 "window exceeds the adapter's texture limit of {limit}"
-            ));
+            )));
         }
         if !self.configured || (target_w, target_h) != (self.config.width, self.config.height) {
             self.config.width = target_w;
             self.config.height = target_h;
             self.surface.configure(&self.device, &self.config);
-            self.check_device()?;
+            if self.device_lost.load(Ordering::Relaxed) {
+                return Err(PresentError::DeviceLost(
+                    "GPU device lost on configure".into(),
+                ));
+            }
             self.configured = true;
         }
 
         let mut acquired = self.surface.get_current_texture();
         if matches!(
             acquired,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated)
+            Err(wgpu::SurfaceError::Lost
+                | wgpu::SurfaceError::Outdated
+                | wgpu::SurfaceError::Other)
         ) {
+            self.configured = false;
             self.surface.configure(&self.device, &self.config);
-            self.check_device()?;
+            if self.device_lost.load(Ordering::Relaxed) {
+                return Err(PresentError::DeviceLost(
+                    "GPU device lost during reconfigure".into(),
+                ));
+            }
+            self.configured = true;
             acquired = self.surface.get_current_texture();
         }
         let output = match acquired {
             Ok(output) => output,
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(err) => return Err(format!("acquiring presentation texture: {err}")),
+            Err(wgpu::SurfaceError::Timeout) => {
+                compat::log_msg("wgpu get_current_texture timeout");
+                return Ok(PresentOutcome::Timeout);
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                self.configured = false;
+                return Err(PresentError::DeviceLost("surface out of memory".into()));
+            }
+            Err(err) => {
+                self.configured = false;
+                compat::log_msg(&format!(
+                    "wgpu get_current_texture recoverable error: {err}"
+                ));
+                return Err(PresentError::Recoverable(format!(
+                    "acquiring presentation texture: {err}"
+                )));
+            }
         };
         self.configured = !output.suboptimal;
         let size = wgpu::Extent3d {
@@ -284,6 +349,11 @@ impl Renderer {
         }
         self.queue.submit([encoder.finish()]);
         output.present();
-        self.check_device()
+        if self.device_lost.load(Ordering::Relaxed) {
+            return Err(PresentError::DeviceLost(
+                "GPU device lost after present".into(),
+            ));
+        }
+        Ok(PresentOutcome::Presented)
     }
 }

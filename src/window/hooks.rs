@@ -13,14 +13,14 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{VirtualProtect, PAGE_PROTECTION_FLAGS, PAGE_READWRITE};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetCapture;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CallNextHookEx, CallWindowProcA, CallWindowProcW, ClipCursor, GetClientRect,
-    GetClipCursor, GetCursorPos, GetDesktopWindow, GetSystemMetrics, GetWindowLongA,
-    GetWindowLongW, GetWindowRect, IsWindow, IsWindowUnicode, KillTimer, MoveWindow, SetCursorPos,
-    SetWindowLongA, SetWindowLongW, SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx,
-    WindowFromPoint, GWLP_WNDPROC, HHOOK, MSG, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN,
-    SYSTEM_METRICS_INDEX, WH_GETMESSAGE, WM_ACTIVATEAPP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-    WM_MOUSEWHEEL, WM_MOVE, WM_RBUTTONDOWN, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER,
-    WM_WINDOWPOSCHANGED, WNDPROC,
+    BringWindowToTop, CallNextHookEx, CallWindowProcA, CallWindowProcW, ClipCursor, DefWindowProcA,
+    DefWindowProcW, GetClientRect, GetClipCursor, GetCursorPos, GetDesktopWindow, GetSystemMetrics,
+    GetWindowLongA, GetWindowLongW, GetWindowRect, IsWindow, IsWindowUnicode, KillTimer,
+    MoveWindow, SetCursorPos, SetWindowLongA, SetWindowLongW, SetWindowPos, SetWindowsHookExW,
+    UnhookWindowsHookEx, WindowFromPoint, GWLP_WNDPROC, HHOOK, MSG, SET_WINDOW_POS_FLAGS,
+    SM_CXSCREEN, SM_CYSCREEN, SYSTEM_METRICS_INDEX, WH_GETMESSAGE, WM_ACTIVATE, WM_ACTIVATEAPP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEWHEEL, WM_MOVE, WM_NCACTIVATE,
+    WM_RBUTTONDOWN, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WM_WINDOWPOSCHANGED, WNDPROC,
 };
 
 use crate::config;
@@ -39,6 +39,8 @@ static ORIG_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static SUBCLASSED_HWND: AtomicIsize = AtomicIsize::new(0);
 static SUBCLASSED_UNICODE: AtomicBool = AtomicBool::new(false);
 static GETMSG_HOOK: AtomicIsize = AtomicIsize::new(0);
+static ACTIVATE_PASSED: AtomicBool = AtomicBool::new(false);
+static ACTIVATEAPP_PASSED: AtomicBool = AtomicBool::new(false);
 
 struct PatchedSlot {
     slot: usize,
@@ -383,9 +385,37 @@ unsafe extern "system" fn subclass_wndproc(
             return LRESULT(0);
         }
     }
-    if msg == WM_ACTIVATEAPP && wparam.0 == 0 {
-        unsafe {
-            let _ = ClipCursor(None);
+    let shield_focus = is_scaling_active()
+        && (config::get().noactivateapp || !crate::draw::is_fullscreen_active());
+    if shield_focus && matches!(msg, WM_KILLFOCUS | WM_NCACTIVATE) {
+        return if SUBCLASSED_UNICODE.load(Ordering::Relaxed) {
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        } else {
+            unsafe { DefWindowProcA(hwnd, msg, wparam, lparam) }
+        };
+    }
+    if msg == WM_ACTIVATE && shield_focus {
+        let active = (wparam.0 & 0xffff) != 0;
+        if !ACTIVATE_PASSED.swap(true, Ordering::Relaxed) && active {
+            // Allow the initial activation through once so the game initializes its focus flag.
+        } else {
+            return LRESULT(0);
+        }
+    }
+    if msg == WM_ACTIVATEAPP {
+        if wparam.0 == 0 {
+            unsafe {
+                let _ = ClipCursor(None);
+            }
+        } else {
+            crate::draw::on_host_window_changed();
+        }
+        if shield_focus {
+            if !ACTIVATEAPP_PASSED.swap(true, Ordering::Relaxed) && wparam.0 != 0 {
+                // Allow initial activation once.
+            } else {
+                return LRESULT(0);
+            }
         }
     }
     if matches!(msg, WM_MOVE | WM_SIZE | WM_WINDOWPOSCHANGED) && hwnd.0 as isize == bound_hwnd_raw()
@@ -464,6 +494,8 @@ pub(crate) fn install_subclass(hwnd: HWND) {
         ORIG_WNDPROC.store(prev as isize, Ordering::Relaxed);
         SUBCLASSED_UNICODE.store(is_unicode, Ordering::Relaxed);
         SUBCLASSED_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+        ACTIVATE_PASSED.store(false, Ordering::Relaxed);
+        ACTIVATEAPP_PASSED.store(false, Ordering::Relaxed);
     }
 }
 

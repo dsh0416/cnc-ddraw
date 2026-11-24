@@ -40,6 +40,9 @@ vsync=false              ; true = Fifo vsync, false = low-latency Mailbox/Immedi
 maxfps=0                 ; 0 = coalesced ~250 Hz cap, >0 = explicit FPS cap
 renderer=auto            ; auto, dx12, or vulkan (overridden by WGPU_BACKEND env var)
 keytogglefullscreen=0x0D ; Alt+key toggle between borderless fullscreen and windowed (0 = off)
+singlecpu=true           ; pin game-directory threads to CPU0 to prevent multi-core engine freezes
+noactivateapp=false      ; shield focus deactivation messages (auto-enabled for RA2/TS presets)
+log=false                ; write diagnostic events to cnc-ddraw.log (or set CNC_DDRAW_LOG=path)
 ```
 
 Press **Alt+Enter** at any time to toggle between borderless fullscreen and windowed mode.
