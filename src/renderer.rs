@@ -1,13 +1,13 @@
-use std::{
-    num::NonZeroIsize,
-    sync::{Arc, OnceLock},
-};
+//! Pure wgpu presentation backend. All Win32 overlay lifecycle and Z-order management lives
+//! in `crate::window::OverlayWindow`.
+use std::num::NonZeroIsize;
+use std::sync::{Arc, OnceLock};
 
 use raw_window_handle::{Win32WindowHandle, WindowsDisplayHandle};
-use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowLongPtrW, IsIconic, GWLP_HINSTANCE,
-};
+use windows::Win32::Foundation::HWND;
+
+use crate::config::{self, RendererBackend};
+use crate::window::{compute_viewport, OverlayWindow};
 
 struct UploadedFrame {
     texture: wgpu::Texture,
@@ -50,8 +50,39 @@ impl UploadedFrame {
     }
 }
 
+fn instance_descriptor() -> wgpu::InstanceDescriptor {
+    // Allow WGPU_BACKEND env var to take precedence for testing/debugging.
+    if std::env::var_os("WGPU_BACKEND").is_some() {
+        return wgpu::InstanceDescriptor::from_env_or_default();
+    }
+    let backends = match config::get().renderer {
+        RendererBackend::Dx12 => wgpu::Backends::DX12,
+        RendererBackend::Vulkan => wgpu::Backends::VULKAN,
+        RendererBackend::Auto => wgpu::Backends::PRIMARY,
+    };
+    wgpu::InstanceDescriptor {
+        backends,
+        ..Default::default()
+    }
+}
+
+fn pick_present_mode(caps: &wgpu::SurfaceCapabilities, vsync: bool) -> wgpu::PresentMode {
+    if vsync {
+        return wgpu::PresentMode::Fifo;
+    }
+    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        wgpu::PresentMode::Mailbox
+    } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+        wgpu::PresentMode::Immediate
+    } else if caps.present_modes.contains(&wgpu::PresentMode::FifoRelaxed) {
+        wgpu::PresentMode::FifoRelaxed
+    } else {
+        wgpu::PresentMode::Fifo
+    }
+}
+
 pub struct Renderer {
-    hwnd: HWND,
+    // Keep wgpu surface/device ahead of `overlay` so the swapchain drops before DestroyWindow.
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -60,22 +91,19 @@ pub struct Renderer {
     configured: bool,
     pipeline: wgpu::RenderPipeline,
     frame: Option<UploadedFrame>,
+    overlay: OverlayWindow,
 }
 
 impl Renderer {
-    /// The DirectDraw client owns the window and must release the display before destroying it.
+    /// The DirectDraw client owns `window` and must release the display before destroying it.
     pub fn new(window: isize) -> Result<Self, String> {
-        let handle = NonZeroIsize::new(window).ok_or("a game window is required")?;
-        let hwnd = HWND(window as *mut _);
-        let mut raw = Win32WindowHandle::new(handle);
-        raw.hinstance =
-            NonZeroIsize::new(unsafe { GetWindowLongPtrW(hwnd, GWLP_HINSTANCE) } as isize);
-        if raw.hinstance.is_none() {
-            return Err("could not get the game window's module handle".into());
-        }
+        let _ = NonZeroIsize::new(window).ok_or("a game window is required")?;
+        let game_hwnd = HWND(window as *mut _);
+        let overlay = OverlayWindow::new(game_hwnd)?;
+        let mut raw = Win32WindowHandle::new(overlay.raw_handle()?);
+        raw.hinstance = Some(overlay.hinstance());
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
-        // The DLL borrows the caller's HWND for the lifetime of this display.
+        let instance = wgpu::Instance::new(&instance_descriptor());
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
                 raw_window_handle: raw.into(),
@@ -108,10 +136,12 @@ impl Renderer {
         });
 
         // Delay the first configure until the HWND has a drawable client area.
-        let mut config = surface
+        let mut surface_cfg = surface
             .get_default_config(&adapter, 1, 1)
             .ok_or("no presentation format for the game window")?;
-        config.present_mode = wgpu::PresentMode::Fifo;
+        let caps = surface.get_capabilities(&adapter);
+        surface_cfg.present_mode = pick_present_mode(&caps, config::get().vsync);
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("DirectDraw nearest-neighbor blit"),
             source: wgpu::ShaderSource::Wgsl(include_str!("present.wgsl").into()),
@@ -132,7 +162,7 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
-                targets: &[Some(config.format.into())],
+                targets: &[Some(surface_cfg.format.into())],
             }),
             multiview: None,
             cache: None,
@@ -141,15 +171,15 @@ impl Renderer {
             return Err(message.clone());
         }
         Ok(Self {
-            hwnd,
             surface,
             device,
             queue,
             gpu_error,
-            config,
+            config: surface_cfg,
             configured: false,
             pipeline,
             frame: None,
+            overlay,
         })
     }
 
@@ -157,6 +187,10 @@ impl Renderer {
         self.gpu_error
             .get()
             .map_or(Ok(()), |message| Err(message.clone()))
+    }
+
+    pub fn sync_overlay(&mut self) {
+        let _ = self.overlay.sync_to_owner();
     }
 
     pub fn present(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
@@ -169,13 +203,9 @@ impl Renderer {
         if (pitch as usize).checked_mul(height as usize) != Some(rgba.len()) {
             return Err("incorrect RGBA frame length".into());
         }
-        let mut client = RECT::default();
-        unsafe { GetClientRect(self.hwnd, &mut client) }
-            .map_err(|err| format!("getting client area: {err}"))?;
-        if unsafe { IsIconic(self.hwnd) }.as_bool() || client.right <= 0 || client.bottom <= 0 {
+        let Some((target_w, target_h)) = self.overlay.sync_to_owner()? else {
             return Ok(());
-        }
-        let (target_w, target_h) = (client.right as u32, client.bottom as u32);
+        };
         if target_w > limit || target_h > limit {
             return Err(format!(
                 "window exceeds the adapter's texture limit of {limit}"
@@ -245,8 +275,9 @@ impl Renderer {
                 })],
                 ..Default::default()
             });
-            let (x, y, w, h) = viewport(width, height, target_w, target_h);
-            pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+            let (vx, vy, vw, vh) =
+                compute_viewport(width, height, target_w, target_h, config::get().maintas);
+            pass.set_viewport(vx as f32, vy as f32, vw as f32, vh as f32, 0.0, 1.0);
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &frame.bindings, &[]);
             pass.draw(0..3, 0..1);
@@ -254,24 +285,5 @@ impl Renderer {
         self.queue.submit([encoder.finish()]);
         output.present();
         self.check_device()
-    }
-}
-
-// Pick whole destination pixels so the centered image always fits the client area.
-fn viewport(width: u32, height: u32, target_w: u32, target_h: u32) -> (u32, u32, u32, u32) {
-    let w = (target_h as u64 * width as u64 / height as u64).clamp(1, target_w as u64) as u32;
-    let h = (target_w as u64 * height as u64 / width as u64).clamp(1, target_h as u64) as u32;
-    ((target_w - w) / 2, (target_h - h) / 2, w, h)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::viewport;
-
-    #[test]
-    fn aspect_ratio_and_centering() {
-        assert_eq!(viewport(640, 480, 1920, 1080), (240, 0, 1440, 1080));
-        assert_eq!(viewport(640, 480, 640, 480), (0, 0, 640, 480));
-        assert_eq!(viewport(640, 480, 1, 99), (0, 49, 1, 1));
     }
 }

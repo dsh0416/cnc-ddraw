@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 
 use windows::core::{implement, IUnknown, Interface, Ref, Result, BOOL, GUID, HRESULT, PCSTR};
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, FARPROC, HMODULE, S_FALSE,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, FARPROC, HINSTANCE,
+    HMODULE, S_FALSE,
 };
 use windows::Win32::Graphics::DirectDraw::{
     CLSID_DirectDraw, CLSID_DirectDraw7, CLSID_DirectDrawClipper,
@@ -20,7 +21,22 @@ use windows::Win32::System::Threading::{
     EnterCriticalSection, InitializeCriticalSection, LeaveCriticalSection, CRITICAL_SECTION,
 };
 
-use crate::{clipper, draw};
+use crate::{clipper, draw, window};
+
+const DLL_PROCESS_ATTACH: u32 = 1;
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn DllMain(
+    _module: HINSTANCE,
+    reason: u32,
+    _reserved: *mut c_void,
+) -> BOOL {
+    if reason == DLL_PROCESS_ATTACH {
+        // Must run before WinMain creates any HWND so process DPI awareness is consistent.
+        window::enable_dpi_awareness();
+    }
+    BOOL(1)
+}
 
 struct ThreadLock(UnsafeCell<CRITICAL_SECTION>);
 

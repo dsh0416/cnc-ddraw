@@ -11,22 +11,22 @@ use windows::core::{
     HRESULT, PCWSTR,
 };
 use windows::Win32::Foundation::{
-    GetLastError, SetLastError, CLASS_E_NOAGGREGATION, ERROR_SUCCESS, E_FAIL, E_INVALIDARG,
-    E_NOINTERFACE, E_NOTIMPL, E_POINTER, HANDLE, HWND, SIZE, S_OK,
+    CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_POINTER, HANDLE, HWND,
+    SIZE, S_OK,
 };
 use windows::Win32::Graphics::DirectDraw::*;
 use windows::Win32::Graphics::Gdi::{
     EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, DEVMODEW, ENUM_CURRENT_SETTINGS, HDC,
-    HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, PALETTEENTRY,
+    HMONITOR, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, PALETTEENTRY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongW, GetWindowPlacement, IsWindow, SetWindowLongW, SetWindowPlacement, SetWindowPos,
-    GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    WINDOWPLACEMENT, WINDOW_LONG_PTR_INDEX, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
-    WS_EX_STATICEDGE, WS_EX_WINDOWEDGE, WS_OVERLAPPEDWINDOW, WS_POPUP,
-};
+use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
-use crate::{clipper, palette, renderer::Renderer, surface};
+use crate::{
+    clipper, config, palette,
+    renderer::Renderer,
+    surface,
+    window::{self, HostWindow, PresentationMode},
+};
 
 const DEFAULT_MODE: (u32, u32, u32) = (640, 480, 32);
 const VIRTUAL_VIDMEM_BYTES: u32 = 64 * 1024 * 1024;
@@ -38,9 +38,81 @@ const SURFACE_BUSY: HRESULT = HRESULT(0x8876_01ae_u32 as i32);
 const DDERR_VERTICALBLANKINPROGRESS: HRESULT = HRESULT(0x8876_0219_u32 as i32);
 
 static FULLSCREEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+const FLUSH_MAX_DEFER: Duration = Duration::from_millis(16);
+
+thread_local! {
+    static ACTIVE_DISPLAY: RefCell<Weak<RefCell<Display>>> = const { RefCell::new(Weak::new()) };
+}
 
 pub fn is_fullscreen_active() -> bool {
     FULLSCREEN_COUNT.load(Ordering::Relaxed) > 0
+}
+
+pub fn flush_pending_present(from_timer: bool) {
+    let display = ACTIVE_DISPLAY.with(|slot| slot.borrow().upgrade());
+    let Some(display) = display else {
+        return;
+    };
+    let min_ms = config::get().min_frame_interval_ms();
+    let Ok(mut d) = display.try_borrow_mut() else {
+        window::arm_flush_timer(min_ms as u32);
+        return;
+    };
+    d.flush_scheduled = false;
+    if !d.dirty {
+        return;
+    }
+    if !from_timer
+        && d.last_present
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(min_ms))
+    {
+        window::arm_flush_timer(min_ms as u32);
+        return;
+    }
+    let _ = d.present_now();
+}
+
+pub fn toggle_fullscreen_hotkey() {
+    let display = ACTIVE_DISPLAY.with(|slot| slot.borrow().upgrade());
+    let Some(display) = display else {
+        return;
+    };
+    let Ok(mut d) = display.try_borrow_mut() else {
+        return;
+    };
+    let (lw, lh) = (d.width, d.height);
+    let cfg = config::get();
+    if let Some(host) = d.host.as_mut() {
+        let was_fs = host.is_fullscreen();
+        if let Ok(new_mode) = host.toggle_mode(lw, lh, cfg) {
+            let now_fs = new_mode == PresentationMode::BorderlessFullscreen;
+            if !was_fs && now_fs {
+                FULLSCREEN_COUNT.fetch_add(1, Ordering::Relaxed);
+            } else if was_fs && !now_fs {
+                FULLSCREEN_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+            if let Some(renderer) = d.renderer.as_mut() {
+                renderer.sync_overlay();
+            }
+            let _ = d.present_now();
+        }
+    }
+}
+
+pub fn on_host_window_changed() {
+    let display = ACTIVE_DISPLAY.with(|slot| slot.borrow().upgrade());
+    let Some(display) = display else {
+        return;
+    };
+    let Ok(mut d) = display.try_borrow_mut() else {
+        return;
+    };
+    if let Some(renderer) = d.renderer.as_mut() {
+        renderer.sync_overlay();
+    }
+    if d.primary.upgrade().is_some() {
+        let _ = d.refresh();
+    }
 }
 
 pub struct Display {
@@ -48,9 +120,13 @@ pub struct Display {
     pub height: u32,
     pub bpp: u32,
     renderer: Option<Renderer>,
+    host: Option<HostWindow>,
     rgba: Vec<u8>,
     pub primary: Weak<RefCell<surface::SurfaceData>>,
     surfaces: Vec<(*mut c_void, Weak<RefCell<surface::SurfaceData>>)>,
+    dirty: bool,
+    flush_scheduled: bool,
+    last_present: Option<Instant>,
 }
 
 impl Display {
@@ -113,8 +189,22 @@ impl Display {
         None
     }
 
-    pub fn refresh(&mut self) -> Result<()> {
+    fn set_host(&mut self, next: Option<HostWindow>) -> Option<HostWindow> {
+        let prev = std::mem::replace(&mut self.host, next);
+        let was_fs = prev.as_ref().is_some_and(HostWindow::is_fullscreen);
+        let now_fs = self.host.as_ref().is_some_and(HostWindow::is_fullscreen);
+        if !was_fs && now_fs {
+            FULLSCREEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else if was_fs && !now_fs {
+            FULLSCREEN_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+        prev
+    }
+
+    pub fn present_now(&mut self) -> Result<()> {
         let (Some(renderer), Some(primary)) = (&mut self.renderer, self.primary.upgrade()) else {
+            self.dirty = false;
+            self.flush_scheduled = false;
             return Ok(());
         };
         let primary = primary.try_borrow().map_err(|_| SURFACE_BUSY)?;
@@ -124,108 +214,37 @@ impl Display {
         surface::frame_rgba(&primary, &mut self.rgba)?;
         let (width, height) = (primary.width, primary.height);
         drop(primary);
+        self.dirty = false;
+        self.flush_scheduled = false;
+        self.last_present = Some(Instant::now());
+        window::disarm_flush_timer();
+        window::sync_presented_size(width, height);
         renderer
             .present(width, height, &self.rgba)
             .map_err(|message| Error::new(E_FAIL, message))
     }
-}
 
-#[derive(Clone, Copy)]
-struct SavedWindow {
-    hwnd: HWND,
-    placement: WINDOWPLACEMENT,
-    style: i32,
-    ex_style: i32,
-}
-
-fn set_style(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX, style: i32) -> Result<()> {
-    unsafe {
-        SetLastError(ERROR_SUCCESS);
-        if SetWindowLongW(hwnd, index, style) == 0 {
-            let error = GetLastError();
-            if error != ERROR_SUCCESS {
-                return Err(error.to_hresult().into());
-            }
-        }
-    }
-    Ok(())
-}
-
-impl SavedWindow {
-    fn enter(hwnd: HWND) -> Result<Self> {
-        let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) };
-        if style as u32 & WS_CHILD.0 != 0 {
-            return Err(E_INVALIDARG.into());
-        }
-        let mut placement = WINDOWPLACEMENT {
-            length: size_of::<WINDOWPLACEMENT>() as u32,
-            ..Default::default()
-        };
-        unsafe { GetWindowPlacement(hwnd, &mut placement)? };
-        let saved = Self {
-            hwnd,
-            placement,
-            style,
-            ex_style: unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) },
-        };
-        let mut info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        unsafe {
-            GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).ok()?
-        };
-        let rect = info.rcMonitor;
-        let edge_styles =
-            WS_EX_CLIENTEDGE.0 | WS_EX_WINDOWEDGE.0 | WS_EX_DLGMODALFRAME.0 | WS_EX_STATICEDGE.0;
-        let apply = || -> Result<()> {
-            set_style(
-                hwnd,
-                GWL_STYLE,
-                ((style as u32 & !WS_OVERLAPPEDWINDOW.0) | WS_POPUP.0) as i32,
-            )?;
-            set_style(
-                hwnd,
-                GWL_EXSTYLE,
-                (saved.ex_style as u32 & !edge_styles) as i32,
-            )?;
-            unsafe {
-                SetWindowPos(
-                    hwnd,
-                    None,
-                    rect.left,
-                    rect.top,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
-                    SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
-                )
-            }
-        };
-        if let Err(error) = apply() {
-            let _ = saved.restore();
-            return Err(error);
-        }
-        Ok(saved)
-    }
-
-    fn restore(self) -> Result<()> {
-        if !unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
+    pub fn refresh(&mut self) -> Result<()> {
+        if self.renderer.is_none() || self.primary.upgrade().is_none() {
             return Ok(());
         }
-        set_style(self.hwnd, GWL_STYLE, self.style)?;
-        set_style(self.hwnd, GWL_EXSTYLE, self.ex_style)?;
-        unsafe {
-            SetWindowPlacement(self.hwnd, &self.placement)?;
-            SetWindowPos(
-                self.hwnd,
-                None,
-                0,
-                0,
-                0,
-                0,
-                SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-            )
+        self.dirty = true;
+        let force_now = self.last_present.is_none()
+            || self
+                .last_present
+                .is_some_and(|t| t.elapsed() >= FLUSH_MAX_DEFER)
+            || !window::can_schedule_flush();
+        if force_now {
+            return self.present_now();
         }
+        if !self.flush_scheduled {
+            if window::schedule_flush() {
+                self.flush_scheduled = true;
+            } else {
+                return self.present_now();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -233,7 +252,9 @@ impl SavedWindow {
 struct Draw {
     display: Rc<RefCell<Display>>,
     hwnd: Cell<HWND>,
-    fullscreen: Cell<Option<SavedWindow>>,
+    bind_id: Cell<usize>,
+    exclusive: Cell<bool>,
+    manage_window: Cell<bool>,
     changing_window: RefCell<()>,
     vblank_epoch: Instant,
     initialized: Cell<bool>,
@@ -248,12 +269,18 @@ impl Draw {
                 height,
                 bpp,
                 renderer: None,
+                host: None,
                 rgba: Vec::new(),
                 primary: Weak::new(),
                 surfaces: Vec::new(),
+                dirty: false,
+                flush_scheduled: false,
+                last_present: None,
             })),
             hwnd: Cell::new(HWND::default()),
-            fullscreen: Cell::new(None),
+            bind_id: Cell::new(0),
+            exclusive: Cell::new(false),
+            manage_window: Cell::new(false),
             changing_window: RefCell::new(()),
             vblank_epoch: Instant::now(),
             initialized: Cell::new(initialized),
@@ -263,16 +290,6 @@ impl Draw {
     fn new() -> Self {
         Self::new_with_init(true)
     }
-
-    fn set_fullscreen(&self, saved: Option<SavedWindow>) {
-        let was = self.fullscreen.replace(saved).is_some();
-        let now = saved.is_some();
-        if !was && now {
-            FULLSCREEN_COUNT.fetch_add(1, Ordering::Relaxed);
-        } else if was && !now {
-            FULLSCREEN_COUNT.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
 }
 
 pub fn create_uninitialized_draw() -> IDirectDraw {
@@ -281,9 +298,17 @@ pub fn create_uninitialized_draw() -> IDirectDraw {
 
 impl Drop for Draw {
     fn drop(&mut self) {
-        if let Some(saved) = self.fullscreen.take() {
-            FULLSCREEN_COUNT.fetch_sub(1, Ordering::Relaxed);
-            let _ = saved.restore();
+        let id = self.bind_id.get();
+        let owns_hooks = window::is_active_owner(id);
+        if let Ok(mut display) = self.display.try_borrow_mut() {
+            if let Some(saved) = display.set_host(None) {
+                if owns_hooks {
+                    let _ = saved.restore();
+                }
+            }
+        }
+        if id != 0 {
+            window::unbind_window(id);
         }
     }
 }
@@ -519,6 +544,9 @@ impl Draw_Impl {
             (800, 600),
             (1024, 768),
             (1280, 720),
+            (1280, 960),
+            (1280, 1024),
+            (1600, 1200),
             (1920, 1080),
         ];
         let additional = (!sizes.contains(&current_size)).then_some(current_size);
@@ -543,18 +571,25 @@ impl Draw_Impl {
                 if filter.dwFlags & DDSD_PIXELFORMAT as u32 != 0 {
                     let requested = &filter.ddpfPixelFormat;
                     let format = &mode.ddpfPixelFormat;
-                    if requested.dwFlags != format.dwFlags
+                    let masks_requested = unsafe {
+                        requested.Anonymous2.dwRBitMask
+                            | requested.Anonymous3.dwGBitMask
+                            | requested.Anonymous4.dwBBitMask
+                    } != 0;
+                    if (requested.dwFlags != 0 && requested.dwFlags != format.dwFlags)
                         || unsafe {
-                            requested.Anonymous1.dwRGBBitCount != bpp
-                                || (
-                                    requested.Anonymous2.dwRBitMask,
-                                    requested.Anonymous3.dwGBitMask,
-                                    requested.Anonymous4.dwBBitMask,
-                                ) != (
-                                    format.Anonymous2.dwRBitMask,
-                                    format.Anonymous3.dwGBitMask,
-                                    format.Anonymous4.dwBBitMask,
-                                )
+                            (requested.Anonymous1.dwRGBBitCount != 0
+                                && requested.Anonymous1.dwRGBBitCount != bpp)
+                                || (masks_requested
+                                    && (
+                                        requested.Anonymous2.dwRBitMask,
+                                        requested.Anonymous3.dwGBitMask,
+                                        requested.Anonymous4.dwBBitMask,
+                                    ) != (
+                                        format.Anonymous2.dwRBitMask,
+                                        format.Anonymous3.dwGBitMask,
+                                        format.Anonymous4.dwBBitMask,
+                                    ))
                         }
                     {
                         continue;
@@ -677,7 +712,7 @@ impl IDirectDraw_Impl for Draw_Impl {
     }
     fn FlipToGDISurface(&self) -> Result<()> {
         let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
-        display.refresh()
+        display.present_now()
     }
 
     fn GetCaps(&self, driver: *mut DDCAPS_DX7, software: *mut DDCAPS_DX7) -> Result<()> {
@@ -698,43 +733,48 @@ impl IDirectDraw_Impl for Draw_Impl {
                 return Err(E_INVALIDARG.into());
             }
         }
-        for (output, emulation) in [(driver, false), (software, true)] {
+        for output in [driver, software] {
             if output.is_null() {
                 continue;
             }
             let size = unsafe { (*output).dwSize };
             let mut caps = DDCAPS_DX7 {
                 dwSize: size,
-                dwCaps: DDCAPS_NOHARDWARE as u32,
-                ..Default::default()
-            };
-            if emulation {
-                caps.dwCaps = (DDCAPS_BLT
+                dwCaps: (DDCAPS_BLT
                     | DDCAPS_BLTSTRETCH
                     | DDCAPS_BLTCOLORFILL
                     | DDCAPS_COLORKEY
                     | DDCAPS_CANBLTSYSMEM
+                    | DDCAPS_CANCLIP
+                    | DDCAPS_CANCLIPSTRETCHED
                     | DDCAPS_OVERLAY
-                    | DDCAPS_PALETTE) as u32;
-                caps.dwCaps2 = DDCAPS2_PRIMARYGAMMA as u32;
-                caps.dwCKeyCaps = (DDCKEYCAPS_SRCBLT | DDCKEYCAPS_DESTBLT) as u32;
-                caps.dwFXCaps = (DDFXCAPS_BLTMIRRORLEFTRIGHT
+                    | DDCAPS_PALETTE) as u32,
+                dwCaps2: (DDCAPS2_PRIMARYGAMMA | DDCAPS2_NOPAGELOCKREQUIRED | DDCAPS2_WIDESURFACES)
+                    as u32,
+                dwCKeyCaps: (DDCKEYCAPS_SRCBLT | DDCKEYCAPS_SRCBLTCLRSPACE | DDCKEYCAPS_DESTBLT)
+                    as u32,
+                dwFXCaps: (DDFXCAPS_BLTMIRRORLEFTRIGHT
                     | DDFXCAPS_BLTMIRRORUPDOWN
                     | DDFXCAPS_BLTSTRETCHX
-                    | DDFXCAPS_BLTSTRETCHY) as u32;
-                caps.dwPalCaps = (DDPCAPS_8BIT | DDPCAPS_ALLOW256) as u32;
-                caps.dwVidMemTotal = VIRTUAL_VIDMEM_BYTES;
-                caps.dwVidMemFree = VIRTUAL_VIDMEM_BYTES;
-                caps.ddsOldCaps.dwCaps = (DDSCAPS_PRIMARYSURFACE
-                    | DDSCAPS_OFFSCREENPLAIN
-                    | DDSCAPS_SYSTEMMEMORY
-                    | DDSCAPS_VIDEOMEMORY
-                    | DDSCAPS_FLIP
-                    | DDSCAPS_BACKBUFFER
-                    | DDSCAPS_OVERLAY
-                    | DDSCAPS_COMPLEX) as u32;
-                caps.ddsCaps.dwCaps = caps.ddsOldCaps.dwCaps;
-            }
+                    | DDFXCAPS_BLTSTRETCHY) as u32,
+                dwPalCaps: (DDPCAPS_8BIT | DDPCAPS_ALLOW256 | DDPCAPS_PRIMARYSURFACE) as u32,
+                dwVidMemTotal: VIRTUAL_VIDMEM_BYTES,
+                dwVidMemFree: VIRTUAL_VIDMEM_BYTES,
+                ..Default::default()
+            };
+            caps.ddsOldCaps.dwCaps = (DDSCAPS_PRIMARYSURFACE
+                | DDSCAPS_OFFSCREENPLAIN
+                | DDSCAPS_SYSTEMMEMORY
+                | DDSCAPS_VIDEOMEMORY
+                | DDSCAPS_LOCALVIDMEM
+                | DDSCAPS_NONLOCALVIDMEM
+                | DDSCAPS_OWNDC
+                | DDSCAPS_FLIP
+                | DDSCAPS_FRONTBUFFER
+                | DDSCAPS_BACKBUFFER
+                | DDSCAPS_OVERLAY
+                | DDSCAPS_COMPLEX) as u32;
+            caps.ddsCaps.dwCaps = caps.ddsOldCaps.dwCaps;
             // Legacy DDCAPS layouts are prefixes of DX7 and callers allocate only dwSize.
             unsafe {
                 ptr::copy_nonoverlapping(
@@ -828,15 +868,15 @@ impl IDirectDraw_Impl for Draw_Impl {
             .changing_window
             .try_borrow_mut()
             .map_err(|_| SURFACE_BUSY)?;
-        if let Some(saved) = self.fullscreen.get() {
-            saved.restore()?;
-            self.set_fullscreen(None);
-        }
+        window::set_scaling_active(self.bind_id.get(), false);
         let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
+        if let Some(saved) = display.set_host(None) {
+            saved.restore()?;
+        }
         if display.primary.upgrade().is_none() {
             (display.width, display.height, display.bpp) = DEFAULT_MODE;
         }
-        display.refresh()
+        display.present_now()
     }
 
     fn SetCooperativeLevel(&self, hwnd: HWND, flags: u32) -> Result<()> {
@@ -878,10 +918,16 @@ impl IDirectDraw_Impl for Draw_Impl {
             .changing_window
             .try_borrow_mut()
             .map_err(|_| SURFACE_BUSY)?;
-        let want_fullscreen = exclusive && !no_window_changes;
+        let manage_window = exclusive && !no_window_changes;
         let change_hwnd = self.hwnd.get() != hwnd;
-        if !change_hwnd && self.fullscreen.get().is_some() == want_fullscreen {
-            return Ok(());
+        {
+            let display = self.display.try_borrow().map_err(|_| SURFACE_BUSY)?;
+            if !change_hwnd
+                && display.host.is_some() == manage_window
+                && self.exclusive.get() == exclusive
+            {
+                return Ok(());
+            }
         }
         let replacement = if change_hwnd && !hwnd.is_invalid() {
             Some(Renderer::new(hwnd.0 as isize).map_err(|message| Error::new(E_FAIL, message))?)
@@ -889,18 +935,37 @@ impl IDirectDraw_Impl for Draw_Impl {
             None
         };
         let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
-        if let Some(saved) = self.fullscreen.get() {
+        if let Some(saved) = display.set_host(None) {
             saved.restore()?;
-            self.set_fullscreen(None);
         }
-        if want_fullscreen {
-            self.set_fullscreen(Some(SavedWindow::enter(hwnd)?));
+        if manage_window {
+            let cfg = config::get();
+            let initial_mode = if cfg.windowed {
+                PresentationMode::Windowed
+            } else {
+                PresentationMode::BorderlessFullscreen
+            };
+            let host = HostWindow::enter(hwnd, initial_mode, display.width, display.height, cfg)?;
+            display.set_host(Some(host));
         }
+        self.exclusive.set(exclusive);
+        self.manage_window.set(manage_window);
         if change_hwnd {
             display.renderer = replacement;
             self.hwnd.set(hwnd);
+            let prev_id = self.bind_id.get();
+            if hwnd.is_invalid() {
+                window::unbind_window(prev_id);
+                self.bind_id.set(0);
+            } else {
+                let id = window::bind_window(hwnd, exclusive);
+                self.bind_id.set(id);
+                ACTIVE_DISPLAY.with(|slot| *slot.borrow_mut() = Rc::downgrade(&self.display));
+            }
+        } else {
+            window::set_scaling_active(self.bind_id.get(), exclusive);
         }
-        display.refresh()
+        display.present_now()
     }
     fn SetDisplayMode(&self, width: u32, height: u32, bpp: u32) -> Result<()> {
         if !(1..=8192).contains(&width)
@@ -909,18 +974,55 @@ impl IDirectDraw_Impl for Draw_Impl {
         {
             return Err(E_INVALIDARG.into());
         }
+        {
+            let display = self.display.try_borrow().map_err(|_| SURFACE_BUSY)?;
+            if (display.width, display.height, display.bpp) != (width, height, bpp)
+                && display.primary.upgrade().is_some()
+            {
+                return Err(SURFACE_BUSY.into());
+            }
+        }
+        let hwnd = self.hwnd.get();
+        let cfg = config::get();
+        let _transition = self
+            .changing_window
+            .try_borrow_mut()
+            .map_err(|_| SURFACE_BUSY)?;
         let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
         if (display.width, display.height, display.bpp) != (width, height, bpp)
             && display.primary.upgrade().is_some()
         {
             return Err(SURFACE_BUSY.into());
         }
+        if self.exclusive.get() && !hwnd.is_invalid() {
+            if self.manage_window.get() && display.host.is_none() {
+                let mode = if cfg.windowed {
+                    PresentationMode::Windowed
+                } else {
+                    PresentationMode::BorderlessFullscreen
+                };
+                let host = HostWindow::enter(hwnd, mode, width, height, cfg)?;
+                display.set_host(Some(host));
+            } else if let Some(host) = display.host.as_mut() {
+                host.on_logical_mode_changed(width, height, cfg);
+            }
+            window::set_scaling_active(self.bind_id.get(), true);
+        }
         (display.width, display.height, display.bpp) = (width, height, bpp);
+        window::set_mode(width, height, bpp, true);
+        if let Some(renderer) = display.renderer.as_mut() {
+            renderer.sync_overlay();
+        }
         Ok(())
     }
     fn WaitForVerticalBlank(&self, flags: u32, event: HANDLE) -> Result<()> {
         if !event.is_invalid() {
             return Err(E_NOTIMPL.into());
+        }
+        if let Ok(mut display) = self.display.try_borrow_mut() {
+            if display.dirty {
+                let _ = display.present_now();
+            }
         }
         let (phase_us, active_end_us, frame_us, _) = self.frame_timing();
         let wait_us = match flags as i32 {

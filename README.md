@@ -22,14 +22,38 @@ cargo build --locked --release --target i686-pc-windows-gnullvm
 
 The output is `target/i686-pc-windows-gnullvm/release/ddraw.dll`. To load the local build in Wine, use the native DLL override `WINEDLLOVERRIDES=ddraw=n`.
 
+## Configuration (`ddraw.ini`)
+
+Place an optional `ddraw.ini` next to `ddraw.dll` (or the game executable) using standard `[ddraw]` keys (with optional `[<exe_name>]` per-game overrides):
+
+```ini
+[ddraw]
+windowed=false           ; start in windowed mode instead of borderless fullscreen
+border=true              ; show window titlebar/frame in windowed mode
+resizable=true           ; allow dragging window edges to resize
+width=0                  ; windowed client width (0 = follow game logical resolution)
+height=0                 ; windowed client height (0 = follow game logical resolution)
+posX=-32000              ; windowed X position (-32000 = center on monitor)
+posY=-32000              ; windowed Y position (-32000 = center on monitor)
+maintas=true             ; preserve aspect ratio (false = stretch to fill window)
+vsync=false              ; true = Fifo vsync, false = low-latency Mailbox/Immediate
+maxfps=0                 ; 0 = coalesced ~250 Hz cap, >0 = explicit FPS cap
+renderer=auto            ; auto, dx12, or vulkan (overridden by WGPU_BACKEND env var)
+keytogglefullscreen=0x0D ; Alt+key toggle between borderless fullscreen and windowed (0 = off)
+```
+
+Press **Alt+Enter** at any time to toggle between borderless fullscreen and windowed mode.
+
 ## Implementation
 
-- `src/draw.rs` implements `IDirectDraw`, `IDirectDraw2`, `IDirectDraw4`, and `IDirectDraw7`, along with `DirectDrawCreate`, `DirectDrawCreateEx`, `DirectDrawCreateClipper`, device/mode/surface enumeration, vblank and scanline timing, window binding, and borderless fullscreen restoration.
+- `src/draw.rs` implements `IDirectDraw`, `IDirectDraw2`, `IDirectDraw4`, and `IDirectDraw7`, along with `DirectDrawCreate`, `DirectDrawCreateEx`, `DirectDrawCreateClipper`, device/mode/surface enumeration, vblank/scanline timing, and coalesced frame flushing.
+- `src/window/` encapsulates all Win32 windowing concerns: `host.rs` (borderless fullscreen / windowed lifecycle and Alt+Enter toggle), `overlay.rs` (owned presentation overlay HWND and Z-order management), `input.rs` (viewport coordinate mapping, dialog hit-testing, and mouse routing), and `hooks.rs` (PE32 IAT hooks, WndProc subclassing, and `WH_GETMESSAGE`).
+- `src/config.rs` parses `ddraw.ini` (`[ddraw]` + per-executable overrides).
 - `src/surface.rs` implements `IDirectDrawSurface`, `IDirectDrawSurface2`, `IDirectDrawSurface3`, `IDirectDrawSurface4`, `IDirectDrawSurface7`, and `IDirectDrawGammaControl`. It owns CPU-backed pixels for primary, offscreen, multi-backbuffer flip chains, and overlay surfaces, supporting rectangular locks, color/depth fills, ROP fills, same- and cross-format blits, stretching, mirroring, source/destination color keys, clipper clipping, `BltBatch`, private data, uniqueness/priority/LOD state, gamma ramps, and GDI drawing through a DIB.
 - `src/clipper.rs` implements `IDirectDrawClipper` backed by Win32 GDI regions (`SetClipList`/`GetClipList`/`SetHWnd`/`GetHWnd`).
 - `src/palette.rs` stores the 256-entry `IDirectDrawPalette`. Changing an attached palette refreshes the primary image even when the pixel indices stay the same.
 - `src/exports.rs`, `exports.def`, and `build.rs` provide standard DirectDraw export ordinals (`@1`..`@21`), reentrant `AcquireDDThreadLock`/`ReleaseDDThreadLock`, legacy stubs (`CompleteCreateSysmemSurface`, `D3DParseUnknownCommand`, `DDInternalLock`/`DDInternalUnlock`), helper exports (`DDIsWindowed`, `DDGetProcAddress`, `DDEnableZoom`), and `DllGetClassObject`/`IClassFactory` for `CLSID_DirectDraw`, `CLSID_DirectDraw7`, and `CLSID_DirectDrawClipper`.
-- `src/renderer.rs` and `src/present.wgsl` share one presentation pipeline across Vulkan and DX12. Indexed, RGB555, RGB565 and XRGB8888 pixels are expanded on the CPU (with optional gamma LUT) and uploaded as RGBA. The shader scales with nearest-neighbor sampling into a centered, aspect-preserving viewport.
+- `src/renderer.rs` and `src/present.wgsl` share one presentation pipeline across Vulkan and DX12. Indexed, RGB555, RGB565 and XRGB8888 pixels are expanded on the CPU via LUTs (with optional gamma) and uploaded as RGBA. The shader scales with nearest-neighbor sampling into a centered, aspect-preserving (or stretched) viewport.
 
 The implemented DirectDraw COM objects are single-threaded. Release the display and its surfaces, or detach the HWND with `SetCooperativeLevel(NULL, DDSCL_NORMAL)`, before destroying the window. Direct3D 3D game rendering remains outside this experiment's scope.
 

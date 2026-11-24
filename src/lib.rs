@@ -5,8 +5,10 @@
 compile_error!("Build ddraw.dll for 32-bit x86 Windows.");
 
 mod clipper;
+mod config;
 mod draw;
 mod exports;
 mod palette;
 mod renderer;
 mod surface;
+mod window;

@@ -45,6 +45,27 @@ const DDERR_DCALREADYCREATED: HRESULT = dd_hresult(620);
 const DDERR_MOREDATA: HRESULT = dd_hresult(690);
 
 const MAX_BACKBUFFERS: u32 = 8;
+const TOP_GUARD_LINES: usize = 64;
+const BOTTOM_GUARD_LINES: usize = 200;
+const MAX_TOP_GUARD_BYTES: usize = 256 * 1024;
+const MAX_BOTTOM_GUARD_BYTES: usize = 512 * 1024;
+
+fn guard_padding(pitch: usize) -> (usize, usize) {
+    let top = (pitch
+        .saturating_mul(TOP_GUARD_LINES)
+        .min(MAX_TOP_GUARD_BYTES)
+        + 15)
+        & !15;
+    let bottom = pitch
+        .saturating_mul(BOTTOM_GUARD_LINES)
+        .min(MAX_BOTTOM_GUARD_BYTES)
+        .max(
+            pitch
+                .saturating_mul(TOP_GUARD_LINES)
+                .min(MAX_BOTTOM_GUARD_BYTES),
+        );
+    (top, bottom)
+}
 
 fn unsupported<T>() -> Result<T> {
     Err(E_NOTIMPL.into())
@@ -278,7 +299,7 @@ impl SurfaceDc {
                 biPlanes: 1,
                 biBitCount: (surface.format.bytes() * 8) as u16,
                 biCompression: BI_RGB.0,
-                biSizeImage: surface.pixels.len() as u32,
+                biSizeImage: surface.image_len as u32,
                 ..Default::default()
             },
             table: [0; 256],
@@ -327,9 +348,9 @@ impl SurfaceDc {
                 return Err(DDERR_CANTCREATEDC.into());
             }
             std::ptr::copy_nonoverlapping(
-                surface.pixels.as_ptr(),
+                surface.pixel_slice().as_ptr(),
                 dc.bits.cast(),
-                surface.pixels.len(),
+                surface.image_len,
             );
         }
         Ok(dc)
@@ -357,6 +378,8 @@ pub struct SurfaceData {
     pub height: u32,
     access: Access,
     pitch: usize,
+    pixel_offset: usize,
+    image_len: usize,
     format: Format,
     caps: u32,
     pixels: Vec<u8>,
@@ -385,14 +408,21 @@ impl SurfaceData {
             .map(|v| v & !3)
             .filter(|v| *v <= i32::MAX as usize)
             .ok_or(E_OUTOFMEMORY)?;
-        let len = pitch.checked_mul(height as usize).ok_or(E_OUTOFMEMORY)?;
+        let image_len = pitch.checked_mul(height as usize).ok_or(E_OUTOFMEMORY)?;
+        let (top_guard, bottom_guard) = guard_padding(pitch);
+        let alloc_len = top_guard
+            .checked_add(image_len)
+            .and_then(|v| v.checked_add(bottom_guard))
+            .ok_or(E_OUTOFMEMORY)?;
         Ok(Self {
             width,
             height,
             pitch,
+            pixel_offset: top_guard,
+            image_len,
             format,
             caps,
-            pixels: zeros(len)?,
+            pixels: zeros(alloc_len)?,
             palette: None,
             clipper: None,
             access: Access::Ready,
@@ -409,8 +439,25 @@ impl SurfaceData {
         })
     }
 
+    fn pixel_slice(&self) -> &[u8] {
+        &self.pixels[self.pixel_offset..self.pixel_offset + self.image_len]
+    }
+
+    fn pixel_slice_mut(&mut self) -> &mut [u8] {
+        let start = self.pixel_offset;
+        &mut self.pixels[start..start + self.image_len]
+    }
+
+    fn surface_ptr(&mut self) -> *mut u8 {
+        self.pixels.as_mut_ptr().wrapping_add(self.pixel_offset)
+    }
+
+    fn surface_ptr_const(&self) -> *const u8 {
+        self.pixels.as_ptr().wrapping_add(self.pixel_offset)
+    }
+
     pub fn byte_len(&self) -> usize {
-        self.pixels.len()
+        self.image_len
     }
 
     pub fn has_dc(&self, hdc: HDC) -> bool {
@@ -427,6 +474,29 @@ impl SurfaceData {
 
     fn bump_uniqueness(&mut self) {
         self.uniqueness = self.uniqueness.wrapping_add(1);
+    }
+
+    fn clamp_rect(&self, rect: *const RECT) -> Option<RECT> {
+        let r = unsafe { rect.as_ref() }.copied().unwrap_or(RECT {
+            left: 0,
+            top: 0,
+            right: self.width as i32,
+            bottom: self.height as i32,
+        });
+        let left = r.left.clamp(0, self.width as i32);
+        let top = r.top.clamp(0, self.height as i32);
+        let right = r.right.clamp(0, self.width as i32);
+        let bottom = r.bottom.clamp(0, self.height as i32);
+        if right <= left || bottom <= top {
+            None
+        } else {
+            Some(RECT {
+                left,
+                top,
+                right,
+                bottom,
+            })
+        }
     }
 
     fn bounds(&self, rect: *const RECT) -> Result<RECT> {
@@ -454,6 +524,7 @@ impl SurfaceData {
             dwFlags: (DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_PIXELFORMAT) as u32,
             dwWidth: self.width,
             dwHeight: self.height,
+            lpSurface: self.surface_ptr_const().cast_mut().cast(),
             ddsCaps: DDSCAPS { dwCaps: self.caps },
             ddpfPixelFormat: self.format.description(),
             ..Default::default()
@@ -511,9 +582,28 @@ impl SurfaceData {
     }
 }
 
+const LUT5: [u8; 32] = {
+    let mut table = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        table[i] = (i * 255 / 31) as u8;
+        i += 1;
+    }
+    table
+};
+
+const LUT6: [u8; 64] = {
+    let mut table = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        table[i] = (i * 255 / 63) as u8;
+        i += 1;
+    }
+    table
+};
+
 pub fn frame_rgba(data: &SurfaceData, rgba: &mut Vec<u8>) -> Result<()> {
     data.ready()?;
-    let entries = data.palette_entries()?;
     let width = data.width as usize;
     let size = width
         .checked_mul(data.height as usize)
@@ -522,27 +612,119 @@ pub fn frame_rgba(data: &SurfaceData, rgba: &mut Vec<u8>) -> Result<()> {
     rgba.try_reserve_exact(size.saturating_sub(rgba.len()))
         .map_err(|_| E_OUTOFMEMORY)?;
     rgba.resize(size, 0);
-    let bytes = data.format.bytes();
     let gamma = data.gamma.as_ref();
-    for (source, dst) in data
-        .pixels
-        .chunks_exact(data.pitch)
-        .zip(rgba.chunks_exact_mut(width * 4))
-    {
-        for (pixel, out) in source[..width * bytes]
-            .chunks_exact(bytes)
-            .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-        {
-            let mut rgb = data.format.decode_rgb(pixel, &entries);
+    let src_rows = data.pixel_slice().chunks_exact(data.pitch);
+    let dst_rows = rgba.chunks_exact_mut(width * 4);
+
+    match data.format {
+        Format::Rgb565 => {
+            let (mut r_lut, mut g_lut, mut b_lut) = (LUT5, LUT6, LUT5);
             if let Some(ramp) = gamma {
-                rgb = [
-                    (ramp.red[rgb[0] as usize] >> 8) as u8,
-                    (ramp.green[rgb[1] as usize] >> 8) as u8,
-                    (ramp.blue[rgb[2] as usize] >> 8) as u8,
-                ];
+                for r in &mut r_lut {
+                    *r = (ramp.red[*r as usize] >> 8) as u8;
+                }
+                for g in &mut g_lut {
+                    *g = (ramp.green[*g as usize] >> 8) as u8;
+                }
+                for b in &mut b_lut {
+                    *b = (ramp.blue[*b as usize] >> 8) as u8;
+                }
             }
-            out[..3].copy_from_slice(&rgb);
-            out[3] = 255;
+            for (source, dst) in src_rows.zip(dst_rows) {
+                for (pixel, out) in source[..width * 2]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
+                    let v = u16::from_le_bytes(*pixel) as usize;
+                    *out = [r_lut[v >> 11], g_lut[(v >> 5) & 63], b_lut[v & 31], 255];
+                }
+            }
+        }
+        Format::Rgb555 => {
+            let (mut r_lut, mut g_lut, mut b_lut) = (LUT5, LUT5, LUT5);
+            if let Some(ramp) = gamma {
+                for r in &mut r_lut {
+                    *r = (ramp.red[*r as usize] >> 8) as u8;
+                }
+                for g in &mut g_lut {
+                    *g = (ramp.green[*g as usize] >> 8) as u8;
+                }
+                for b in &mut b_lut {
+                    *b = (ramp.blue[*b as usize] >> 8) as u8;
+                }
+            }
+            for (source, dst) in src_rows.zip(dst_rows) {
+                for (pixel, out) in source[..width * 2]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
+                    let v = u16::from_le_bytes(*pixel) as usize;
+                    *out = [
+                        r_lut[(v >> 10) & 31],
+                        g_lut[(v >> 5) & 31],
+                        b_lut[v & 31],
+                        255,
+                    ];
+                }
+            }
+        }
+        Format::Indexed => {
+            let entries = data.palette_entries()?;
+            let mut pal_rgba = [[0u8; 4]; 256];
+            for (slot, e) in pal_rgba.iter_mut().zip(entries.iter()) {
+                let (r, g, b) = if let Some(ramp) = gamma {
+                    (
+                        (ramp.red[e.peRed as usize] >> 8) as u8,
+                        (ramp.green[e.peGreen as usize] >> 8) as u8,
+                        (ramp.blue[e.peBlue as usize] >> 8) as u8,
+                    )
+                } else {
+                    (e.peRed, e.peGreen, e.peBlue)
+                };
+                *slot = [r, g, b, 255];
+            }
+            for (source, dst) in src_rows.zip(dst_rows) {
+                for (&idx, out) in source[..width]
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
+                    *out = pal_rgba[idx as usize];
+                }
+            }
+        }
+        Format::Xrgb => {
+            if let Some(ramp) = gamma {
+                for (source, dst) in src_rows.zip(dst_rows) {
+                    for (pixel, out) in source[..width * 4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                    {
+                        *out = [
+                            (ramp.red[pixel[2] as usize] >> 8) as u8,
+                            (ramp.green[pixel[1] as usize] >> 8) as u8,
+                            (ramp.blue[pixel[0] as usize] >> 8) as u8,
+                            255,
+                        ];
+                    }
+                }
+            } else {
+                for (source, dst) in src_rows.zip(dst_rows) {
+                    for (pixel, out) in source[..width * 4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                    {
+                        *out = [pixel[2], pixel[1], pixel[0], 255];
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -698,10 +880,12 @@ pub fn create_surface(
     if (count > 0) != (caps & DDSCAPS_FLIP as u32 != 0) {
         return Err(DDERR_INVALIDCAPS.into());
     }
-    let mem_caps = if caps & DDSCAPS_VIDEOMEMORY as u32 != 0 {
+    let mem_caps = if caps & DDSCAPS_SYSTEMMEMORY as u32 != 0 {
         caps
-    } else {
+    } else if primary {
         caps | DDSCAPS_SYSTEMMEMORY as u32
+    } else {
+        caps | DDSCAPS_VIDEOMEMORY as u32
     };
     let mut data = SurfaceData::new(width, height, format, mem_caps)?;
     if primary {
@@ -730,11 +914,12 @@ pub fn create_surface(
             data.pitch
         };
         let row_bytes = width as usize * format.bytes();
+        let dst_ptr = data.surface_ptr();
         for y in 0..height as usize {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     desc.lpSurface.cast::<u8>().add(y * src_pitch),
-                    data.pixels.as_mut_ptr().add(y * data.pitch),
+                    dst_ptr.add(y * data.pitch),
                     row_bytes,
                 );
             }
@@ -774,6 +959,7 @@ pub fn create_surface(
             .try_borrow_mut()
             .map_err(|_| DDERR_SURFACEBUSY)?
             .primary = Rc::downgrade(&data);
+        crate::window::set_mode(width, height, (format.bytes() * 8) as u32, true);
     }
     register_surface_object(parent, display, data, attached)
 }
@@ -793,7 +979,7 @@ pub fn duplicate_surface(
         return Err(DDERR_CANTDUPLICATE.into());
     }
     let mut copy = SurfaceData::new(src.width, src.height, src.format, src.caps)?;
-    copy.pixels.copy_from_slice(&src.pixels);
+    copy.pixel_slice_mut().copy_from_slice(src.pixel_slice());
     copy.palette = src.palette.clone();
     copy.clipper = src.clipper.clone();
     copy.source_key = src.source_key;
@@ -860,6 +1046,16 @@ impl Surface {
                 .try_borrow_mut()
                 .map_err(|_| DDERR_SURFACEBUSY)?
                 .refresh()?;
+        }
+        Ok(())
+    }
+
+    fn present_now(&self) -> Result<()> {
+        if self.read()?.caps & DDSCAPS_PRIMARYSURFACE as u32 != 0 {
+            self.display
+                .try_borrow_mut()
+                .map_err(|_| DDERR_SURFACEBUSY)?
+                .present_now()?;
         }
         Ok(())
     }
@@ -965,7 +1161,9 @@ impl Surface {
     ) -> Result<()> {
         let src = source.read()?;
         src.ready()?;
-        let src_rect = src.bounds(src_rect)?;
+        let Some(src_rect) = src.clamp_rect(src_rect) else {
+            return Ok(());
+        };
         let src_format = src.format;
         let src_palette = if src_format == Format::Indexed {
             Some(src.palette_entries()?)
@@ -976,10 +1174,11 @@ impl Surface {
         if Rc::ptr_eq(&source.data, &self.data) {
             let row_bytes = (src_rect.right - src_rect.left) as usize * src_format.bytes();
             let mut snapshot = zeros(row_bytes * (src_rect.bottom - src_rect.top) as usize)?;
+            let src_pixels = src.pixel_slice();
             for (y, row) in snapshot.chunks_exact_mut(row_bytes).enumerate() {
                 let start = (src_rect.top as usize + y) * src.pitch
                     + src_rect.left as usize * src_format.bytes();
-                row.copy_from_slice(&src.pixels[start..start + row_bytes]);
+                row.copy_from_slice(&src_pixels[start..start + row_bytes]);
             }
             drop(src);
             let local = RECT {
@@ -1006,7 +1205,7 @@ impl Surface {
             blit(
                 &mut dst,
                 dest_rect,
-                &src.pixels,
+                src.pixel_slice(),
                 src.pitch,
                 src_format,
                 src_palette.as_ref(),
@@ -1028,8 +1227,9 @@ impl Surface {
         dst.ready()?;
         let bytes = dst.format.bytes();
         let pitch = dst.pitch;
+        let pixels = dst.pixel_slice_mut();
         for y in rect.top as usize..rect.bottom as usize {
-            let row = &mut dst.pixels
+            let row = &mut pixels
                 [y * pitch + rect.left as usize * bytes..y * pitch + rect.right as usize * bytes];
             for pixel in row.chunks_exact_mut(bytes) {
                 if let Some(range) = dst_key {
@@ -1080,7 +1280,9 @@ impl Surface {
                 return Err(E_INVALIDARG.into());
             }
         }
-        let rect = self.read()?.bounds(dest)?;
+        let Some(rect) = self.read()?.clamp_rect(dest) else {
+            return Ok(());
+        };
         let clip_rects = {
             let clipper_opt = self.read()?.clipper.clone();
             match clipper_opt {
@@ -1306,10 +1508,12 @@ impl Surface {
                 front.ready()?;
                 back_data.ready()?;
                 std::mem::swap(&mut front.pixels, &mut back_data.pixels);
+                std::mem::swap(&mut front.pixel_offset, &mut back_data.pixel_offset);
+                std::mem::swap(&mut front.image_len, &mut back_data.image_len);
                 front.bump_uniqueness();
                 back_data.bump_uniqueness();
             }
-            return self.refresh();
+            return self.present_now();
         }
 
         // Verify all surfaces in the chain are unlocked before rotating buffers.
@@ -1320,19 +1524,25 @@ impl Surface {
 
         // Rotate: front <- back[0] <- back[1] <- ... <- back[n-1] <- old front.
         let mut front = self.write()?;
-        let mut carried = std::mem::take(&mut front.pixels);
+        let mut carried_pixels = std::mem::take(&mut front.pixels);
+        let mut carried_offset = front.pixel_offset;
+        let mut carried_len = front.image_len;
         drop(front);
         for surf in chain.iter().rev() {
             let obj = surf.cast_object_ref::<Surface>()?;
             let mut data = obj.write()?;
-            std::mem::swap(&mut data.pixels, &mut carried);
+            std::mem::swap(&mut data.pixels, &mut carried_pixels);
+            std::mem::swap(&mut data.pixel_offset, &mut carried_offset);
+            std::mem::swap(&mut data.image_len, &mut carried_len);
             data.bump_uniqueness();
         }
         let mut front = self.write()?;
-        front.pixels = carried;
+        front.pixels = carried_pixels;
+        front.pixel_offset = carried_offset;
+        front.image_len = carried_len;
         front.bump_uniqueness();
         drop(front);
-        self.refresh()
+        self.present_now()
     }
 
     fn get_attached_surface_impl<S>(&self, caps_val: u32, out: OutRef<S>) -> Result<()>
@@ -1365,6 +1575,7 @@ impl Surface {
         if flags
             & !((DDLOCK_WAIT
                 | DDLOCK_DONOTWAIT
+                | DDLOCK_EVENT
                 | DDLOCK_READONLY
                 | DDLOCK_WRITEONLY
                 | DDLOCK_NOSYSLOCK
@@ -1380,7 +1591,7 @@ impl Surface {
         let r = data.bounds(rect)?;
         let mut desc = data.desc(count);
         let offset = r.top as usize * data.pitch + r.left as usize * data.format.bytes();
-        desc.lpSurface = data.pixels.as_mut_ptr().wrapping_add(offset).cast();
+        desc.lpSurface = data.surface_ptr().wrapping_add(offset).cast();
         desc.dwFlags |= DDSD_LPSURFACE as u32;
         data.access = Access::Locked { offset, rect: r };
         Ok(desc)
@@ -1391,7 +1602,7 @@ impl Surface {
         let Access::Locked { offset, .. } = data.access else {
             return Err(DDERR_NOTLOCKED.into());
         };
-        if !address.is_null() && address != data.pixels.as_mut_ptr().wrapping_add(offset).cast() {
+        if !address.is_null() && address != data.surface_ptr().wrapping_add(offset).cast() {
             return Err(E_INVALIDARG.into());
         }
         data.access = Access::Ready;
@@ -1475,18 +1686,22 @@ impl Surface {
                 .filter(|v| *v <= i32::MAX as usize)
                 .ok_or(E_OUTOFMEMORY)?
         };
-        let len = pitch
+        let image_len = pitch
             .checked_mul(data.height as usize)
             .ok_or(E_OUTOFMEMORY)?;
+        let (top_guard, bottom_guard) = guard_padding(pitch);
+        let alloc_len = top_guard
+            .checked_add(image_len)
+            .and_then(|v| v.checked_add(bottom_guard))
+            .ok_or(E_OUTOFMEMORY)?;
         data.pitch = pitch;
-        data.pixels = zeros(len)?;
+        data.pixel_offset = top_guard;
+        data.image_len = image_len;
+        data.pixels = zeros(alloc_len)?;
         if desc.dwFlags & DDSD_LPSURFACE as u32 != 0 && !desc.lpSurface.is_null() {
+            let dst_ptr = data.surface_ptr();
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    desc.lpSurface.cast::<u8>(),
-                    data.pixels.as_mut_ptr(),
-                    len,
-                );
+                std::ptr::copy_nonoverlapping(desc.lpSurface.cast::<u8>(), dst_ptr, image_len);
             }
         }
         data.bump_uniqueness();
@@ -1700,8 +1915,6 @@ fn blit(
     let dst_bytes = dst.format.bytes();
     let src_bytes = src_format.bytes();
     let same_format = dst.format == src_format;
-    let default_pal = [PALETTEENTRY::default(); 256];
-    let pal = src_palette.unwrap_or(&default_pal);
     let (dw, dh) = (
         (dest.right - dest.left) as usize,
         (dest.bottom - dest.top) as usize,
@@ -1710,6 +1923,71 @@ fn blit(
         (src.right - src.left) as usize,
         (src.bottom - src.top) as usize,
     );
+    if same_format && dw == sw && !opts.mirror_lr && opts.dst_key.is_none() {
+        for y in 0..dh {
+            let src_y_rel = if dh == sh {
+                y
+            } else {
+                (y as u64 * sh as u64 / dh as u64) as usize
+            };
+            let sy = if opts.mirror_ud {
+                src.top as usize + (sh - 1 - src_y_rel)
+            } else {
+                src.top as usize + src_y_rel
+            };
+            let start = sy * pitch + src.left as usize * src_bytes;
+            let row = &source[start..start + sw * src_bytes];
+            let start = dst.pixel_offset
+                + (dest.top as usize + y) * dst.pitch
+                + dest.left as usize * dst_bytes;
+            let out = &mut dst.pixels[start..start + dw * dst_bytes];
+            let Some(range) = opts.src_key else {
+                out.copy_from_slice(row);
+                continue;
+            };
+            let (lo, hi) = (range.dwColorSpaceLowValue, range.dwColorSpaceHighValue);
+            match dst_bytes {
+                1 => {
+                    let (lo, hi) = (lo as u8, hi as u8);
+                    for (&sp, dp) in row.iter().zip(out.iter_mut()) {
+                        if sp < lo || sp > hi {
+                            *dp = sp;
+                        }
+                    }
+                }
+                2 => {
+                    let (lo, hi) = (lo as u16, hi as u16);
+                    for (sp, dp) in row
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .zip(out.as_chunks_mut::<2>().0.iter_mut())
+                    {
+                        let v = u16::from_le_bytes(*sp);
+                        if v < lo || v > hi {
+                            *dp = *sp;
+                        }
+                    }
+                }
+                _ => {
+                    for (sp, dp) in row
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(out.as_chunks_mut::<4>().0.iter_mut())
+                    {
+                        let v = u32::from_le_bytes(*sp);
+                        if v < lo || v > hi {
+                            *dp = *sp;
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let default_pal = [PALETTEENTRY::default(); 256];
+    let pal = src_palette.unwrap_or(&default_pal);
     for y in 0..dh {
         let src_y_rel = (y as u64 * sh as u64 / dh as u64) as usize;
         let sy = if opts.mirror_ud {
@@ -1719,17 +1997,9 @@ fn blit(
         };
         let start = sy * pitch + src.left as usize * src_bytes;
         let row = &source[start..start + sw * src_bytes];
-        let start = (dest.top as usize + y) * dst.pitch + dest.left as usize * dst_bytes;
+        let start =
+            dst.pixel_offset + (dest.top as usize + y) * dst.pitch + dest.left as usize * dst_bytes;
         let out = &mut dst.pixels[start..start + dw * dst_bytes];
-        if same_format
-            && dw == sw
-            && opts.src_key.is_none()
-            && opts.dst_key.is_none()
-            && !opts.mirror_lr
-        {
-            out.copy_from_slice(row);
-            continue;
-        }
         for (x, target) in out.chunks_exact_mut(dst_bytes).enumerate() {
             let src_x_rel = (x as u64 * sw as u64 / dw as u64) as usize;
             let sx = if opts.mirror_lr {
@@ -2023,10 +2293,12 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
             return Err(E_INVALIDARG.into());
         }
         let bits = dc.bits;
+        let len = data.image_len;
+        let dst_ptr = data.surface_ptr();
         unsafe {
             // GDI queues draws on the calling thread. Flush before reading the DIB.
             let _ = GdiFlush();
-            std::ptr::copy_nonoverlapping(bits.cast(), data.pixels.as_mut_ptr(), data.pixels.len());
+            std::ptr::copy_nonoverlapping(bits.cast(), dst_ptr, len);
         }
         data.access = Access::Ready;
         data.bump_uniqueness();
@@ -2776,13 +3048,12 @@ mod tests {
         ] {
             let mut surface = SurfaceData::new(1, 3, format, 0).unwrap();
             assert_eq!(surface.pitch, 4);
-            for (row, color) in
-                surface
-                    .pixels
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip([red, green_sample, 0x001f])
+            for (row, color) in surface
+                .pixel_slice_mut()
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip([red, green_sample, 0x001f])
             {
                 row[..2].copy_from_slice(&color.to_le_bytes());
                 row[2..].fill(0xad);
@@ -2800,7 +3071,7 @@ mod tests {
     fn xrgb_swaps_red_and_blue_and_ignores_the_reserved_byte() {
         let mut surface = SurfaceData::new(2, 1, Format::Xrgb, 0).unwrap();
         surface
-            .pixels
+            .pixel_slice_mut()
             .copy_from_slice(&[8, 32, 128, 0, 1, 2, 3, 96]);
         let mut rgba = Vec::new();
         frame_rgba(&surface, &mut rgba).unwrap();
@@ -2810,7 +3081,7 @@ mod tests {
     #[test]
     fn gamma_ramp_remaps_expanded_rgba_channels() {
         let mut surface = SurfaceData::new(1, 1, Format::Xrgb, 0).unwrap();
-        surface.pixels.copy_from_slice(&[10, 20, 30, 0]);
+        surface.pixel_slice_mut().copy_from_slice(&[10, 20, 30, 0]);
         let mut ramp = identity_gamma_ramp();
         ramp.red[30] = 0x8000;
         ramp.green[20] = 0x4000;
@@ -2825,8 +3096,8 @@ mod tests {
     fn cross_format_mirror_blit_converts_rgb565_to_xrgb() {
         let mut src = SurfaceData::new(2, 1, Format::Rgb565, 0).unwrap();
         // Pixel 0 = red (0xf800), Pixel 1 = blue (0x001f)
-        src.pixels[0..2].copy_from_slice(&0xf800u16.to_le_bytes());
-        src.pixels[2..4].copy_from_slice(&0x001fu16.to_le_bytes());
+        src.pixel_slice_mut()[0..2].copy_from_slice(&0xf800u16.to_le_bytes());
+        src.pixel_slice_mut()[2..4].copy_from_slice(&0x001fu16.to_le_bytes());
         let mut dst = SurfaceData::new(2, 1, Format::Xrgb, 0).unwrap();
         let rect = RECT {
             left: 0,
@@ -2837,7 +3108,7 @@ mod tests {
         blit(
             &mut dst,
             rect,
-            &src.pixels,
+            src.pixel_slice(),
             src.pitch,
             Format::Rgb565,
             None,
@@ -2848,7 +3119,16 @@ mod tests {
             },
         );
         // Mirrored: Pixel 0 = blue (BGRA: 255,0,0,0), Pixel 1 = red (BGRA: 0,0,255,0)
-        assert_eq!(&dst.pixels[0..4], &[255, 0, 0, 0]);
-        assert_eq!(&dst.pixels[4..8], &[0, 0, 255, 0]);
+        assert_eq!(&dst.pixel_slice()[0..4], &[255, 0, 0, 0]);
+        assert_eq!(&dst.pixel_slice()[4..8], &[0, 0, 255, 0]);
+    }
+
+    #[test]
+    fn surface_allocates_top_and_bottom_guard_padding() {
+        let surface = SurfaceData::new(640, 480, Format::Rgb565, 0).unwrap();
+        assert_eq!(surface.pitch, 1280);
+        assert_eq!(surface.image_len, 1280 * 480);
+        assert!(surface.pixel_offset >= 1280 * 64);
+        assert!(surface.pixels.len() - (surface.pixel_offset + surface.image_len) >= 1280 * 200);
     }
 }
