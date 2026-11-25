@@ -31,4 +31,5 @@ windows = { version = "0.62.2", features = [
 
 [profile.release]
 lto = "thin"
+debug = true
 strip = "symbols"
