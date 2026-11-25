@@ -78,6 +78,12 @@ pub(crate) fn bound_thread_id() -> u32 {
     BOUND_THREAD.load(Ordering::Relaxed)
 }
 
+/// Returns true when the caller is on the bound UI thread (or no window is bound yet).
+pub fn is_ui_thread_or_unbound() -> bool {
+    let bound = BOUND_THREAD.load(Ordering::Relaxed);
+    bound == 0 || bound == unsafe { GetCurrentThreadId() }
+}
+
 pub(crate) fn present_hwnd_raw() -> isize {
     PRESENT_HWND.load(Ordering::Relaxed)
 }

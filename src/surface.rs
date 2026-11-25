@@ -1,11 +1,12 @@
 //! CPU-backed DirectDraw 1-7 surfaces. A lock exposes stable storage until Unlock.
 #![allow(non_snake_case)]
 
-use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{size_of, ManuallyDrop};
-use std::rc::Rc;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use windows::core::{implement, Error, IUnknown, Interface, OutRef, Ref, Result, GUID, HRESULT};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, HANDLE, RECT};
@@ -15,9 +16,10 @@ use windows::Win32::Graphics::Gdi::{
     SelectObject, SetDIBColorTable, BITMAPINFO, BITMAPINFOHEADER, BI_BITFIELDS, BI_RGB, BLACKNESS,
     DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PALETTEENTRY, PATCOPY, RGBQUAD, SRCCOPY, WHITENESS,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 
 use crate::clipper;
-use crate::draw::Display;
+use crate::draw::DisplayShared;
 use crate::simd_blit::{self, KeyRange};
 
 const fn dd_hresult(code: u32) -> HRESULT {
@@ -263,8 +265,148 @@ pub fn pixel_format(bpp: u32) -> Result<DDPIXELFORMAT> {
 // A DirectDraw lock and a GDI DC both grant exclusive write access.
 enum Access {
     Ready,
-    Locked { rect: RECT },
-    Gdi { handle: HDC, saved_state: i32 },
+    Locked {
+        rect: RECT,
+        owner_tid: u32,
+    },
+    Gdi {
+        handle: HDC,
+        saved_state: i32,
+        owner_tid: u32,
+    },
+}
+
+const CROSS_THREAD_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[inline]
+fn current_tid() -> u32 {
+    unsafe { GetCurrentThreadId() }
+}
+
+/// Thread-safe synchronization wrapper around `SurfaceData` supporting cross-thread
+/// `DDLOCK_WAIT` / `DDBLT_WAIT` / `DDFLIP_WAIT` coordination without spurious `DDERR_SURFACEBUSY`.
+pub struct SurfaceSlot {
+    data: Mutex<SurfaceData>,
+    ready_cv: Condvar,
+}
+
+// All fields inside `SurfaceData` are accessed strictly under `SurfaceSlot::data` Mutex;
+// GDI memory DCs and COM interface references (atomic refcount) are exclusively synchronized.
+unsafe impl Send for SurfaceSlot {}
+unsafe impl Sync for SurfaceSlot {}
+
+impl SurfaceSlot {
+    fn new(data: SurfaceData) -> Self {
+        Self {
+            data: Mutex::new(data),
+            ready_cv: Condvar::new(),
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, SurfaceData> {
+        self.data.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Acquires `SurfaceData` when its `Access` is `Ready`.
+    /// - Same-thread conflict (e.g. `GetDC` followed by `Lock` on the same thread) immediately
+    ///   returns `DDERR_SURFACEBUSY` to match DirectDraw semantics and prevent self-deadlock.
+    /// - Cross-thread conflict (e.g. a background cursor thread calling `Lock` while the main
+    ///   thread briefly holds `Lock` or `GetDC`) waits on `ready_cv` when `wait` is true.
+    fn lock_ready(&self, wait: bool) -> Result<MutexGuard<'_, SurfaceData>> {
+        let mut guard = self.lock();
+        if !guard.locked() {
+            return Ok(guard);
+        }
+        let tid = current_tid();
+        if !wait || guard.lock_owner_tid() == tid {
+            return Err(DDERR_SURFACEBUSY.into());
+        }
+        let deadline = Instant::now() + CROSS_THREAD_WAIT_TIMEOUT;
+        while guard.locked() {
+            if guard.lock_owner_tid() == tid {
+                return Err(DDERR_SURFACEBUSY.into());
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(DDERR_SURFACEBUSY.into());
+            };
+            let (g, timeout) = self
+                .ready_cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
+            if timeout.timed_out() && guard.locked() {
+                return Err(DDERR_SURFACEBUSY.into());
+            }
+        }
+        Ok(guard)
+    }
+
+    fn notify_ready(&self) {
+        self.ready_cv.notify_all();
+    }
+}
+
+/// Acquires two distinct `SurfaceSlot`s in canonical pointer-address order and verifies both
+/// are `Access::Ready` without ever holding one mutex while waiting on the other's `Condvar`.
+fn lock_pair_ready<'a>(
+    first: &'a SurfaceSlot,
+    second: &'a SurfaceSlot,
+    wait: bool,
+) -> Result<(MutexGuard<'a, SurfaceData>, MutexGuard<'a, SurfaceData>)> {
+    let swap = std::ptr::from_ref(second) < std::ptr::from_ref(first);
+    let (lo, hi) = if swap {
+        (second, first)
+    } else {
+        (first, second)
+    };
+    loop {
+        let g_lo = lo.lock_ready(wait)?;
+        let g_hi = hi.lock();
+        if !g_hi.locked() {
+            return Ok(if swap { (g_hi, g_lo) } else { (g_lo, g_hi) });
+        }
+        let hi_owner = g_hi.lock_owner_tid();
+        drop(g_hi);
+        drop(g_lo);
+        if !wait || hi_owner == current_tid() {
+            return Err(DDERR_SURFACEBUSY.into());
+        }
+        drop(hi.lock_ready(true)?);
+    }
+}
+
+/// Atomically locks a flip chain of distinct `SurfaceSlot`s in canonical pointer-address order,
+/// waiting if another thread temporarily holds `Lock`/`GetDC` on any member.
+fn lock_chain_ready<'a>(
+    slots: &[&'a SurfaceSlot],
+    wait: bool,
+) -> Result<Vec<MutexGuard<'a, SurfaceData>>> {
+    let mut order: Vec<usize> = (0..slots.len()).collect();
+    order.sort_by_key(|&i| std::ptr::from_ref(slots[i]) as usize);
+    loop {
+        let mut guards: Vec<Option<MutexGuard<'a, SurfaceData>>> =
+            (0..slots.len()).map(|_| None).collect();
+        let mut busy_idx: Option<usize> = None;
+        for &idx in &order {
+            let g = slots[idx].lock();
+            if g.locked() {
+                let same_thread = g.lock_owner_tid() == current_tid();
+                drop(g);
+                if !wait || same_thread {
+                    return Err(DDERR_SURFACEBUSY.into());
+                }
+                busy_idx = Some(idx);
+                break;
+            }
+            guards[idx] = Some(g);
+        }
+        if let Some(idx) = busy_idx {
+            drop(guards);
+            drop(slots[idx].lock_ready(true)?);
+            continue;
+        }
+        return Ok(guards.into_iter().map(Option::unwrap).collect());
+    }
 }
 
 enum PrivateData {
@@ -595,6 +737,13 @@ impl SurfaceData {
         !matches!(self.access, Access::Ready)
     }
 
+    fn lock_owner_tid(&self) -> u32 {
+        match self.access {
+            Access::Ready => 0,
+            Access::Locked { owner_tid, .. } | Access::Gdi { owner_tid, .. } => owner_tid,
+        }
+    }
+
     fn ready(&self) -> Result<()> {
         if self.locked() {
             Err(DDERR_SURFACEBUSY.into())
@@ -839,49 +988,50 @@ struct BltOptions {
 )]
 struct Surface {
     parent: Option<IDirectDraw>,
-    display: Rc<RefCell<Display>>,
-    data: Rc<RefCell<SurfaceData>>,
-    attached: RefCell<Vec<IDirectDrawSurface>>,
-    self_raw: Cell<*mut c_void>,
+    display: Arc<DisplayShared>,
+    data: Arc<SurfaceSlot>,
+    is_primary: bool,
+    attached: Mutex<Vec<IDirectDrawSurface>>,
+    self_raw: AtomicPtr<c_void>,
 }
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        let raw = self.self_raw.get();
+        let raw = self.self_raw.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if !raw.is_null() {
-            if let Ok(mut d) = self.display.try_borrow_mut() {
-                d.unregister_surface(raw);
-            }
+            self.display.unregister_surface(raw);
         }
     }
 }
 
 fn register_surface_object(
     parent: Option<IDirectDraw>,
-    display: Rc<RefCell<Display>>,
-    data: Rc<RefCell<SurfaceData>>,
+    display: Arc<DisplayShared>,
+    data: Arc<SurfaceSlot>,
+    is_primary: bool,
     attached: Vec<IDirectDrawSurface>,
 ) -> Result<IDirectDrawSurface> {
     let iface: IDirectDrawSurface = Surface {
         parent,
         display: display.clone(),
         data: data.clone(),
-        attached: RefCell::new(attached),
-        self_raw: Cell::new(std::ptr::null_mut()),
+        is_primary,
+        attached: Mutex::new(attached),
+        self_raw: AtomicPtr::new(std::ptr::null_mut()),
     }
     .into();
     let raw = iface.as_raw();
-    iface.cast_object_ref::<Surface>()?.self_raw.set(raw);
-    display
-        .try_borrow_mut()
-        .map_err(|_| DDERR_SURFACEBUSY)?
-        .register_surface(raw, Rc::downgrade(&data));
+    iface
+        .cast_object_ref::<Surface>()?
+        .self_raw
+        .store(raw, Ordering::Release);
+    display.register_surface(raw, Arc::downgrade(&data));
     Ok(iface)
 }
 
 pub fn create_surface(
     parent: Option<IDirectDraw>,
-    display: Rc<RefCell<Display>>,
+    display: Arc<DisplayShared>,
     desc: &DDSURFACEDESC,
 ) -> Result<IDirectDrawSurface> {
     if desc.dwSize as usize != size_of::<DDSURFACEDESC>() {
@@ -933,7 +1083,7 @@ pub fn create_surface(
         return unsupported();
     }
     let primary = caps & DDSCAPS_PRIMARYSURFACE as u32 != 0;
-    let d = display.try_borrow().map_err(|_| DDERR_SURFACEBUSY)?;
+    let d = display.lock();
     if primary && d.primary.upgrade().is_some() {
         return Err(DDERR_PRIMARYSURFACEALREADYEXISTS.into());
     }
@@ -1016,7 +1166,7 @@ pub fn create_surface(
         // Build backbuffer chain from tail to head so back[0] -> back[1] -> ... -> back[count-1].
         let mut next: Option<IDirectDrawSurface> = None;
         for _ in 0..count {
-            let back_data = Rc::new(RefCell::new(SurfaceData::new(
+            let back_data = Arc::new(SurfaceSlot::new(SurfaceData::new(
                 width, height, format, back_mem,
             )?));
             let chain = next.into_iter().collect();
@@ -1024,6 +1174,7 @@ pub fn create_surface(
                 parent.clone(),
                 display.clone(),
                 back_data,
+                false,
                 chain,
             )?);
         }
@@ -1032,28 +1183,25 @@ pub fn create_surface(
         }
     }
 
-    let data = Rc::new(RefCell::new(data));
+    let data = Arc::new(SurfaceSlot::new(data));
     if primary {
-        display
-            .try_borrow_mut()
-            .map_err(|_| DDERR_SURFACEBUSY)?
-            .primary = Rc::downgrade(&data);
+        display.lock().primary = Arc::downgrade(&data);
         crate::window::set_mode(width, height, (format.bytes() * 8) as u32, true);
     }
-    register_surface_object(parent, display, data, attached)
+    register_surface_object(parent, display, data, primary, attached)
 }
 
 pub fn duplicate_surface(
     parent: Option<IDirectDraw>,
-    display: Rc<RefCell<Display>>,
+    display: Arc<DisplayShared>,
     source: &IDirectDrawSurface,
 ) -> Result<IDirectDrawSurface> {
     let src_obj = source.cast_object_ref::<Surface>()?;
-    let src = src_obj.read()?;
-    src.ready()?;
+    let has_attached = !src_obj.attached_lock().is_empty();
+    let src = src_obj.data.lock_ready(true)?;
     if src.caps & (DDSCAPS_PRIMARYSURFACE | DDSCAPS_FLIP | DDSCAPS_COMPLEX | DDSCAPS_ZBUFFER) as u32
         != 0
-        || !src_obj.attached.borrow().is_empty()
+        || has_attached
     {
         return Err(DDERR_CANTDUPLICATE.into());
     }
@@ -1067,7 +1215,13 @@ pub fn duplicate_surface(
     copy.dest_overlay_key = src.dest_overlay_key;
     copy.gamma = src.gamma;
     drop(src);
-    register_surface_object(parent, display, Rc::new(RefCell::new(copy)), Vec::new())
+    register_surface_object(
+        parent,
+        display,
+        Arc::new(SurfaceSlot::new(copy)),
+        false,
+        Vec::new(),
+    )
 }
 
 pub fn surface_desc(surface: &IDirectDrawSurface) -> Result<DDSURFACEDESC> {
@@ -1107,34 +1261,28 @@ pub fn matches_desc(surface: &IDirectDrawSurface, filter: &DDSURFACEDESC) -> Res
 }
 
 impl Surface {
-    fn read(&self) -> Result<std::cell::Ref<'_, SurfaceData>> {
-        self.data
-            .try_borrow()
-            .map_err(|_| Error::from(DDERR_SURFACEBUSY))
+    fn read(&self) -> Result<MutexGuard<'_, SurfaceData>> {
+        Ok(self.data.lock())
     }
 
-    fn write(&self) -> Result<std::cell::RefMut<'_, SurfaceData>> {
-        self.data
-            .try_borrow_mut()
-            .map_err(|_| Error::from(DDERR_SURFACEBUSY))
+    fn write(&self) -> Result<MutexGuard<'_, SurfaceData>> {
+        Ok(self.data.lock())
+    }
+
+    fn attached_lock(&self) -> MutexGuard<'_, Vec<IDirectDrawSurface>> {
+        self.attached.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn refresh(&self) -> Result<()> {
-        if self.read()?.caps & DDSCAPS_PRIMARYSURFACE as u32 != 0 {
-            self.display
-                .try_borrow_mut()
-                .map_err(|_| DDERR_SURFACEBUSY)?
-                .refresh()?;
+        if self.is_primary {
+            self.display.request_refresh()?;
         }
         Ok(())
     }
 
     fn present_now(&self) -> Result<()> {
-        if self.read()?.caps & DDSCAPS_PRIMARYSURFACE as u32 != 0 {
-            self.display
-                .try_borrow_mut()
-                .map_err(|_| DDERR_SURFACEBUSY)?
-                .present_now()?;
+        if self.is_primary {
+            self.display.request_present_now()?;
         }
         Ok(())
     }
@@ -1143,34 +1291,32 @@ impl Surface {
     fn flip_chain(&self) -> Result<Vec<IDirectDrawSurface>> {
         let mut chain = Vec::new();
         let mut current = self
-            .attached
-            .borrow()
+            .attached_lock()
             .iter()
             .find(|s| {
-                s.cast_object_ref::<Surface>()
-                    .and_then(|o| o.read())
-                    .is_ok_and(|d| d.caps & (DDSCAPS_BACKBUFFER | DDSCAPS_FLIP) as u32 != 0)
+                s.cast_object_ref::<Surface>().is_ok_and(|o| {
+                    o.data.lock().caps & (DDSCAPS_BACKBUFFER | DDSCAPS_FLIP) as u32 != 0
+                })
             })
             .cloned();
         while let Some(surf) = current {
             let obj = surf.cast_object_ref::<Surface>()?;
-            if Rc::ptr_eq(&obj.data, &self.data)
+            if Arc::ptr_eq(&obj.data, &self.data)
                 || chain.iter().any(|existing: &IDirectDrawSurface| {
                     existing
                         .cast_object_ref::<Surface>()
-                        .is_ok_and(|e| Rc::ptr_eq(&e.data, &obj.data))
+                        .is_ok_and(|e| Arc::ptr_eq(&e.data, &obj.data))
                 })
             {
                 break;
             }
             let next = obj
-                .attached
-                .borrow()
+                .attached_lock()
                 .iter()
                 .find(|s| {
-                    s.cast_object_ref::<Surface>()
-                        .and_then(|o| o.read())
-                        .is_ok_and(|d| d.caps & (DDSCAPS_BACKBUFFER | DDSCAPS_FLIP) as u32 != 0)
+                    s.cast_object_ref::<Surface>().is_ok_and(|o| {
+                        o.data.lock().caps & (DDSCAPS_BACKBUFFER | DDSCAPS_FLIP) as u32 != 0
+                    })
                 })
                 .cloned();
             chain.push(surf);
@@ -1186,19 +1332,20 @@ impl Surface {
     fn add_attached_surface_impl<S: Interface>(&self, target: Ref<S>) -> Result<()> {
         let target_ref = target.ok()?;
         let target_obj = target_ref.cast_object_ref::<Surface>()?;
-        if Rc::ptr_eq(&target_obj.data, &self.data) {
+        if Arc::ptr_eq(&target_obj.data, &self.data) {
             return Err(E_INVALIDARG.into());
         }
         let target_v1 = target_ref.cast::<IDirectDrawSurface>()?;
-        let mut attached = self.attached.borrow_mut();
+        let mut attached = self.attached_lock();
         if attached.iter().any(|s| {
             s.cast_object_ref::<Surface>()
-                .is_ok_and(|o| Rc::ptr_eq(&o.data, &target_obj.data))
+                .is_ok_and(|o| Arc::ptr_eq(&o.data, &target_obj.data))
         }) {
             return Err(DDERR_SURFACEALREADYATTACHED.into());
         }
-        if self.read()?.caps & DDSCAPS_FRONTBUFFER as u32 != 0 {
-            let mut target_data = target_obj.write()?;
+        let is_front = self.data.lock().caps & DDSCAPS_FRONTBUFFER as u32 != 0;
+        if is_front {
+            let mut target_data = target_obj.data.lock();
             target_data.caps |= (DDSCAPS_BACKBUFFER | DDSCAPS_FLIP) as u32;
         }
         attached.push(target_v1);
@@ -1209,7 +1356,7 @@ impl Surface {
         if flags != 0 {
             return Err(E_INVALIDARG.into());
         }
-        let mut attached = self.attached.borrow_mut();
+        let mut attached = self.attached_lock();
         match target.as_ref() {
             None => {
                 attached.clear();
@@ -1220,7 +1367,7 @@ impl Surface {
                 let before = attached.len();
                 attached.retain(|s| {
                     s.cast_object_ref::<Surface>()
-                        .is_ok_and(|o| !Rc::ptr_eq(&o.data, &target_obj.data))
+                        .is_ok_and(|o| !Arc::ptr_eq(&o.data, &target_obj.data))
                 });
                 if attached.len() == before {
                     Err(DDERR_SURFACENOTATTACHED.into())
@@ -1237,36 +1384,34 @@ impl Surface {
         src_rect: *const RECT,
         dest_rect: RECT,
         opts: BltOptions,
+        wait: bool,
     ) -> Result<()> {
-        let src = source.read()?;
-        src.ready()?;
-        let Some(src_rect) = src.clamp_rect(src_rect) else {
-            return Ok(());
-        };
-        let src_format = src.format;
-        let src_palette = if src_format == Format::Indexed {
-            Some(src.palette_entries()?)
-        } else {
-            None
-        };
-        // Snapshot overlapping self-blits before borrowing the destination mutably.
-        if Rc::ptr_eq(&source.data, &self.data) {
+        // Snapshot overlapping self-blits before mutably writing the destination.
+        if Arc::ptr_eq(&source.data, &self.data) {
+            let mut dst = self.data.lock_ready(wait)?;
+            let Some(src_rect) = dst.clamp_rect(src_rect) else {
+                return Ok(());
+            };
+            let src_format = dst.format;
+            let src_palette = if src_format == Format::Indexed {
+                Some(dst.palette_entries()?)
+            } else {
+                None
+            };
             let row_bytes = (src_rect.right - src_rect.left) as usize * src_format.bytes();
             let mut snapshot = zeros(row_bytes * (src_rect.bottom - src_rect.top) as usize)?;
-            let src_pixels = src.pixel_slice();
+            let src_pixels = dst.pixel_slice();
             for (y, row) in snapshot.chunks_exact_mut(row_bytes).enumerate() {
-                let start = (src_rect.top as usize + y) * src.pitch
+                let start = (src_rect.top as usize + y) * dst.pitch
                     + src_rect.left as usize * src_format.bytes();
                 row.copy_from_slice(&src_pixels[start..start + row_bytes]);
             }
-            drop(src);
             let local = RECT {
                 left: 0,
                 top: 0,
                 right: src_rect.right - src_rect.left,
                 bottom: src_rect.bottom - src_rect.top,
             };
-            let mut dst = self.write()?;
             blit(
                 &mut dst,
                 dest_rect,
@@ -1279,8 +1424,16 @@ impl Surface {
             );
             dst.bump_uniqueness();
         } else {
-            let mut dst = self.write()?;
-            dst.ready()?;
+            let (src, mut dst) = lock_pair_ready(&source.data, &self.data, wait)?;
+            let Some(src_rect) = src.clamp_rect(src_rect) else {
+                return Ok(());
+            };
+            let src_format = src.format;
+            let src_palette = if src_format == Format::Indexed {
+                Some(src.palette_entries()?)
+            } else {
+                None
+            };
             blit(
                 &mut dst,
                 dest_rect,
@@ -1301,9 +1454,9 @@ impl Surface {
         rect: RECT,
         color: [u8; 4],
         dst_key: Option<DDCOLORKEY>,
+        wait: bool,
     ) -> Result<()> {
-        let mut dst = self.write()?;
-        dst.ready()?;
+        let mut dst = self.data.lock_ready(wait)?;
         let bytes = dst.format.bytes();
         let pitch = dst.pitch;
         let width = (rect.right - rect.left) as usize;
@@ -1410,14 +1563,15 @@ impl Surface {
             }
         }
 
+        let wait = flags & DDBLT_DONOTWAIT as u32 == 0;
         if let Some(color) = fill_color {
             match clip_rects {
                 Some(rects) => {
                     for sub in rects {
-                        self.blt_colorfill_rect(sub, color, dst_key)?;
+                        self.blt_colorfill_rect(sub, color, dst_key, wait)?;
                     }
                 }
-                None => self.blt_colorfill_rect(rect, color, dst_key)?,
+                None => self.blt_colorfill_rect(rect, color, dst_key, wait)?,
             }
             return self.refresh();
         }
@@ -1481,11 +1635,11 @@ impl Surface {
                             right: s_right,
                             bottom: s_bottom,
                         };
-                        self.copy(source_obj, &sub_src, sub, opts)?;
+                        self.copy(source_obj, &sub_src, sub, opts, wait)?;
                     }
                 }
             }
-            None => self.copy(source_obj, src, rect, opts)?,
+            None => self.copy(source_obj, src, rect, opts, wait)?,
         }
         self.refresh()
     }
@@ -1530,6 +1684,7 @@ impl Surface {
         } else {
             None
         };
+        let wait = flags & DDBLTFAST_DONOTWAIT == 0;
         self.copy(
             source_obj,
             &s,
@@ -1540,6 +1695,7 @@ impl Surface {
                 mirror_lr: false,
                 mirror_ud: false,
             },
+            wait,
         )?;
         self.refresh()
     }
@@ -1572,6 +1728,7 @@ impl Surface {
         if flags & !((DDFLIP_WAIT | DDFLIP_DONOTWAIT | DDFLIP_NOVSYNC) as u32) != 0 {
             return unsupported();
         }
+        let wait = flags & DDFLIP_DONOTWAIT as u32 == 0;
         let chain = self.flip_chain()?;
         if chain.is_empty() {
             return Err(DDERR_NOTFLIPPABLE.into());
@@ -1582,15 +1739,12 @@ impl Surface {
                 .map_err(|_| DDERR_SURFACENOTATTACHED)?;
             if !chain.iter().any(|s| {
                 s.cast_object_ref::<Surface>()
-                    .is_ok_and(|o| Rc::ptr_eq(&o.data, &t_obj.data))
+                    .is_ok_and(|o| Arc::ptr_eq(&o.data, &t_obj.data))
             }) {
                 return Err(DDERR_SURFACENOTATTACHED.into());
             }
             {
-                let mut front = self.write()?;
-                let mut back_data = t_obj.write()?;
-                front.ready()?;
-                back_data.ready()?;
+                let (mut front, mut back_data) = lock_pair_ready(&self.data, &t_obj.data, wait)?;
                 std::mem::swap(&mut front.pixels, &mut back_data.pixels);
                 std::mem::swap(&mut front.pixel_offset, &mut back_data.pixel_offset);
                 std::mem::swap(&mut front.image_len, &mut back_data.image_len);
@@ -1601,35 +1755,31 @@ impl Surface {
             return self.present_now();
         }
 
-        // Verify all surfaces in the chain are unlocked before rotating buffers.
-        self.read()?.ready()?;
+        // Lock the entire flip chain atomically in canonical pointer order before rotating buffers.
+        let mut slot_refs: Vec<&SurfaceSlot> = Vec::with_capacity(chain.len() + 1);
+        slot_refs.push(&self.data);
         for surf in &chain {
-            surf.cast_object_ref::<Surface>()?.read()?.ready()?;
+            slot_refs.push(&surf.cast_object_ref::<Surface>()?.data);
         }
-
-        // Rotate: front <- back[0] <- back[1] <- ... <- back[n-1] <- old front.
-        let mut front = self.write()?;
-        let mut carried_pixels = std::mem::take(&mut front.pixels);
-        let mut carried_offset = front.pixel_offset;
-        let mut carried_len = front.image_len;
-        let mut carried_dc = front.cached_dc.take();
-        drop(front);
-        for surf in chain.iter().rev() {
-            let obj = surf.cast_object_ref::<Surface>()?;
-            let mut data = obj.write()?;
-            std::mem::swap(&mut data.pixels, &mut carried_pixels);
-            std::mem::swap(&mut data.pixel_offset, &mut carried_offset);
-            std::mem::swap(&mut data.image_len, &mut carried_len);
-            std::mem::swap(&mut data.cached_dc, &mut carried_dc);
-            data.bump_uniqueness();
+        {
+            let mut guards = lock_chain_ready(&slot_refs, wait)?;
+            let mut carried_pixels = std::mem::take(&mut guards[0].pixels);
+            let mut carried_offset = guards[0].pixel_offset;
+            let mut carried_len = guards[0].image_len;
+            let mut carried_dc = guards[0].cached_dc.take();
+            for data in guards[1..].iter_mut().rev() {
+                std::mem::swap(&mut data.pixels, &mut carried_pixels);
+                std::mem::swap(&mut data.pixel_offset, &mut carried_offset);
+                std::mem::swap(&mut data.image_len, &mut carried_len);
+                std::mem::swap(&mut data.cached_dc, &mut carried_dc);
+                data.bump_uniqueness();
+            }
+            guards[0].pixels = carried_pixels;
+            guards[0].pixel_offset = carried_offset;
+            guards[0].image_len = carried_len;
+            guards[0].cached_dc = carried_dc;
+            guards[0].bump_uniqueness();
         }
-        let mut front = self.write()?;
-        front.pixels = carried_pixels;
-        front.pixel_offset = carried_offset;
-        front.image_len = carried_len;
-        front.cached_dc = carried_dc;
-        front.bump_uniqueness();
-        drop(front);
         self.present_now()
     }
 
@@ -1641,7 +1791,7 @@ impl Surface {
             if caps_val == 0 {
                 return Err(DDERR_NOTFOUND.into());
             }
-            let attached = self.attached.borrow();
+            let attached = self.attached_lock();
             for s in attached.iter() {
                 let actual = s.cast_object_ref::<Surface>()?.read()?.caps;
                 if actual & caps_val == caps_val {
@@ -1673,15 +1823,18 @@ impl Surface {
         {
             return unsupported();
         }
+        let wait = flags & DDLOCK_DONOTWAIT as u32 == 0;
         let count = self.backbuffer_chain_len();
-        let mut data = self.write()?;
-        data.ready()?;
+        let mut data = self.data.lock_ready(wait)?;
         let r = data.bounds(rect)?;
         let mut desc = data.desc(count);
         let offset = r.top as usize * data.pitch + r.left as usize * data.format.bytes();
         desc.lpSurface = data.surface_ptr().wrapping_add(offset).cast();
         desc.dwFlags |= DDSD_LPSURFACE as u32;
-        data.access = Access::Locked { rect: r };
+        data.access = Access::Locked {
+            rect: r,
+            owner_tid: current_tid(),
+        };
         Ok(desc)
     }
 
@@ -1701,12 +1854,13 @@ impl Surface {
         data.access = Access::Ready;
         data.bump_uniqueness();
         drop(data);
+        self.data.notify_ready();
         self.refresh()
     }
 
     fn unlock_rect_impl(&self, rect: *mut RECT) -> Result<()> {
         let mut data = self.write()?;
-        let Access::Locked { rect: locked } = data.access else {
+        let Access::Locked { rect: locked, .. } = data.access else {
             return Err(DDERR_NOTLOCKED.into());
         };
         if let Some(r) = unsafe { rect.as_ref() } {
@@ -1717,6 +1871,7 @@ impl Surface {
         data.access = Access::Ready;
         data.bump_uniqueness();
         drop(data);
+        self.data.notify_ready();
         self.refresh()
     }
 
@@ -1746,8 +1901,7 @@ impl Surface {
         if flags != 0 {
             return Err(E_INVALIDARG.into());
         }
-        let mut data = self.write()?;
-        data.ready()?;
+        let mut data = self.data.lock_ready(true)?;
         if desc.dwFlags & DDSD_PIXELFORMAT as u32 != 0 {
             data.format = Format::from_dd(&desc.ddpfPixelFormat)?;
         }
@@ -1969,7 +2123,7 @@ impl Surface {
             }
         }
         if flags & DDOVER_HIDE as u32 == 0 && self.read()?.overlay.visible {
-            let raw = self.self_raw.get();
+            let raw = self.self_raw.load(Ordering::Acquire);
             let me = unsafe { IDirectDrawSurface::from_raw_borrowed(&raw) }.ok_or(E_INVALIDARG)?;
             let me_obj = me.cast_object_ref::<Surface>()?;
             dest_obj.copy(
@@ -1982,6 +2136,7 @@ impl Surface {
                     mirror_lr: false,
                     mirror_ud: false,
                 },
+                true,
             )?;
             dest_obj.refresh()?;
         }
@@ -2235,7 +2390,7 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
         callback: LPDDENUMSURFACESCALLBACK,
     ) -> Result<()> {
         let callback = callback.ok_or(E_INVALIDARG)?;
-        let snapshot: Vec<IDirectDrawSurface> = self.attached.borrow().clone();
+        let snapshot: Vec<IDirectDrawSurface> = self.attached_lock().clone();
         for s in snapshot {
             let mut desc = surface_desc(&s)?;
             let owned = ManuallyDrop::new(s);
@@ -2420,11 +2575,14 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
         unsafe {
             out.write(HDC::default());
         }
-        let mut data = self.write()?;
-        if matches!(data.access, Access::Gdi { .. }) {
-            return Err(DDERR_DCALREADYCREATED.into());
+        let tid = current_tid();
+        {
+            let data = self.data.lock();
+            if matches!(data.access, Access::Gdi { owner_tid, .. } if owner_tid == tid) {
+                return Err(DDERR_DCALREADYCREATED.into());
+            }
         }
-        data.ready()?;
+        let mut data = self.data.lock_ready(true)?;
         let entries = if data.format == Format::Indexed {
             Some(data.palette_entries()?)
         } else {
@@ -2456,6 +2614,7 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
         data.access = Access::Gdi {
             handle,
             saved_state,
+            owner_tid: tid,
         };
         Ok(())
     }
@@ -2465,6 +2624,7 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
         let Access::Gdi {
             handle: dc_handle,
             saved_state,
+            ..
         } = data.access
         else {
             return Err(DDERR_NODC.into());
@@ -2494,6 +2654,7 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
         }
         data.access = Access::Ready;
         drop(data);
+        self.data.notify_ready();
         self.refresh()
     }
     fn GetOverlayPosition(&self, x: *mut i32, y: *mut i32) -> Result<()> {
@@ -2858,7 +3019,7 @@ impl IDirectDrawSurface4_Impl for Surface_Impl {
         callback: LPDDENUMSURFACESCALLBACK2,
     ) -> Result<()> {
         let callback = callback.ok_or(E_INVALIDARG)?;
-        let snapshot: Vec<IDirectDrawSurface> = self.attached.borrow().clone();
+        let snapshot: Vec<IDirectDrawSurface> = self.attached_lock().clone();
         for s in snapshot {
             let mut desc = desc_to_desc2(&surface_desc(&s)?);
             let owned = ManuallyDrop::new(s.cast::<IDirectDrawSurface4>()?);
@@ -3062,7 +3223,7 @@ impl IDirectDrawSurface7_Impl for Surface_Impl {
         callback: LPDDENUMSURFACESCALLBACK7,
     ) -> Result<()> {
         let callback = callback.ok_or(E_INVALIDARG)?;
-        let snapshot: Vec<IDirectDrawSurface> = self.attached.borrow().clone();
+        let snapshot: Vec<IDirectDrawSurface> = self.attached_lock().clone();
         for s in snapshot {
             let mut desc = desc_to_desc2(&surface_desc(&s)?);
             let owned = ManuallyDrop::new(s.cast::<IDirectDrawSurface7>()?);
@@ -3332,5 +3493,176 @@ mod tests {
         assert_eq!(surface.surface_ptr(), ptr_before);
         assert_eq!(surface.pixel_offset, offset_before);
         assert!(surface.pixel_offset >= surface.pitch * 64);
+    }
+
+    #[test]
+    fn cross_thread_primary_lock_and_blt_never_fail_with_null_surface() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Barrier;
+
+        let display = crate::draw::DisplayShared::new(1024, 768, 16);
+        let prim_desc = DDSURFACEDESC {
+            dwSize: size_of::<DDSURFACEDESC>() as u32,
+            dwFlags: DDSD_CAPS as u32,
+            ddsCaps: DDSCAPS {
+                dwCaps: DDSCAPS_PRIMARYSURFACE as u32,
+            },
+            ..Default::default()
+        };
+        let back_desc = DDSURFACEDESC {
+            dwSize: size_of::<DDSURFACEDESC>() as u32,
+            dwFlags: (DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT) as u32,
+            dwWidth: 1024,
+            dwHeight: 768,
+            ddsCaps: DDSCAPS {
+                dwCaps: (DDSCAPS_OFFSCREENPLAIN | DDSCAPS_SYSTEMMEMORY) as u32,
+            },
+            ..Default::default()
+        };
+        let primary = create_surface(None, display.clone(), &prim_desc).unwrap();
+        let back = create_surface(None, display.clone(), &back_desc).unwrap();
+
+        // Same-thread Lock while GetDC is held must still fail immediately (no self-deadlock).
+        let mut dc = HDC::default();
+        unsafe { primary.GetDC(&mut dc) }.unwrap();
+        let mut same_thread_desc = DDSURFACEDESC {
+            dwSize: size_of::<DDSURFACEDESC>() as u32,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe {
+                primary.Lock(
+                    std::ptr::null_mut(),
+                    &mut same_thread_desc,
+                    0,
+                    HANDLE::default(),
+                )
+            }
+            .unwrap_err()
+            .code(),
+            DDERR_SURFACEBUSY
+        );
+        unsafe { primary.ReleaseDC(dc) }.unwrap();
+
+        // Cross-thread DONOTWAIT must still return DDERR_SURFACEBUSY immediately when locked.
+        let mut main_lock = DDSURFACEDESC {
+            dwSize: size_of::<DDSURFACEDESC>() as u32,
+            ..Default::default()
+        };
+        unsafe { primary.Lock(std::ptr::null_mut(), &mut main_lock, 0, HANDLE::default()) }
+            .unwrap();
+        let raw_primary_addr = primary.as_raw() as usize;
+        let dnw_code = std::thread::spawn(move || unsafe {
+            let raw = raw_primary_addr as *mut c_void;
+            let s = IDirectDrawSurface::from_raw_borrowed(&raw).unwrap();
+            let mut d = DDSURFACEDESC {
+                dwSize: size_of::<DDSURFACEDESC>() as u32,
+                ..Default::default()
+            };
+            s.Lock(
+                std::ptr::null_mut(),
+                &mut d,
+                DDLOCK_DONOTWAIT as u32,
+                HANDLE::default(),
+            )
+            .unwrap_err()
+            .code()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(dnw_code, DDERR_SURFACEBUSY);
+        unsafe { primary.Unlock(main_lock.lpSurface) }.unwrap();
+
+        // Stress test: simulate RA2's background cursor worker thread calling Primary->Lock()
+        // and reading a 37x28 rect at (82, 353) concurrently with main-thread Blt + Lock + present reads.
+        let done = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(2));
+        let done_worker = Arc::clone(&done);
+        let start_worker = Arc::clone(&start);
+        let worker = std::thread::spawn(move || unsafe {
+            let raw = raw_primary_addr as *mut c_void;
+            let s = IDirectDrawSurface::from_raw_borrowed(&raw).unwrap();
+            start_worker.wait();
+            let mut cursor_buf = [0u16; 37 * 28];
+            let mut locks = 0u32;
+            while !done_worker.load(Ordering::Relaxed) || locks < 2000 {
+                let mut desc = DDSURFACEDESC {
+                    dwSize: size_of::<DDSURFACEDESC>() as u32,
+                    ..Default::default()
+                };
+                s.Lock(
+                    std::ptr::null_mut(),
+                    &mut desc,
+                    DDLOCK_WAIT as u32,
+                    HANDLE::default(),
+                )
+                .expect("cross-thread DDLOCK_WAIT must never fail with DDERR_SURFACEBUSY");
+                assert!(!desc.lpSurface.is_null());
+                let pitch = desc.Anonymous1.lPitch as usize;
+                let base = desc.lpSurface.cast::<u8>();
+                for row in 0..28usize {
+                    let src_row = base.add((353 + row) * pitch + 82 * 2).cast::<u16>();
+                    std::ptr::copy_nonoverlapping(
+                        src_row,
+                        cursor_buf.as_mut_ptr().add(row * 37),
+                        37,
+                    );
+                }
+                s.Unlock(desc.lpSurface).unwrap();
+                locks += 1;
+                if locks >= 4000 {
+                    break;
+                }
+            }
+            locks
+        });
+
+        let primary_slot = display.lock().primary.upgrade().unwrap();
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 256,
+            bottom: 256,
+        };
+        start.wait();
+        for i in 0..1000u32 {
+            unsafe {
+                primary
+                    .Blt(
+                        &mut rect,
+                        &back,
+                        &mut rect,
+                        DDBLT_WAIT as u32,
+                        std::ptr::null_mut(),
+                    )
+                    .unwrap();
+            }
+            if i % 4 == 0 {
+                let mut desc = DDSURFACEDESC {
+                    dwSize: size_of::<DDSURFACEDESC>() as u32,
+                    ..Default::default()
+                };
+                unsafe {
+                    primary
+                        .Lock(
+                            std::ptr::null_mut(),
+                            &mut desc,
+                            DDLOCK_WAIT as u32,
+                            HANDLE::default(),
+                        )
+                        .unwrap();
+                    *desc.lpSurface.cast::<u16>() = i as u16;
+                    primary.Unlock(desc.lpSurface).unwrap();
+                }
+            }
+            // Simulate present_surface brief pixel read under SurfaceSlot lock.
+            let guard = primary_slot.lock();
+            if !guard.locked() {
+                let _ = guard.pixel_slice()[0];
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        let worker_locks = worker.join().unwrap();
+        assert!(worker_locks >= 2000);
     }
 }

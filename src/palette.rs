@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use windows::core::{implement, IUnknownImpl, Interface, Ref, Result, HRESULT};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_POINTER};
 use windows::Win32::Graphics::DirectDraw::{
@@ -7,19 +6,19 @@ use windows::Win32::Graphics::DirectDraw::{
 };
 use windows::Win32::Graphics::Gdi::PALETTEENTRY;
 
-use crate::draw::Display;
+use crate::draw::DisplayShared;
 
 #[implement(IDirectDrawPalette, Agile = false)]
 struct Palette {
     flags: u32,
-    entries: RefCell<[PALETTEENTRY; 256]>,
-    display: Weak<RefCell<Display>>,
+    entries: Mutex<[PALETTEENTRY; 256]>,
+    display: Weak<DisplayShared>,
 }
 
 pub fn create_palette(
     flags: u32,
     entries: *const PALETTEENTRY,
-    display: Rc<RefCell<Display>>,
+    display: Arc<DisplayShared>,
 ) -> Result<IDirectDrawPalette> {
     if flags & DDPCAPS_8BIT as u32 == 0 || flags & !(DDPCAPS_8BIT | DDPCAPS_ALLOW256) as u32 != 0 {
         return Err(E_NOTIMPL.into());
@@ -32,15 +31,15 @@ pub fn create_palette(
     preserve_endpoints(flags, &mut colors);
     Ok(Palette {
         flags,
-        entries: RefCell::new(colors),
-        display: Rc::downgrade(&display),
+        entries: Mutex::new(colors),
+        display: Arc::downgrade(&display),
     }
     .into())
 }
 
-pub fn check_owner(palette: &IDirectDrawPalette, display: &Rc<RefCell<Display>>) -> Result<()> {
+pub fn check_owner(palette: &IDirectDrawPalette, display: &Arc<DisplayShared>) -> Result<()> {
     let object = palette.cast_object_ref::<Palette>()?;
-    if object.display.as_ptr() == Rc::as_ptr(display) {
+    if object.display.as_ptr() == Arc::as_ptr(display) {
         Ok(())
     } else {
         Err(E_INVALIDARG.into())
@@ -84,7 +83,7 @@ impl IDirectDrawPalette_Impl for Palette_Impl {
         if out.is_null() {
             return Err(E_POINTER.into());
         }
-        let colors = self.entries.borrow();
+        let colors = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::ptr::copy_nonoverlapping(colors[span].as_ptr(), out, count as usize) };
         Ok(())
     }
@@ -98,23 +97,14 @@ impl IDirectDrawPalette_Impl for Palette_Impl {
             return Err(E_POINTER.into());
         }
         {
-            let mut colors = self.entries.borrow_mut();
+            let mut colors = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             unsafe {
                 std::ptr::copy_nonoverlapping(src, colors[span].as_mut_ptr(), count as usize)
             };
             preserve_endpoints(self.flags, &mut colors);
         }
         if let Some(display) = self.display.upgrade() {
-            let mut display = display.try_borrow_mut().map_err(|_| E_INVALIDARG)?;
-            if let Some(primary) = display.primary.upgrade() {
-                let attached = primary
-                    .try_borrow()
-                    .map_err(|_| E_INVALIDARG)?
-                    .uses_palette(&self.as_interface::<IDirectDrawPalette>());
-                if attached {
-                    display.refresh()?;
-                }
-            }
+            display.refresh_if_primary_uses_palette(&self.as_interface::<IDirectDrawPalette>())?;
         }
         Ok(())
     }

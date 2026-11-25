@@ -9,14 +9,15 @@ use windows::Win32::Foundation::HWND;
 
 use crate::compat;
 use crate::config::{self, RendererBackend};
-use crate::surface::PixelFormat;
-use crate::window::{compute_viewport, OverlayWindow};
+use crate::surface::{PixelFormat, SurfaceSlot};
+use crate::window::{self, compute_viewport, OverlayWindow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentOutcome {
     Presented,
     Hidden,
     Timeout,
+    Busy,
 }
 
 #[derive(Debug)]
@@ -32,15 +33,6 @@ impl std::fmt::Display for PresentError {
             Self::Recoverable(m) | Self::DeviceLost(m) | Self::Fatal(m) => f.write_str(m),
         }
     }
-}
-
-pub struct FrameView<'a> {
-    pub width: u32,
-    pub height: u32,
-    pub pitch: u32,
-    pub format: PixelFormat,
-    pub pixels: &'a [u8],
-    pub lut: &'a [[u8; 4]; 256],
 }
 
 fn raw_texture_format(format: PixelFormat) -> wgpu::TextureFormat {
@@ -285,27 +277,85 @@ impl Renderer {
         let _ = self.overlay.sync_to_owner();
     }
 
-    pub fn present(&mut self, view_in: FrameView<'_>) -> Result<PresentOutcome, PresentError> {
+    fn upload_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        format: PixelFormat,
+        pixels: &[u8],
+        lut: &[[u8; 4]; 256],
+    ) {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let raw_format = raw_texture_format(format);
+        if self
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.raw_texture.size() != size || frame.raw_format != raw_format)
+        {
+            self.frame = None;
+        }
+        let frame = self.frame.get_or_insert_with(|| {
+            UploadedFrame::new(
+                &self.device,
+                &self.pipeline,
+                self.config.format,
+                size,
+                raw_format,
+            )
+        });
+        if frame.last_format != Some(format) {
+            self.queue
+                .write_buffer(&frame.params_buffer, 0, &params_bytes(format));
+            frame.last_format = Some(format);
+        }
+        if frame.last_lut.as_ref() != Some(lut) {
+            let lut_bytes = lut.as_flattened();
+            self.queue.write_texture(
+                frame.lut_texture.as_image_copy(),
+                lut_bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256 * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: 256,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            frame.last_lut = Some(*lut);
+        }
+        self.queue.write_texture(
+            frame.raw_texture.as_image_copy(),
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pitch),
+                rows_per_image: None,
+            },
+            size,
+        );
+    }
+
+    /// Presents the primary surface while holding its mutex ONLY for the brief GPU texture
+    /// upload (`queue.write_texture`), never across swapchain acquire or `output.present()`.
+    /// `on_uploaded` is invoked before dropping the surface lock so callers can clear their
+    /// dirty bit without racing subsequent worker-thread writes.
+    pub fn present_surface(
+        &mut self,
+        primary: &SurfaceSlot,
+        on_uploaded: impl FnOnce(),
+    ) -> Result<PresentOutcome, PresentError> {
         if self.device_lost.load(Ordering::Relaxed) {
             return Err(PresentError::DeviceLost("GPU device lost".into()));
         }
         let limit = self.device.limits().max_texture_dimension_2d;
-        let (width, height) = (view_in.width, view_in.height);
-        if width == 0 || height == 0 || width > limit || height > limit {
-            return Err(PresentError::Fatal(format!(
-                "unsupported frame dimensions {width}x{height}"
-            )));
-        }
-        let min_row = width
-            .checked_mul(view_in.format.bytes() as u32)
-            .ok_or_else(|| PresentError::Fatal("frame row size overflow".into()))?;
-        if view_in.pitch < min_row
-            || (view_in.pitch as usize).checked_mul(height as usize) != Some(view_in.pixels.len())
-        {
-            return Err(PresentError::Fatal(
-                "incorrect raw frame buffer length".into(),
-            ));
-        }
         let Some((target_w, target_h)) = self
             .overlay
             .sync_to_owner()
@@ -318,6 +368,43 @@ impl Renderer {
                 "window exceeds the adapter's texture limit of {limit}"
             )));
         }
+
+        // Hold the primary surface mutex ONLY while validating, building the 1 KB LUT, and
+        // staging pixels into wgpu's upload buffer (~20-30 us) so concurrent worker threads
+        // calling Primary->Lock() are never stalled across swapchain acquire/present.
+        let (width, height) = {
+            let guard = primary.lock();
+            if guard.locked() {
+                return Ok(PresentOutcome::Busy);
+            }
+            let (width, height) = (guard.width, guard.height);
+            if width == 0 || height == 0 || width > limit || height > limit {
+                return Err(PresentError::Fatal(format!(
+                    "unsupported frame dimensions {width}x{height}"
+                )));
+            }
+            let format = guard.pixel_format();
+            let pitch = guard.pitch();
+            let min_row = width
+                .checked_mul(format.bytes() as u32)
+                .ok_or_else(|| PresentError::Fatal("frame row size overflow".into()))?;
+            let pixels = guard.pixel_slice();
+            if pitch < min_row
+                || (pitch as usize).checked_mul(height as usize) != Some(pixels.len())
+            {
+                return Err(PresentError::Fatal(
+                    "incorrect raw frame buffer length".into(),
+                ));
+            }
+            let lut = guard
+                .build_lut()
+                .map_err(|err| PresentError::Fatal(format!("building frame LUT: {err}")))?;
+            window::sync_presented_size(width, height);
+            self.upload_frame(width, height, pitch, format, pixels, &lut);
+            on_uploaded();
+            (width, height)
+        };
+
         if !self.configured || (target_w, target_h) != (self.config.width, self.config.height) {
             self.config.width = target_w;
             self.config.height = target_h;
@@ -368,61 +455,7 @@ impl Renderer {
             }
         };
         self.configured = !output.suboptimal;
-        let size = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-        let raw_format = raw_texture_format(view_in.format);
-        if self
-            .frame
-            .as_ref()
-            .is_some_and(|frame| frame.raw_texture.size() != size || frame.raw_format != raw_format)
-        {
-            self.frame = None;
-        }
-        let frame = self.frame.get_or_insert_with(|| {
-            UploadedFrame::new(
-                &self.device,
-                &self.pipeline,
-                self.config.format,
-                size,
-                raw_format,
-            )
-        });
-        if frame.last_format != Some(view_in.format) {
-            self.queue
-                .write_buffer(&frame.params_buffer, 0, &params_bytes(view_in.format));
-            frame.last_format = Some(view_in.format);
-        }
-        if frame.last_lut.as_ref() != Some(view_in.lut) {
-            let lut_bytes = view_in.lut.as_flattened();
-            self.queue.write_texture(
-                frame.lut_texture.as_image_copy(),
-                lut_bytes,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(256 * 4),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: 256,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
-            frame.last_lut = Some(*view_in.lut);
-        }
-        self.queue.write_texture(
-            frame.raw_texture.as_image_copy(),
-            view_in.pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(view_in.pitch),
-                rows_per_image: None,
-            },
-            size,
-        );
+        let frame = self.frame.as_ref().expect("frame uploaded above");
         let view = output.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {

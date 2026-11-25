@@ -1,4 +1,4 @@
-//! In-process, single-threaded DirectDraw implementation for Win32 games.
+//! In-process, thread-safe DirectDraw implementation for Win32 games.
 #![allow(non_snake_case)]
 
 #[cfg(not(all(windows, target_arch = "x86")))]

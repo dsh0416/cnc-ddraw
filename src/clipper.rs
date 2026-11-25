@@ -1,9 +1,10 @@
 //! DirectDraw clipper implementation backed by Win32 GDI regions.
 #![allow(non_snake_case)]
 
-use std::cell::{Cell, RefCell};
+use std::ffi::c_void;
 use std::mem::size_of;
-use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::core::{implement, Interface, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_POINTER, HWND, RECT};
@@ -16,7 +17,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsWindow};
 
-use crate::draw::Display;
+use crate::draw::DisplayShared;
 
 const fn dd_hresult(code: u32) -> HRESULT {
     HRESULT((0x8876_0000 | code) as i32)
@@ -29,6 +30,9 @@ const DDERR_REGIONTOOSMALL: HRESULT = dd_hresult(566);
 const DDERR_CLIPPERISUSINGHWND: HRESULT = dd_hresult(567);
 
 struct OwnedRgn(HRGN);
+
+// Win32 GDI HRGN handles are process-global and synchronized via `Clipper::region` Mutex.
+unsafe impl Send for OwnedRgn {}
 
 impl OwnedRgn {
     fn from_rect(rect: &RECT) -> Option<Self> {
@@ -57,41 +61,45 @@ impl Drop for OwnedRgn {
 
 #[implement(IDirectDrawClipper, Agile = false)]
 pub struct Clipper {
-    hwnd: Cell<HWND>,
-    region: RefCell<Option<OwnedRgn>>,
-    display: Option<Weak<RefCell<Display>>>,
-    initialized: Cell<bool>,
+    hwnd: AtomicIsize,
+    region: Mutex<Option<OwnedRgn>>,
+    display: Option<Weak<DisplayShared>>,
+    initialized: AtomicBool,
 }
 
 pub fn create_clipper(
     flags: u32,
-    display: Option<Rc<RefCell<Display>>>,
+    display: Option<Arc<DisplayShared>>,
 ) -> Result<IDirectDrawClipper> {
     if flags != 0 {
         return Err(E_INVALIDARG.into());
     }
     Ok(Clipper {
-        hwnd: Cell::new(HWND::default()),
-        region: RefCell::new(None),
-        display: display.map(|d| Rc::downgrade(&d)),
-        initialized: Cell::new(true),
+        hwnd: AtomicIsize::new(0),
+        region: Mutex::new(None),
+        display: display.map(|d| Arc::downgrade(&d)),
+        initialized: AtomicBool::new(true),
     }
     .into())
 }
 
 pub fn create_uninitialized_clipper() -> IDirectDrawClipper {
     Clipper {
-        hwnd: Cell::new(HWND::default()),
-        region: RefCell::new(None),
+        hwnd: AtomicIsize::new(0),
+        region: Mutex::new(None),
         display: None,
-        initialized: Cell::new(false),
+        initialized: AtomicBool::new(false),
     }
     .into()
 }
 
 impl Clipper {
+    fn current_hwnd(&self) -> HWND {
+        HWND(self.hwnd.load(Ordering::Acquire) as *mut c_void)
+    }
+
     fn hwnd_region(&self) -> Option<OwnedRgn> {
-        let hwnd = self.hwnd.get();
+        let hwnd = self.current_hwnd();
         if hwnd.is_invalid() {
             return None;
         }
@@ -100,16 +108,15 @@ impl Clipper {
             return OwnedRgn::from_rect(&rect);
         }
         if let Some(display) = self.display.as_ref().and_then(Weak::upgrade) {
-            if let Ok(d) = display.try_borrow() {
-                if d.width > 0 && d.height > 0 {
-                    let fallback = RECT {
-                        left: 0,
-                        top: 0,
-                        right: d.width as i32,
-                        bottom: d.height as i32,
-                    };
-                    return OwnedRgn::from_rect(&fallback);
-                }
+            let (width, height, _) = display.mode();
+            if width > 0 && height > 0 {
+                let fallback = RECT {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                };
+                return OwnedRgn::from_rect(&fallback);
             }
         }
         None
@@ -118,10 +125,10 @@ impl Clipper {
     /// Returns intersected clip rectangles when a manual clip list is attached.
     /// Returns `Ok(None)` when no manual clip list is active (including HWND-only clippers).
     pub fn clip_rects(&self, bounds: RECT) -> Result<Option<Vec<RECT>>> {
-        if !self.hwnd.get().is_invalid() {
+        if !self.current_hwnd().is_invalid() {
             return Ok(None);
         }
-        let region_ref = self.region.borrow();
+        let region_ref = self.region.lock().unwrap_or_else(|e| e.into_inner());
         let Some(region) = region_ref.as_ref() else {
             return Ok(None);
         };
@@ -181,7 +188,7 @@ pub fn clip_rects(clipper: &IDirectDrawClipper, bounds: RECT) -> Result<Option<V
 impl IDirectDrawClipper_Impl for Clipper_Impl {
     fn GetClipList(&self, rect: *mut RECT, clip_list: *mut RGNDATA, size: *mut u32) -> Result<()> {
         let size = unsafe { size.as_mut() }.ok_or(E_INVALIDARG)?;
-        let manual = self.region.borrow();
+        let manual = self.region.lock().unwrap_or_else(|e| e.into_inner());
         let hwnd_rgn = if manual.is_none() {
             self.hwnd_region()
         } else {
@@ -232,18 +239,18 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
 
     fn GetHWnd(&self, out: *mut HWND) -> Result<()> {
         let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
-        *out = self.hwnd.get();
+        *out = self.current_hwnd();
         Ok(())
     }
 
     fn Initialize(&self, _: Ref<IDirectDraw>, flags: u32) -> Result<()> {
-        if self.initialized.get() {
+        if self.initialized.load(Ordering::Acquire) {
             return Err(DDERR_ALREADYINITIALIZED.into());
         }
         if flags != 0 {
             return Err(E_INVALIDARG.into());
         }
-        self.initialized.set(true);
+        self.initialized.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -257,11 +264,11 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
         if flags != 0 {
             return Err(E_INVALIDARG.into());
         }
-        if !self.hwnd.get().is_invalid() {
+        if !self.current_hwnd().is_invalid() {
             return Err(DDERR_CLIPPERISUSINGHWND.into());
         }
         if clip_list.is_null() {
-            *self.region.borrow_mut() = None;
+            *self.region.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return Ok(());
         }
         let header = unsafe { &(*clip_list).rdh };
@@ -291,7 +298,7 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
                 return Err(DDERR_INVALIDCLIPLIST.into());
             }
         }
-        *self.region.borrow_mut() = Some(combined);
+        *self.region.lock().unwrap_or_else(|e| e.into_inner()) = Some(combined);
         Ok(())
     }
 
@@ -302,9 +309,9 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
         if !hwnd.is_invalid() && !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Err(E_INVALIDARG.into());
         }
-        self.hwnd.set(hwnd);
+        self.hwnd.store(hwnd.0 as isize, Ordering::Release);
         if !hwnd.is_invalid() {
-            *self.region.borrow_mut() = None;
+            *self.region.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         Ok(())
     }

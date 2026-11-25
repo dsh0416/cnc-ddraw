@@ -1,9 +1,8 @@
-use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::mem::{size_of, ManuallyDrop};
 use std::ptr;
-use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use windows::core::{
@@ -23,8 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
 use crate::{
     clipper, compat, config, palette,
-    renderer::{FrameView, PresentError, PresentOutcome, Renderer},
-    surface,
+    renderer::{PresentError, PresentOutcome, Renderer},
+    surface::{self, SurfaceSlot},
     window::{self, HostWindow, PresentationMode},
 };
 
@@ -40,8 +39,13 @@ const DDERR_VERTICALBLANKINPROGRESS: HRESULT = HRESULT(0x8876_0219_u32 as i32);
 static FULLSCREEN_COUNT: AtomicUsize = AtomicUsize::new(0);
 const FLUSH_MAX_DEFER: Duration = Duration::from_millis(16);
 
-thread_local! {
-    static ACTIVE_DISPLAY: RefCell<Weak<RefCell<Display>>> = const { RefCell::new(Weak::new()) };
+static ACTIVE_DISPLAY: Mutex<Weak<DisplayShared>> = Mutex::new(Weak::new());
+
+fn active_display() -> Option<Arc<DisplayShared>> {
+    ACTIVE_DISPLAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .upgrade()
 }
 
 pub fn is_fullscreen_active() -> bool {
@@ -49,17 +53,16 @@ pub fn is_fullscreen_active() -> bool {
 }
 
 pub fn flush_pending_present(from_timer: bool) {
-    let display = ACTIVE_DISPLAY.with(|slot| slot.borrow().upgrade());
-    let Some(display) = display else {
+    let Some(display) = active_display() else {
         return;
     };
     let min_ms = config::get().min_frame_interval_ms();
-    let Ok(mut d) = display.try_borrow_mut() else {
+    let Some(mut d) = display.try_lock() else {
         window::arm_flush_timer(min_ms as u32);
         return;
     };
-    d.flush_scheduled = false;
-    if !d.dirty {
+    display.flush_scheduled.store(false, Ordering::Release);
+    if !display.dirty.load(Ordering::Acquire) {
         return;
     }
     if !from_timer
@@ -69,15 +72,14 @@ pub fn flush_pending_present(from_timer: bool) {
         window::arm_flush_timer(min_ms as u32);
         return;
     }
-    let _ = d.present_now();
+    let _ = d.present_now(&display);
 }
 
 pub fn toggle_fullscreen_hotkey() {
-    let display = ACTIVE_DISPLAY.with(|slot| slot.borrow().upgrade());
-    let Some(display) = display else {
+    let Some(display) = active_display() else {
         return;
     };
-    let Ok(mut d) = display.try_borrow_mut() else {
+    let Some(mut d) = display.try_lock() else {
         return;
     };
     let (lw, lh) = (d.width, d.height);
@@ -94,24 +96,135 @@ pub fn toggle_fullscreen_hotkey() {
             if let Some(renderer) = d.renderer.as_mut() {
                 renderer.sync_overlay();
             }
-            let _ = d.present_now();
+            let _ = d.present_now(&display);
         }
     }
 }
 
 pub fn on_host_window_changed() {
-    let display = ACTIVE_DISPLAY.with(|slot| slot.borrow().upgrade());
-    let Some(display) = display else {
+    let Some(display) = active_display() else {
         return;
     };
-    let Ok(mut d) = display.try_borrow_mut() else {
+    let Some(mut d) = display.try_lock() else {
         return;
     };
     if let Some(renderer) = d.renderer.as_mut() {
         renderer.sync_overlay();
     }
     if d.primary.upgrade().is_some() {
-        let _ = d.refresh();
+        let _ = d.refresh(&display);
+    }
+}
+
+pub struct DisplayShared {
+    inner: Mutex<Display>,
+    dirty: AtomicBool,
+    flush_scheduled: AtomicBool,
+    width: AtomicU32,
+    height: AtomicU32,
+    bpp: AtomicU32,
+}
+
+// All mutable Display state is guarded by `inner`, and `Renderer`/`HostWindow` are only driven
+// on the bound UI thread (or when unbound in tests).
+unsafe impl Send for DisplayShared {}
+unsafe impl Sync for DisplayShared {}
+
+impl DisplayShared {
+    pub fn new(width: u32, height: u32, bpp: u32) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Display {
+                width,
+                height,
+                bpp,
+                bound_hwnd: HWND::default(),
+                renderer: None,
+                host: None,
+                primary: Weak::new(),
+                surfaces: Vec::new(),
+                last_present: None,
+                consecutive_present_failures: 0,
+            }),
+            dirty: AtomicBool::new(false),
+            flush_scheduled: AtomicBool::new(false),
+            width: AtomicU32::new(width),
+            height: AtomicU32::new(height),
+            bpp: AtomicU32::new(bpp),
+        })
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, Display> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, Display>> {
+        self.inner.try_lock().ok()
+    }
+
+    pub fn mode(&self) -> (u32, u32, u32) {
+        (
+            self.width.load(Ordering::Relaxed),
+            self.height.load(Ordering::Relaxed),
+            self.bpp.load(Ordering::Relaxed),
+        )
+    }
+
+    fn store_mode(&self, width: u32, height: u32, bpp: u32) {
+        self.width.store(width, Ordering::Relaxed);
+        self.height.store(height, Ordering::Relaxed);
+        self.bpp.store(bpp, Ordering::Relaxed);
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height.load(Ordering::Relaxed).max(1)
+    }
+
+    pub fn register_surface(&self, raw: *mut c_void, data: Weak<SurfaceSlot>) {
+        self.lock().register_surface(raw, data);
+    }
+
+    pub fn unregister_surface(&self, raw: *mut c_void) {
+        self.lock().unregister_surface(raw);
+    }
+
+    fn mark_dirty_and_schedule_flush(&self) {
+        self.dirty.store(true, Ordering::Release);
+        if !self.flush_scheduled.swap(true, Ordering::AcqRel) && !window::schedule_flush() {
+            self.flush_scheduled.store(false, Ordering::Release);
+        }
+    }
+
+    /// Requests a coalesced presentation. Safe to call from any thread: off-UI worker threads
+    /// never block on `Display` or touch `Renderer`/`OverlayWindow`, instead posting `WM_APP_FLUSH`.
+    pub fn request_refresh(&self) -> Result<()> {
+        if !window::is_ui_thread_or_unbound() {
+            self.mark_dirty_and_schedule_flush();
+            return Ok(());
+        }
+        let mut d = self.lock();
+        d.refresh(self)
+    }
+
+    /// Requests an immediate presentation on the UI thread, or schedules one when called off-UI.
+    pub fn request_present_now(&self) -> Result<()> {
+        if !window::is_ui_thread_or_unbound() {
+            self.mark_dirty_and_schedule_flush();
+            return Ok(());
+        }
+        let mut d = self.lock();
+        d.present_now(self)
+    }
+
+    pub fn refresh_if_primary_uses_palette(&self, palette: &IDirectDrawPalette) -> Result<()> {
+        let primary = self.lock().primary.upgrade();
+        let Some(primary) = primary else {
+            return Ok(());
+        };
+        let attached = primary.lock().uses_palette(palette);
+        if attached {
+            self.request_refresh()?;
+        }
+        Ok(())
     }
 }
 
@@ -122,20 +235,14 @@ pub struct Display {
     bound_hwnd: HWND,
     renderer: Option<Renderer>,
     host: Option<HostWindow>,
-    pub primary: Weak<RefCell<surface::SurfaceData>>,
-    surfaces: Vec<(*mut c_void, Weak<RefCell<surface::SurfaceData>>)>,
-    dirty: bool,
-    flush_scheduled: bool,
+    pub primary: Weak<SurfaceSlot>,
+    surfaces: Vec<(*mut c_void, Weak<SurfaceSlot>)>,
     last_present: Option<Instant>,
     consecutive_present_failures: u32,
 }
 
 impl Display {
-    pub fn register_surface(
-        &mut self,
-        raw: *mut c_void,
-        data: Weak<RefCell<surface::SurfaceData>>,
-    ) {
+    pub fn register_surface(&mut self, raw: *mut c_void, data: Weak<SurfaceSlot>) {
         self.surfaces.retain(|(_, w)| w.upgrade().is_some());
         self.surfaces.push((raw, data));
     }
@@ -148,7 +255,7 @@ impl Display {
         self.surfaces
             .iter()
             .filter_map(|(_, w)| w.upgrade())
-            .filter_map(|d| d.try_borrow().ok().map(|s| s.byte_len()))
+            .map(|d| d.lock().byte_len())
             .sum()
     }
 
@@ -167,7 +274,7 @@ impl Display {
             let Some(data) = weak.upgrade() else {
                 continue;
             };
-            if data.try_borrow().is_ok_and(|s| s.is_primary()) {
+            if data.lock().is_primary() {
                 return unsafe { IDirectDrawSurface::from_raw_borrowed(raw) }.cloned();
             }
         }
@@ -182,7 +289,7 @@ impl Display {
             let Some(data) = weak.upgrade() else {
                 continue;
             };
-            let matches = data.try_borrow().is_ok_and(|s| s.has_dc(hdc));
+            let matches = data.lock().has_dc(hdc);
             if matches {
                 return unsafe { IDirectDrawSurface::from_raw_borrowed(raw) }.cloned();
             }
@@ -202,17 +309,17 @@ impl Display {
         prev
     }
 
-    pub fn present_now(&mut self) -> Result<()> {
+    pub fn present_now(&mut self, shared: &DisplayShared) -> Result<()> {
         let Some(primary) = self.primary.upgrade() else {
-            self.dirty = false;
-            self.flush_scheduled = false;
+            shared.dirty.store(false, Ordering::Release);
+            shared.flush_scheduled.store(false, Ordering::Release);
             return Ok(());
         };
         if self.renderer.is_none() {
             if self.bound_hwnd.is_invalid() || !unsafe { IsWindow(Some(self.bound_hwnd)) }.as_bool()
             {
-                self.dirty = false;
-                self.flush_scheduled = false;
+                shared.dirty.store(false, Ordering::Release);
+                shared.flush_scheduled.store(false, Ordering::Release);
                 return Ok(());
             }
             match Renderer::new(self.bound_hwnd.0 as isize) {
@@ -223,45 +330,41 @@ impl Display {
                 }
                 Err(err) => {
                     compat::log_msg(&format!("renderer recreate deferred: {err}"));
-                    self.dirty = true;
+                    shared.dirty.store(true, Ordering::Release);
                     window::arm_flush_timer(50);
                     return Ok(());
                 }
             }
         }
-        let primary = primary.try_borrow().map_err(|_| SURFACE_BUSY)?;
-        if primary.locked() {
-            return Ok(());
-        }
-        let lut = primary.build_lut()?;
-        let (width, height) = (primary.width, primary.height);
-        window::sync_presented_size(width, height);
 
         let result = self
             .renderer
             .as_mut()
             .expect("renderer checked above")
-            .present(FrameView {
-                width,
-                height,
-                pitch: primary.pitch(),
-                format: primary.pixel_format(),
-                pixels: primary.pixel_slice(),
-                lut: &lut,
+            .present_surface(&primary, || {
+                // Clear dirty while still holding the primary surface mutex so any worker-thread
+                // write that happens after upload sets dirty=true without being clobbered.
+                shared.dirty.store(false, Ordering::Release);
             });
-        drop(primary);
         match result {
-            Ok(PresentOutcome::Presented | PresentOutcome::Hidden) => {
-                self.dirty = false;
-                self.flush_scheduled = false;
+            Ok(PresentOutcome::Presented) => {
+                shared.flush_scheduled.store(false, Ordering::Release);
                 self.consecutive_present_failures = 0;
                 self.last_present = Some(Instant::now());
                 window::disarm_flush_timer();
                 Ok(())
             }
-            Ok(PresentOutcome::Timeout) => {
-                self.dirty = true;
-                self.flush_scheduled = false;
+            Ok(PresentOutcome::Hidden) => {
+                shared.dirty.store(false, Ordering::Release);
+                shared.flush_scheduled.store(false, Ordering::Release);
+                self.consecutive_present_failures = 0;
+                self.last_present = Some(Instant::now());
+                window::disarm_flush_timer();
+                Ok(())
+            }
+            Ok(PresentOutcome::Timeout | PresentOutcome::Busy) => {
+                shared.dirty.store(true, Ordering::Release);
+                shared.flush_scheduled.store(false, Ordering::Release);
                 window::arm_flush_timer(16);
                 Ok(())
             }
@@ -276,16 +379,16 @@ impl Display {
                     // Drop and recreate the swapchain/device on the next tick.
                     self.renderer = None;
                 }
-                self.dirty = true;
-                self.flush_scheduled = false;
+                shared.dirty.store(true, Ordering::Release);
+                shared.flush_scheduled.store(false, Ordering::Release);
                 window::arm_flush_timer(16);
                 Ok(())
             }
             Err(PresentError::DeviceLost(msg)) => {
                 compat::log_msg(&format!("device lost during present, rebuilding: {msg}"));
                 self.renderer = None;
-                self.dirty = true;
-                self.flush_scheduled = false;
+                shared.dirty.store(true, Ordering::Release);
+                shared.flush_scheduled.store(false, Ordering::Release);
                 window::arm_flush_timer(50);
                 Ok(())
             }
@@ -293,76 +396,80 @@ impl Display {
         }
     }
 
-    pub fn refresh(&mut self) -> Result<()> {
+    pub fn refresh(&mut self, shared: &DisplayShared) -> Result<()> {
         if (self.renderer.is_none() && self.bound_hwnd.is_invalid())
             || self.primary.upgrade().is_none()
         {
             return Ok(());
         }
-        self.dirty = true;
+        shared.dirty.store(true, Ordering::Release);
         let force_now = self.last_present.is_none()
             || self
                 .last_present
                 .is_some_and(|t| t.elapsed() >= FLUSH_MAX_DEFER)
             || !window::can_schedule_flush();
         if force_now {
-            return self.present_now();
+            return self.present_now(shared);
         }
-        if !self.flush_scheduled {
-            if window::schedule_flush() {
-                self.flush_scheduled = true;
-            } else {
-                return self.present_now();
-            }
+        if !shared.flush_scheduled.swap(true, Ordering::AcqRel) && !window::schedule_flush() {
+            shared.flush_scheduled.store(false, Ordering::Release);
+            return self.present_now(shared);
         }
         Ok(())
     }
 }
 
+struct WindowTransitionGuard<'a>(&'a AtomicBool);
+
+impl<'a> WindowTransitionGuard<'a> {
+    fn acquire(flag: &'a AtomicBool) -> Result<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self(flag))
+            .map_err(|_| Error::from(SURFACE_BUSY))
+    }
+}
+
+impl Drop for WindowTransitionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 #[implement(IDirectDraw, IDirectDraw2, IDirectDraw4, IDirectDraw7, Agile = false)]
 struct Draw {
-    display: Rc<RefCell<Display>>,
-    hwnd: Cell<HWND>,
-    bind_id: Cell<usize>,
-    exclusive: Cell<bool>,
-    manage_window: Cell<bool>,
-    changing_window: RefCell<()>,
+    display: Arc<DisplayShared>,
+    hwnd: AtomicIsize,
+    bind_id: AtomicUsize,
+    exclusive: AtomicBool,
+    manage_window: AtomicBool,
+    changing_window: AtomicBool,
     vblank_epoch: Instant,
-    cached_hz: Cell<u32>,
-    initialized: Cell<bool>,
+    cached_hz: AtomicU32,
+    initialized: AtomicBool,
 }
 
 impl Draw {
     fn new_with_init(initialized: bool) -> Self {
         let (width, height, bpp) = DEFAULT_MODE;
         Self {
-            display: Rc::new(RefCell::new(Display {
-                width,
-                height,
-                bpp,
-                bound_hwnd: HWND::default(),
-                renderer: None,
-                host: None,
-                primary: Weak::new(),
-                surfaces: Vec::new(),
-                dirty: false,
-                flush_scheduled: false,
-                last_present: None,
-                consecutive_present_failures: 0,
-            })),
-            hwnd: Cell::new(HWND::default()),
-            bind_id: Cell::new(0),
-            exclusive: Cell::new(false),
-            manage_window: Cell::new(false),
-            changing_window: RefCell::new(()),
+            display: DisplayShared::new(width, height, bpp),
+            hwnd: AtomicIsize::new(0),
+            bind_id: AtomicUsize::new(0),
+            exclusive: AtomicBool::new(false),
+            manage_window: AtomicBool::new(false),
+            changing_window: AtomicBool::new(false),
             vblank_epoch: Instant::now(),
-            cached_hz: Cell::new(0),
-            initialized: Cell::new(initialized),
+            cached_hz: AtomicU32::new(0),
+            initialized: AtomicBool::new(initialized),
         }
     }
 
     fn new() -> Self {
         Self::new_with_init(true)
+    }
+
+    fn current_hwnd(&self) -> HWND {
+        HWND(self.hwnd.load(Ordering::Acquire) as *mut c_void)
     }
 }
 
@@ -372,9 +479,10 @@ pub fn create_uninitialized_draw() -> IDirectDraw {
 
 impl Drop for Draw {
     fn drop(&mut self) {
-        let id = self.bind_id.get();
+        let id = self.bind_id.load(Ordering::Acquire);
         let owns_hooks = window::is_active_owner(id);
-        if let Ok(mut display) = self.display.try_borrow_mut() {
+        {
+            let mut display = self.display.lock();
             if let Some(saved) = display.set_host(None) {
                 if owns_hooks {
                     let _ = saved.restore();
@@ -470,12 +578,12 @@ impl Draw_Impl {
         } else {
             60
         };
-        self.cached_hz.set(resolved);
+        self.cached_hz.store(resolved, Ordering::Relaxed);
         resolved
     }
 
     fn monitor_hz(&self) -> u32 {
-        let cached = self.cached_hz.get();
+        let cached = self.cached_hz.load(Ordering::Relaxed);
         if cached != 0 {
             cached
         } else {
@@ -490,11 +598,7 @@ impl Draw_Impl {
         let active_end_us = frame_us * 92 / 100;
         let elapsed_us = self.vblank_epoch.elapsed().as_micros() as u64;
         let phase_us = elapsed_us % frame_us;
-        let height = self
-            .display
-            .try_borrow()
-            .map(|d| d.height.max(1))
-            .unwrap_or(480);
+        let height = self.display.height();
         (phase_us, active_end_us, frame_us, height)
     }
 
@@ -574,11 +678,7 @@ impl Draw_Impl {
         if can_create {
             return Ok(());
         }
-        let snapshot = self
-            .display
-            .try_borrow()
-            .map_err(|_| SURFACE_BUSY)?
-            .live_surfaces();
+        let snapshot = self.display.lock().live_surfaces();
         for surf in snapshot {
             let keep = if all {
                 true
@@ -617,9 +717,8 @@ impl Draw_Impl {
         {
             return Err(E_INVALIDARG.into());
         }
-        let current = self.display.try_borrow().map_err(|_| SURFACE_BUSY)?;
-        let current_size = (current.width, current.height);
-        drop(current);
+        let (cur_w, cur_h, _) = self.display.mode();
+        let current_size = (cur_w, cur_h);
         let refresh = self.monitor_hz();
         let include_refresh = flags & DDEDM_REFRESHRATES as u32 != 0;
         let sizes = [
@@ -695,8 +794,7 @@ impl Draw_Impl {
         }
         let used = self
             .display
-            .try_borrow()
-            .map_err(|_| SURFACE_BUSY)?
+            .lock()
             .allocated_bytes()
             .min(VIRTUAL_VIDMEM_BYTES as usize) as u32;
         if let Some(total) = unsafe { total.as_mut() } {
@@ -711,8 +809,7 @@ impl Draw_Impl {
     fn get_surface_from_dc_impl<S: Interface>(&self, hdc: HDC) -> Result<S> {
         let surface = self
             .display
-            .try_borrow()
-            .map_err(|_| SURFACE_BUSY)?
+            .lock()
             .find_surface_by_dc(hdc)
             .ok_or(DDERR_NOTFOUND)?;
         surface.cast::<S>()
@@ -797,8 +894,7 @@ impl IDirectDraw_Impl for Draw_Impl {
         })
     }
     fn FlipToGDISurface(&self) -> Result<()> {
-        let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
-        display.present_now()
+        self.display.request_present_now()
     }
 
     fn GetCaps(&self, driver: *mut DDCAPS_DX7, software: *mut DDCAPS_DX7) -> Result<()> {
@@ -874,8 +970,8 @@ impl IDirectDraw_Impl for Draw_Impl {
     }
     fn GetDisplayMode(&self, desc: *mut DDSURFACEDESC) -> Result<()> {
         check_desc(desc)?;
-        let d = self.display.try_borrow().map_err(|_| SURFACE_BUSY)?;
-        unsafe { desc.write(mode_description(d.width, d.height, d.bpp)?) };
+        let (width, height, bpp) = self.display.mode();
+        unsafe { desc.write(mode_description(width, height, bpp)?) };
         Ok(())
     }
     fn GetFourCCCodes(&self, count: *mut u32, _: *mut u32) -> Result<()> {
@@ -887,8 +983,7 @@ impl IDirectDraw_Impl for Draw_Impl {
     }
     fn GetGDISurface(&self) -> Result<IDirectDrawSurface> {
         self.display
-            .try_borrow()
-            .map_err(|_| SURFACE_BUSY)?
+            .lock()
             .primary_surface()
             .ok_or_else(|| Error::from(DDERR_NOTFOUND))
     }
@@ -900,7 +995,7 @@ impl IDirectDraw_Impl for Draw_Impl {
             dmSize: size_of::<DEVMODEW>() as u16,
             ..Default::default()
         };
-        let hwnd = self.hwnd.get();
+        let hwnd = self.current_hwnd();
         let mut monitor = MONITORINFOEXW::default();
         let device_name = if hwnd.is_invalid() {
             PCWSTR::null()
@@ -940,29 +1035,28 @@ impl IDirectDraw_Impl for Draw_Impl {
         Ok(())
     }
     fn Initialize(&self, device: *mut GUID) -> Result<()> {
-        if self.initialized.get() {
+        if self.initialized.load(Ordering::Acquire) {
             return Err(ALREADY_INITIALIZED.into());
         }
         if !valid_device_guid(device) {
             return Err(E_INVALIDARG.into());
         }
-        self.initialized.set(true);
+        self.initialized.store(true, Ordering::Release);
         Ok(())
     }
     fn RestoreDisplayMode(&self) -> Result<()> {
-        let _transition = self
-            .changing_window
-            .try_borrow_mut()
-            .map_err(|_| SURFACE_BUSY)?;
-        window::set_scaling_active(self.bind_id.get(), false);
-        let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
+        let _transition = WindowTransitionGuard::acquire(&self.changing_window)?;
+        window::set_scaling_active(self.bind_id.load(Ordering::Acquire), false);
+        let mut display = self.display.lock();
         if let Some(saved) = display.set_host(None) {
             saved.restore()?;
         }
         if display.primary.upgrade().is_none() {
             (display.width, display.height, display.bpp) = DEFAULT_MODE;
+            self.display
+                .store_mode(DEFAULT_MODE.0, DEFAULT_MODE.1, DEFAULT_MODE.2);
         }
-        display.present_now()
+        display.present_now(&self.display)
     }
 
     fn SetCooperativeLevel(&self, hwnd: HWND, flags: u32) -> Result<()> {
@@ -1000,17 +1094,14 @@ impl IDirectDraw_Impl for Draw_Impl {
             return Err(E_INVALIDARG.into());
         }
         // SetWindowPos synchronously calls the game's WndProc, which may re-enter us.
-        let _transition = self
-            .changing_window
-            .try_borrow_mut()
-            .map_err(|_| SURFACE_BUSY)?;
+        let _transition = WindowTransitionGuard::acquire(&self.changing_window)?;
         let manage_window = exclusive && !no_window_changes;
-        let change_hwnd = self.hwnd.get() != hwnd;
+        let change_hwnd = self.current_hwnd() != hwnd;
         {
-            let display = self.display.try_borrow().map_err(|_| SURFACE_BUSY)?;
+            let display = self.display.lock();
             if !change_hwnd
                 && display.host.is_some() == manage_window
-                && self.exclusive.get() == exclusive
+                && self.exclusive.load(Ordering::Acquire) == exclusive
             {
                 return Ok(());
             }
@@ -1020,7 +1111,7 @@ impl IDirectDraw_Impl for Draw_Impl {
         } else {
             None
         };
-        let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
+        let mut display = self.display.lock();
         if let Some(saved) = display.set_host(None) {
             saved.restore()?;
         }
@@ -1034,28 +1125,29 @@ impl IDirectDraw_Impl for Draw_Impl {
             let host = HostWindow::enter(hwnd, initial_mode, display.width, display.height, cfg)?;
             display.set_host(Some(host));
         }
-        self.exclusive.set(exclusive);
-        self.manage_window.set(manage_window);
+        self.exclusive.store(exclusive, Ordering::Release);
+        self.manage_window.store(manage_window, Ordering::Release);
         if change_hwnd {
             display.bound_hwnd = hwnd;
             display.renderer = replacement;
             display.consecutive_present_failures = 0;
-            self.hwnd.set(hwnd);
-            self.cached_hz.set(0);
-            let prev_id = self.bind_id.get();
+            self.hwnd.store(hwnd.0 as isize, Ordering::Release);
+            self.cached_hz.store(0, Ordering::Relaxed);
+            let prev_id = self.bind_id.load(Ordering::Acquire);
             if hwnd.is_invalid() {
                 window::unbind_window(prev_id);
-                self.bind_id.set(0);
+                self.bind_id.store(0, Ordering::Release);
             } else {
                 compat::apply_single_cpu_affinity();
                 let id = window::bind_window(hwnd, exclusive);
-                self.bind_id.set(id);
-                ACTIVE_DISPLAY.with(|slot| *slot.borrow_mut() = Rc::downgrade(&self.display));
+                self.bind_id.store(id, Ordering::Release);
+                *ACTIVE_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Arc::downgrade(&self.display);
             }
         } else {
-            window::set_scaling_active(self.bind_id.get(), exclusive);
+            window::set_scaling_active(self.bind_id.load(Ordering::Acquire), exclusive);
         }
-        display.present_now()
+        display.present_now(&self.display)
     }
     fn SetDisplayMode(&self, width: u32, height: u32, bpp: u32) -> Result<()> {
         if !(1..=8192).contains(&width)
@@ -1065,27 +1157,24 @@ impl IDirectDraw_Impl for Draw_Impl {
             return Err(E_INVALIDARG.into());
         }
         {
-            let display = self.display.try_borrow().map_err(|_| SURFACE_BUSY)?;
+            let display = self.display.lock();
             if (display.width, display.height, display.bpp) != (width, height, bpp)
                 && display.primary.upgrade().is_some()
             {
                 return Err(SURFACE_BUSY.into());
             }
         }
-        let hwnd = self.hwnd.get();
+        let hwnd = self.current_hwnd();
         let cfg = config::get();
-        let _transition = self
-            .changing_window
-            .try_borrow_mut()
-            .map_err(|_| SURFACE_BUSY)?;
-        let mut display = self.display.try_borrow_mut().map_err(|_| SURFACE_BUSY)?;
+        let _transition = WindowTransitionGuard::acquire(&self.changing_window)?;
+        let mut display = self.display.lock();
         if (display.width, display.height, display.bpp) != (width, height, bpp)
             && display.primary.upgrade().is_some()
         {
             return Err(SURFACE_BUSY.into());
         }
-        if self.exclusive.get() && !hwnd.is_invalid() {
-            if self.manage_window.get() && display.host.is_none() {
+        if self.exclusive.load(Ordering::Acquire) && !hwnd.is_invalid() {
+            if self.manage_window.load(Ordering::Acquire) && display.host.is_none() {
                 let mode = if cfg.windowed {
                     PresentationMode::Windowed
                 } else {
@@ -1096,9 +1185,10 @@ impl IDirectDraw_Impl for Draw_Impl {
             } else if let Some(host) = display.host.as_mut() {
                 host.on_logical_mode_changed(width, height, cfg);
             }
-            window::set_scaling_active(self.bind_id.get(), true);
+            window::set_scaling_active(self.bind_id.load(Ordering::Acquire), true);
         }
         (display.width, display.height, display.bpp) = (width, height, bpp);
+        self.display.store_mode(width, height, bpp);
         window::set_mode(width, height, bpp, true);
         if let Some(renderer) = display.renderer.as_mut() {
             renderer.sync_overlay();
@@ -1109,9 +1199,9 @@ impl IDirectDraw_Impl for Draw_Impl {
         if !event.is_invalid() {
             return Err(E_NOTIMPL.into());
         }
-        if let Ok(mut display) = self.display.try_borrow_mut() {
-            if display.dirty {
-                let _ = display.present_now();
+        if window::is_ui_thread_or_unbound() && self.display.dirty.load(Ordering::Acquire) {
+            if let Some(mut display) = self.display.try_lock() {
+                let _ = display.present_now(&self.display);
             }
         }
         let (phase_us, active_end_us, frame_us, _) = self.frame_timing();
@@ -1324,8 +1414,8 @@ impl IDirectDraw4_Impl for Draw_Impl {
     }
     fn GetDisplayMode(&self, desc: *mut DDSURFACEDESC2) -> Result<()> {
         check_desc2(desc)?;
-        let d = self.display.try_borrow().map_err(|_| SURFACE_BUSY)?;
-        let mode = mode_description(d.width, d.height, d.bpp)?;
+        let (width, height, bpp) = self.display.mode();
+        let mode = mode_description(width, height, bpp)?;
         unsafe { desc.write(surface::desc_to_desc2(&mode)) };
         Ok(())
     }
