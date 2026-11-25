@@ -30,7 +30,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config;
 
 use super::dialog_template::FontPatch;
-use super::geometry::{client_to_screen, is_window, map_rect, screen_to_client, window_rect};
 use super::input::{
     client_origin_in_bound, client_to_logical, hit_test_logical_child, is_mouse_message,
     is_related_dialog_window, logical_to_client,
@@ -39,6 +38,9 @@ use super::overlay::ensure_present_on_top_if_active;
 use super::{
     bound_hwnd_raw, is_present_hwnd, is_scaling_active, logical_mode, present_hwnd_raw,
     FLUSH_TIMER_ID, WM_APP_FLUSH,
+};
+use crate::win32::geometry::{
+    client_to_screen, is_window, map_rect, screen_to_client, window_rect,
 };
 
 static ORIG_WNDPROC: AtomicIsize = AtomicIsize::new(0);
@@ -55,8 +57,9 @@ struct PatchedSlot {
 
 static IAT_PATCHES: Mutex<Vec<PatchedSlot>> = Mutex::new(Vec::new());
 
-pub(crate) fn subclassed_hwnd_raw() -> isize {
-    SUBCLASSED_HWND.load(Ordering::Relaxed)
+pub(crate) fn subclassed_hwnd() -> Option<HWND> {
+    let raw = SUBCLASSED_HWND.load(Ordering::Relaxed);
+    (raw != 0).then_some(HWND(raw as *mut c_void))
 }
 
 fn virtual_window_rect(hwnd: HWND, include_dialogs: bool) -> Option<RECT> {

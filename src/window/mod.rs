@@ -1,24 +1,22 @@
 //! Win32 windowing subsystem: host window mode management, owned presentation overlay,
 //! logical<->physical coordinate mapping, and PE32 IAT / WndProc / WH_GETMESSAGE hooks.
+#![deny(unsafe_code)]
 #![allow(non_snake_case)]
 
 mod dialog_template;
-mod geometry;
+#[allow(unsafe_code)]
 pub mod hooks;
 pub mod host;
 pub mod input;
 pub mod overlay;
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use crate::win32::current_thread_id;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::{
-    KillTimer, PostMessageW, SetProcessDPIAware, SetTimer,
-};
 
-pub(crate) use geometry::{client_rect, is_window};
+pub(crate) use crate::win32::geometry::{client_rect, is_window};
+use crate::win32::hwnd::{kill_timer, post_message_w, set_timer};
+use crate::win32::{current_thread_id, AtomicHwnd};
 pub use host::{HostWindow, PresentationMode};
 pub use overlay::OverlayWindow;
 
@@ -27,8 +25,8 @@ pub(crate) const FLUSH_TIMER_ID: usize = 0x434E_4344;
 
 static NEXT_BIND_ID: AtomicUsize = AtomicUsize::new(1);
 static ACTIVE_BIND_ID: AtomicUsize = AtomicUsize::new(0);
-static BOUND_HWND: AtomicIsize = AtomicIsize::new(0);
-static PRESENT_HWND: AtomicIsize = AtomicIsize::new(0);
+static BOUND_HWND: AtomicHwnd = AtomicHwnd::new();
+static PRESENT_HWND: AtomicHwnd = AtomicHwnd::new();
 static BOUND_THREAD: AtomicU32 = AtomicU32::new(0);
 static LOGICAL_WIDTH: AtomicU32 = AtomicU32::new(0);
 static LOGICAL_HEIGHT: AtomicU32 = AtomicU32::new(0);
@@ -37,9 +35,7 @@ static MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static LOGICAL_SCALING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn enable_dpi_awareness() {
-    unsafe {
-        let _ = SetProcessDPIAware();
-    }
+    crate::win32::enable_dpi_awareness();
 }
 
 /// Computes the presentation viewport inside a `target_w x target_h` client area.
@@ -63,18 +59,22 @@ pub(crate) fn logical_mode() -> Option<(HWND, u32, u32, u32)> {
     if !LOGICAL_SCALING_ACTIVE.load(Ordering::Relaxed) || !MODE_ACTIVE.load(Ordering::Relaxed) {
         return None;
     }
-    let hwnd_raw = BOUND_HWND.load(Ordering::Relaxed);
+    let hwnd = BOUND_HWND.load()?;
     let w = LOGICAL_WIDTH.load(Ordering::Relaxed);
     let h = LOGICAL_HEIGHT.load(Ordering::Relaxed);
     let bpp = LOGICAL_BPP.load(Ordering::Relaxed);
-    if hwnd_raw == 0 || w == 0 || h == 0 {
+    if w == 0 || h == 0 {
         return None;
     }
-    Some((HWND(hwnd_raw as *mut c_void), w, h, bpp))
+    Some((hwnd, w, h, bpp))
+}
+
+pub(crate) fn bound_hwnd() -> Option<HWND> {
+    BOUND_HWND.load()
 }
 
 pub(crate) fn bound_hwnd_raw() -> isize {
-    BOUND_HWND.load(Ordering::Relaxed)
+    BOUND_HWND.load_raw()
 }
 
 pub(crate) fn bound_thread_id() -> u32 {
@@ -87,8 +87,12 @@ pub fn is_ui_thread_or_unbound() -> bool {
     bound == 0 || bound == current_thread_id()
 }
 
+pub(crate) fn present_hwnd() -> Option<HWND> {
+    PRESENT_HWND.load()
+}
+
 pub(crate) fn present_hwnd_raw() -> isize {
-    PRESENT_HWND.load(Ordering::Relaxed)
+    PRESENT_HWND.load_raw()
 }
 
 pub(crate) fn is_scaling_active() -> bool {
@@ -96,19 +100,15 @@ pub(crate) fn is_scaling_active() -> bool {
 }
 
 pub fn set_present_hwnd(hwnd: HWND) {
-    PRESENT_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+    PRESENT_HWND.store(Some(hwnd));
 }
 
 pub fn clear_present_hwnd(hwnd: HWND) {
-    let raw = hwnd.0 as isize;
-    if raw != 0 {
-        let _ = PRESENT_HWND.compare_exchange(raw, 0, Ordering::Relaxed, Ordering::Relaxed);
-    }
+    PRESENT_HWND.clear_if(hwnd);
 }
 
 pub(crate) fn is_present_hwnd(hwnd: HWND) -> bool {
-    let raw = PRESENT_HWND.load(Ordering::Relaxed);
-    raw != 0 && hwnd.0 as isize == raw
+    PRESENT_HWND.matches(hwnd)
 }
 
 pub fn bind_window(hwnd: HWND, scaling_active: bool) -> usize {
@@ -118,7 +118,7 @@ pub fn bind_window(hwnd: HWND, scaling_active: bool) -> usize {
     let id = NEXT_BIND_ID.fetch_add(1, Ordering::Relaxed);
     let tid = current_thread_id();
     ACTIVE_BIND_ID.store(id, Ordering::Relaxed);
-    BOUND_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+    BOUND_HWND.store(Some(hwnd));
     BOUND_THREAD.store(tid, Ordering::Relaxed);
     LOGICAL_SCALING_ACTIVE.store(scaling_active, Ordering::Relaxed);
     MODE_ACTIVE.store(false, Ordering::Relaxed);
@@ -132,14 +132,14 @@ pub fn set_mode(width: u32, height: u32, bpp: u32, active: bool) {
     LOGICAL_WIDTH.store(width, Ordering::Relaxed);
     LOGICAL_HEIGHT.store(height, Ordering::Relaxed);
     LOGICAL_BPP.store(bpp, Ordering::Relaxed);
-    if BOUND_HWND.load(Ordering::Relaxed) != 0 {
+    if BOUND_HWND.load().is_some() {
         MODE_ACTIVE.store(active, Ordering::Relaxed);
     }
 }
 
 /// Keeps logical dimensions aligned with the exact primary surface dimensions presented by wgpu.
 pub fn sync_presented_size(width: u32, height: u32) {
-    if width > 0 && height > 0 && BOUND_HWND.load(Ordering::Relaxed) != 0 {
+    if width > 0 && height > 0 && BOUND_HWND.load().is_some() {
         LOGICAL_WIDTH.store(width, Ordering::Relaxed);
         LOGICAL_HEIGHT.store(height, Ordering::Relaxed);
         if LOGICAL_SCALING_ACTIVE.load(Ordering::Relaxed) {
@@ -170,7 +170,7 @@ pub fn unbind_window(bind_id: usize) {
     }
     MODE_ACTIVE.store(false, Ordering::Relaxed);
     LOGICAL_SCALING_ACTIVE.store(false, Ordering::Relaxed);
-    BOUND_HWND.store(0, Ordering::Relaxed);
+    BOUND_HWND.store(None);
     BOUND_THREAD.store(0, Ordering::Relaxed);
     hooks::uninstall_getmsg_hook();
     hooks::uninstall_subclass();
@@ -178,9 +178,7 @@ pub fn unbind_window(bind_id: usize) {
 }
 
 fn flush_window() -> Option<HWND> {
-    let raw = hooks::subclassed_hwnd_raw();
-    let hwnd = HWND(raw as *mut c_void);
-    (raw != 0 && is_window(hwnd)).then_some(hwnd)
+    hooks::subclassed_hwnd().filter(|&hwnd| is_window(hwnd))
 }
 
 pub fn can_schedule_flush() -> bool {
@@ -191,35 +189,25 @@ pub fn schedule_flush() -> bool {
     let Some(hwnd) = flush_window() else {
         return false;
     };
-    unsafe {
-        PostMessageW(
-            Some(hwnd),
-            WM_APP_FLUSH,
-            Default::default(),
-            Default::default(),
-        )
-    }
-    .is_ok()
+    post_message_w(hwnd, WM_APP_FLUSH, Default::default(), Default::default())
 }
 
 pub fn arm_flush_timer(ms: u32) {
     if let Some(hwnd) = flush_window() {
-        unsafe {
-            let _ = SetTimer(Some(hwnd), FLUSH_TIMER_ID, ms.max(1), None);
-        }
+        set_timer(hwnd, FLUSH_TIMER_ID, ms.max(1));
     }
 }
 
 pub fn disarm_flush_timer() {
     if let Some(hwnd) = flush_window() {
-        unsafe {
-            let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
-        }
+        kill_timer(hwnd, FLUSH_TIMER_ID);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+
     use super::*;
 
     #[test]

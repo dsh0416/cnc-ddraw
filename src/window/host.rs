@@ -1,54 +1,26 @@
 //! Game host HWND lifecycle: borderless fullscreen, windowed mode, live Alt+Enter toggle,
 //! and lossless restoration of original window style and placement.
-use std::mem::size_of;
+#![forbid(unsafe_code)]
 
 use windows::core::Result;
-use windows::Win32::Foundation::{
-    GetLastError, SetLastError, ERROR_SUCCESS, E_INVALIDARG, HWND, RECT,
-};
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
+use windows::Win32::Foundation::{E_INVALIDARG, HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, GetWindowLongW, GetWindowPlacement, SetWindowLongW, SetWindowPlacement,
-    SetWindowPos, GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE,
-    WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE,
-    WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU,
-    WS_THICKFRAME,
+    GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
+    WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
-use super::geometry::{is_window, window_rect};
 use crate::config::Config;
+use crate::win32::geometry::{adjust_window_rect_ex, is_window, monitor_info, window_rect};
+use crate::win32::hwnd::{
+    ex_style, set_window_long, set_window_placement, set_window_pos, style, window_placement,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentationMode {
     BorderlessFullscreen,
     Windowed,
-}
-
-fn set_style(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX, style: i32) -> Result<()> {
-    unsafe {
-        SetLastError(ERROR_SUCCESS);
-        if SetWindowLongW(hwnd, index, style) == 0 {
-            let error = GetLastError();
-            if error != ERROR_SUCCESS {
-                return Err(error.to_hresult().into());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn monitor_info(hwnd: HWND) -> Result<MONITORINFO> {
-    let mut info = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).ok()?;
-    }
-    Ok(info)
 }
 
 #[derive(Clone, Copy)]
@@ -70,20 +42,16 @@ impl HostWindow {
         logical_h: u32,
         cfg: &Config,
     ) -> Result<Self> {
-        let orig_style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) };
+        let orig_style = style(hwnd);
         if orig_style as u32 & WS_CHILD.0 != 0 {
             return Err(E_INVALIDARG.into());
         }
-        let mut placement = WINDOWPLACEMENT {
-            length: size_of::<WINDOWPLACEMENT>() as u32,
-            ..Default::default()
-        };
-        unsafe { GetWindowPlacement(hwnd, &mut placement)? };
+        let placement = window_placement(hwnd)?;
         let mut host = Self {
             hwnd,
             placement,
             orig_style,
-            orig_ex_style: unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) },
+            orig_ex_style: ex_style(hwnd),
             mode,
             saved_windowed_rect: None,
             has_custom_window_rect: false,
@@ -146,44 +114,42 @@ impl HostWindow {
         let rect = info.rcMonitor;
         let edge_styles =
             WS_EX_CLIENTEDGE.0 | WS_EX_WINDOWEDGE.0 | WS_EX_DLGMODALFRAME.0 | WS_EX_STATICEDGE.0;
-        set_style(
+        set_window_long(
             self.hwnd,
             GWL_STYLE,
             ((self.orig_style as u32 & !WS_OVERLAPPEDWINDOW.0) | WS_POPUP.0) as i32,
         )?;
-        set_style(
+        set_window_long(
             self.hwnd,
             GWL_EXSTYLE,
             (self.orig_ex_style as u32 & !edge_styles) as i32,
         )?;
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                None,
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        }
+        set_window_pos(
+            self.hwnd,
+            None,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
     }
 
     fn apply_windowed(&mut self, logical_w: u32, logical_h: u32, cfg: &Config) -> Result<()> {
         let info = monitor_info(self.hwnd)?;
         let work = info.rcWork;
-        let mut style = (self.orig_style as u32) & !(WS_POPUP.0 | WS_OVERLAPPEDWINDOW.0);
+        let mut next_style = (self.orig_style as u32) & !(WS_POPUP.0 | WS_OVERLAPPEDWINDOW.0);
         if cfg.border {
-            style |= WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0;
+            next_style |= WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0;
             if cfg.resizable {
-                style |= WS_THICKFRAME.0 | WS_MAXIMIZEBOX.0;
+                next_style |= WS_THICKFRAME.0 | WS_MAXIMIZEBOX.0;
             }
         } else {
-            style |= WS_POPUP.0;
+            next_style |= WS_POPUP.0;
         }
-        let ex_style = self.orig_ex_style as u32;
-        set_style(self.hwnd, GWL_STYLE, style as i32)?;
-        set_style(self.hwnd, GWL_EXSTYLE, ex_style as i32)?;
+        let next_ex_style = self.orig_ex_style as u32;
+        set_window_long(self.hwnd, GWL_STYLE, next_style as i32)?;
+        set_window_long(self.hwnd, GWL_EXSTYLE, next_ex_style as i32)?;
 
         let (x, y, win_w, win_h) = if let Some(rc) = self.saved_windowed_rect {
             (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top)
@@ -204,14 +170,12 @@ impl HostWindow {
                 right: client_w,
                 bottom: client_h,
             };
-            unsafe {
-                let _ = AdjustWindowRectEx(
-                    &mut rc,
-                    WINDOW_STYLE(style),
-                    false,
-                    WINDOW_EX_STYLE(ex_style),
-                );
-            }
+            adjust_window_rect_ex(
+                &mut rc,
+                WINDOW_STYLE(next_style),
+                false,
+                WINDOW_EX_STYLE(next_ex_style),
+            );
             let max_w = (work.right - work.left).max(320);
             let max_h = (work.bottom - work.top).max(200);
             let w = (rc.right - rc.left).min(max_w);
@@ -221,95 +185,88 @@ impl HostWindow {
             (x, y, w, h)
         };
 
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                None,
-                x,
-                y,
-                win_w,
-                win_h,
-                SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        }
+        set_window_pos(
+            self.hwnd,
+            None,
+            x,
+            y,
+            win_w,
+            win_h,
+            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
     }
 
     pub fn restore(self) -> Result<()> {
         if !is_window(self.hwnd) {
             return Ok(());
         }
-        set_style(self.hwnd, GWL_STYLE, self.orig_style)?;
-        set_style(self.hwnd, GWL_EXSTYLE, self.orig_ex_style)?;
-        unsafe {
-            SetWindowPlacement(self.hwnd, &self.placement)?;
-            SetWindowPos(
-                self.hwnd,
-                None,
-                0,
-                0,
-                0,
-                0,
-                SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-            )
-        }
+        set_window_long(self.hwnd, GWL_STYLE, self.orig_style)?;
+        set_window_long(self.hwnd, GWL_EXSTYLE, self.orig_ex_style)?;
+        set_window_placement(self.hwnd, &self.placement)?;
+        set_window_pos(
+            self.hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::win32::hwnd::{create_window_ex_w, destroy_window};
     use windows::core::w;
-    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_VISIBLE};
+    use windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE;
 
     #[test]
     fn host_window_enters_toggles_and_restores_original_style_and_rect() {
-        unsafe {
-            let hwnd = CreateWindowExW(
-                Default::default(),
-                w!("STATIC"),
-                w!("cnc-ddraw-host-test"),
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                100,
-                100,
-                640,
-                480,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-            let orig_style = GetWindowLongW(hwnd, GWL_STYLE);
-            let orig_rect = window_rect(hwnd).unwrap();
+        let hwnd = create_window_ex_w(
+            Default::default(),
+            w!("STATIC"),
+            w!("cnc-ddraw-host-test"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            100,
+            100,
+            640,
+            480,
+            None,
+            None,
+        )
+        .unwrap();
+        let orig_style = style(hwnd);
+        let orig_rect = window_rect(hwnd).unwrap();
 
-            let cfg = Config {
-                width: 800,
-                height: 600,
-                border: true,
-                resizable: true,
-                ..Config::default()
-            };
-            let mut host =
-                HostWindow::enter(hwnd, PresentationMode::BorderlessFullscreen, 800, 600, &cfg)
-                    .unwrap();
-            assert!(host.is_fullscreen());
+        let cfg = Config {
+            width: 800,
+            height: 600,
+            border: true,
+            resizable: true,
+            ..Config::default()
+        };
+        let mut host =
+            HostWindow::enter(hwnd, PresentationMode::BorderlessFullscreen, 800, 600, &cfg)
+                .unwrap();
+        assert!(host.is_fullscreen());
 
-            let next = host.toggle_mode(800, 600, &cfg).unwrap();
-            assert_eq!(next, PresentationMode::Windowed);
-            assert!(!host.is_fullscreen());
-            let win_style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-            assert!(win_style & WS_CAPTION.0 != 0);
-            assert!(win_style & WS_THICKFRAME.0 != 0);
+        let next = host.toggle_mode(800, 600, &cfg).unwrap();
+        assert_eq!(next, PresentationMode::Windowed);
+        assert!(!host.is_fullscreen());
+        let win_style = style(hwnd) as u32;
+        assert!(win_style & WS_CAPTION.0 != 0);
+        assert!(win_style & WS_THICKFRAME.0 != 0);
 
-            let back = host.toggle_mode(800, 600, &cfg).unwrap();
-            assert_eq!(back, PresentationMode::BorderlessFullscreen);
+        let back = host.toggle_mode(800, 600, &cfg).unwrap();
+        assert_eq!(back, PresentationMode::BorderlessFullscreen);
 
-            host.restore().unwrap();
-            assert_eq!(GetWindowLongW(hwnd, GWL_STYLE), orig_style);
-            let restored = window_rect(hwnd).unwrap();
-            assert_eq!(restored, orig_rect);
+        host.restore().unwrap();
+        assert_eq!(style(hwnd), orig_style);
+        let restored = window_rect(hwnd).unwrap();
+        assert_eq!(restored, orig_rect);
 
-            let _ = DestroyWindow(hwnd);
-        }
+        destroy_window(hwnd);
     }
 }
