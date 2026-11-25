@@ -9,12 +9,13 @@ pub mod overlay;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
+use windows::core::{s, w};
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::WindowsAndMessaging::{
-    IsWindow, KillTimer, PostMessageW, SetProcessDPIAware, SetTimer,
-};
+use windows::Win32::UI::WindowsAndMessaging::{IsWindow, KillTimer, PostMessageW, SetTimer};
 
 pub use host::{HostWindow, PresentationMode};
 pub use overlay::OverlayWindow;
@@ -33,10 +34,100 @@ static LOGICAL_BPP: AtomicU32 = AtomicU32::new(0);
 static MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static LOGICAL_SCALING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-pub fn enable_dpi_awareness() {
-    unsafe {
-        let _ = SetProcessDPIAware();
+type SetThreadDpiAwarenessContextFn = unsafe extern "system" fn(isize) -> isize;
+type GetWindowDpiAwarenessContextFn = unsafe extern "system" fn(HWND) -> isize;
+
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE: isize = -3;
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+
+struct DpiApi {
+    set_thread_ctx: Option<SetThreadDpiAwarenessContextFn>,
+    get_window_ctx: Option<GetWindowDpiAwarenessContextFn>,
+}
+
+fn dpi_api() -> &'static DpiApi {
+    static API: OnceLock<DpiApi> = OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else {
+            return DpiApi {
+                set_thread_ctx: None,
+                get_window_ctx: None,
+            };
+        };
+        let set_thread_ctx = GetProcAddress(user32, s!("SetThreadDpiAwarenessContext")).map(|f| {
+            std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                SetThreadDpiAwarenessContextFn,
+            >(f)
+        });
+        let get_window_ctx = GetProcAddress(user32, s!("GetWindowDpiAwarenessContext")).map(|f| {
+            std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                GetWindowDpiAwarenessContextFn,
+            >(f)
+        });
+        DpiApi {
+            set_thread_ctx,
+            get_window_ctx,
+        }
+    })
+}
+
+struct ThreadDpiGuard {
+    prev: isize,
+    set_fn: Option<SetThreadDpiAwarenessContextFn>,
+}
+
+impl Drop for ThreadDpiGuard {
+    fn drop(&mut self) {
+        if self.prev != 0 {
+            if let Some(f) = self.set_fn {
+                unsafe {
+                    let _ = f(self.prev);
+                }
+            }
+        }
     }
+}
+
+/// Runs `f` with Per-Monitor V2 DPI awareness on the current thread only, keeping the game
+/// process and all legacy Win32 dialogs at 96 DPI while the wgpu overlay renders at native pixels.
+pub(crate) fn with_per_monitor_dpi<R>(f: impl FnOnce() -> R) -> R {
+    let set_fn = dpi_api().set_thread_ctx;
+    let prev = if let Some(set) = set_fn {
+        let p = unsafe { set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if p != 0 {
+            p
+        } else {
+            unsafe { set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE) }
+        }
+    } else {
+        0
+    };
+    let _guard = ThreadDpiGuard { prev, set_fn };
+    f()
+}
+
+/// Runs `f` in `hwnd`'s own DPI awareness context (e.g. 96 DPI for legacy game dialogs) so
+/// `GetWindowRect` / `ClientToScreen` queries return coordinates matching the game's logical space.
+pub(crate) fn with_window_dpi<R>(hwnd: HWND, f: impl FnOnce() -> R) -> R {
+    let api = dpi_api();
+    let prev = match (api.get_window_ctx, api.set_thread_ctx) {
+        (Some(get), Some(set)) if !hwnd.is_invalid() => {
+            let ctx = unsafe { get(hwnd) };
+            if ctx != 0 {
+                unsafe { set(ctx) }
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+    let _guard = ThreadDpiGuard {
+        prev,
+        set_fn: api.set_thread_ctx,
+    };
+    f()
 }
 
 /// Computes the presentation viewport inside a `target_w x target_h` client area.

@@ -18,7 +18,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config;
 
 use super::overlay::keep_present_on_top;
-use super::{bound_hwnd_raw, bound_thread_id, compute_viewport, is_present_hwnd, logical_mode};
+use super::{
+    bound_hwnd_raw, bound_thread_id, compute_viewport, is_present_hwnd, logical_mode,
+    with_window_dpi,
+};
 
 const SS_NOTIFY: u32 = 0x0100;
 
@@ -283,21 +286,26 @@ pub(crate) unsafe extern "system" fn present_wndproc(
                 let mut py = ((raw >> 16) & 0xffff) as i16 as i32;
                 if msg == WM_MOUSEWHEEL {
                     let mut pt = POINT { x: px, y: py };
-                    if unsafe { ScreenToClient(bound, &mut pt) }.as_bool() {
+                    if unsafe { ScreenToClient(hwnd, &mut pt) }.as_bool() {
                         px = pt.x;
                         py = pt.y;
                     }
                 }
-                let (lx, ly) = client_to_logical(bound, px, py, w, h);
-                let target = hit_test_logical_child(bound, lx, ly).unwrap_or(bound);
-                let target_lparam = if msg == WM_MOUSEWHEEL || target == bound {
-                    LPARAM(((ly as u16 as u32) << 16 | (lx as u16 as u32)) as isize)
-                } else {
-                    let (tx, ty) = client_origin_in_bound(bound, target);
-                    let cx = lx - tx;
-                    let cy = ly - ty;
-                    LPARAM(((cy as u16 as u32) << 16 | (cx as u16 as u32)) as isize)
-                };
+                // Map from the Per-Monitor V2 overlay's physical client coords to logical coords,
+                // then hit-test and compute child-relative offsets in `bound`'s 96-DPI context.
+                let (lx, ly) = client_to_logical(hwnd, px, py, w, h);
+                let (target, target_lparam) = with_window_dpi(bound, || {
+                    let target = hit_test_logical_child(bound, lx, ly).unwrap_or(bound);
+                    let target_lparam = if msg == WM_MOUSEWHEEL || target == bound {
+                        LPARAM(((ly as u16 as u32) << 16 | (lx as u16 as u32)) as isize)
+                    } else {
+                        let (tx, ty) = client_origin_in_bound(bound, target);
+                        let cx = lx - tx;
+                        let cy = ly - ty;
+                        LPARAM(((cy as u16 as u32) << 16 | (cx as u16 as u32)) as isize)
+                    };
+                    (target, target_lparam)
+                });
                 if unsafe { IsWindowUnicode(target) }.as_bool() {
                     let _ = unsafe { PostMessageW(Some(target), msg, wparam, target_lparam) };
                 } else {

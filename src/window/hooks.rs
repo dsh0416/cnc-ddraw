@@ -7,7 +7,7 @@ use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, GetDeviceCaps, MapWindowPoints, ScreenToClient, BITSPIXEL,
-    GET_DEVICE_CAPS_INDEX, HDC, HORZRES, VERTRES,
+    GET_DEVICE_CAPS_INDEX, HDC, HORZRES, LOGPIXELSX, LOGPIXELSY, VERTRES,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{VirtualProtect, PAGE_PROTECTION_FLAGS, PAGE_READWRITE};
@@ -302,6 +302,9 @@ unsafe extern "system" fn hook_GetDeviceCaps(hdc: HDC, index: i32) -> i32 {
         }
         if index == VERTRES.0 as i32 {
             return h as i32;
+        }
+        if index == LOGPIXELSX.0 as i32 || index == LOGPIXELSY.0 as i32 {
+            return 96;
         }
     }
     unsafe { GetDeviceCaps(Some(hdc), GET_DEVICE_CAPS_INDEX(index as u32)) }
