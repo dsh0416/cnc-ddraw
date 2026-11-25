@@ -35,7 +35,6 @@ const DDERR_NOTFOUND: HRESULT = dd_hresult(255);
 const DDERR_SURFACEALREADYATTACHED: HRESULT = dd_hresult(410);
 const DDERR_SURFACEBUSY: HRESULT = dd_hresult(430);
 const DDERR_SURFACENOTATTACHED: HRESULT = dd_hresult(460);
-const DDERR_PRIMARYSURFACEALREADYEXISTS: HRESULT = dd_hresult(564);
 const DDERR_NOCLIPPERATTACHED: HRESULT = dd_hresult(568);
 const DDERR_NOPALETTEATTACHED: HRESULT = dd_hresult(572);
 const DDERR_NOTAOVERLAYSURFACE: HRESULT = dd_hresult(580);
@@ -987,7 +986,6 @@ struct BltOptions {
     Agile = false
 )]
 struct Surface {
-    parent: Option<IDirectDraw>,
     display: Arc<DisplayShared>,
     data: Arc<SurfaceSlot>,
     is_primary: bool,
@@ -1005,14 +1003,12 @@ impl Drop for Surface {
 }
 
 fn register_surface_object(
-    parent: Option<IDirectDraw>,
     display: Arc<DisplayShared>,
     data: Arc<SurfaceSlot>,
     is_primary: bool,
     attached: Vec<IDirectDrawSurface>,
 ) -> Result<IDirectDrawSurface> {
     let iface: IDirectDrawSurface = Surface {
-        parent,
         display: display.clone(),
         data: data.clone(),
         is_primary,
@@ -1030,7 +1026,6 @@ fn register_surface_object(
 }
 
 pub fn create_surface(
-    parent: Option<IDirectDraw>,
     display: Arc<DisplayShared>,
     desc: &DDSURFACEDESC,
 ) -> Result<IDirectDrawSurface> {
@@ -1084,9 +1079,6 @@ pub fn create_surface(
     }
     let primary = caps & DDSCAPS_PRIMARYSURFACE as u32 != 0;
     let d = display.lock();
-    if primary && d.primary.upgrade().is_some() {
-        return Err(DDERR_PRIMARYSURFACEALREADYEXISTS.into());
-    }
     let (width, height) = if primary {
         (d.width, d.height)
     } else {
@@ -1171,7 +1163,6 @@ pub fn create_surface(
             )?));
             let chain = next.into_iter().collect();
             next = Some(register_surface_object(
-                parent.clone(),
                 display.clone(),
                 back_data,
                 false,
@@ -1188,11 +1179,10 @@ pub fn create_surface(
         display.lock().primary = Arc::downgrade(&data);
         crate::window::set_mode(width, height, (format.bytes() * 8) as u32, true);
     }
-    register_surface_object(parent, display, data, primary, attached)
+    register_surface_object(display, data, primary, attached)
 }
 
 pub fn duplicate_surface(
-    parent: Option<IDirectDraw>,
     display: Arc<DisplayShared>,
     source: &IDirectDrawSurface,
 ) -> Result<IDirectDrawSurface> {
@@ -1215,13 +1205,7 @@ pub fn duplicate_surface(
     copy.dest_overlay_key = src.dest_overlay_key;
     copy.gamma = src.gamma;
     drop(src);
-    register_surface_object(
-        parent,
-        display,
-        Arc::new(SurfaceSlot::new(copy)),
-        false,
-        Vec::new(),
-    )
+    register_surface_object(display, Arc::new(SurfaceSlot::new(copy)), false, Vec::new())
 }
 
 pub fn surface_desc(surface: &IDirectDrawSurface) -> Result<DDSURFACEDESC> {
@@ -1892,7 +1876,7 @@ impl Surface {
             return Err(E_POINTER.into());
         }
         unsafe { out.write(std::ptr::null_mut()) };
-        let parent = self.parent.clone().ok_or(E_INVALIDARG)?;
+        let parent = self.display.clone_owner_draw().ok_or(E_INVALIDARG)?;
         unsafe { out.write(parent.into_raw()) };
         Ok(())
     }
@@ -3519,8 +3503,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let primary = create_surface(None, display.clone(), &prim_desc).unwrap();
-        let back = create_surface(None, display.clone(), &back_desc).unwrap();
+        let primary = create_surface(display.clone(), &prim_desc).unwrap();
+        let back = create_surface(display.clone(), &back_desc).unwrap();
 
         // Same-thread Lock while GetDC is held must still fail immediately (no self-deadlock).
         let mut dc = HDC::default();

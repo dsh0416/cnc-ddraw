@@ -3,6 +3,7 @@ use windows::core::{implement, IUnknownImpl, Interface, Ref, Result, HRESULT};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_POINTER};
 use windows::Win32::Graphics::DirectDraw::{
     IDirectDraw, IDirectDrawPalette, IDirectDrawPalette_Impl, DDPCAPS_8BIT, DDPCAPS_ALLOW256,
+    DDPCAPS_INITIALIZE, DDPCAPS_PRIMARYSURFACE, DDPCAPS_VSYNC,
 };
 use windows::Win32::Graphics::Gdi::PALETTEENTRY;
 
@@ -20,7 +21,12 @@ pub fn create_palette(
     entries: *const PALETTEENTRY,
     display: Arc<DisplayShared>,
 ) -> Result<IDirectDrawPalette> {
-    if flags & DDPCAPS_8BIT as u32 == 0 || flags & !(DDPCAPS_8BIT | DDPCAPS_ALLOW256) as u32 != 0 {
+    let allowed = (DDPCAPS_8BIT
+        | DDPCAPS_ALLOW256
+        | DDPCAPS_INITIALIZE
+        | DDPCAPS_PRIMARYSURFACE
+        | DDPCAPS_VSYNC) as u32;
+    if flags & DDPCAPS_8BIT as u32 == 0 || flags & !allowed != 0 {
         return Err(E_NOTIMPL.into());
     }
     if entries.is_null() {
