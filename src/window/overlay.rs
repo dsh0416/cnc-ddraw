@@ -16,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::input::{is_related_dialog_window, is_same_process_window, present_wndproc};
-use super::{clear_present_hwnd, present_hwnd_raw, set_present_hwnd, with_per_monitor_dpi};
+use super::{clear_present_hwnd, present_hwnd_raw, set_present_hwnd};
 
 pub struct OverlayWindow {
     owner: HWND,
@@ -28,52 +28,50 @@ pub struct OverlayWindow {
 
 impl OverlayWindow {
     pub fn new(owner: HWND) -> Result<Self, String> {
-        with_per_monitor_dpi(|| {
-            let module = unsafe { GetModuleHandleW(None) }
-                .map_err(|err| format!("getting module handle: {err}"))?;
-            let hinstance = HINSTANCE(module.0);
-            let class_name = w!("CncDdrawWgpuPresent");
-            static REGISTERED: OnceLock<()> = OnceLock::new();
-            REGISTERED.get_or_init(|| {
-                let wc = WNDCLASSW {
-                    lpfnWndProc: Some(present_wndproc),
-                    hInstance: hinstance,
-                    lpszClassName: class_name,
-                    ..Default::default()
-                };
-                unsafe {
-                    let _ = RegisterClassW(&wc);
-                }
-            });
-
-            let (x, y, w, h) = client_screen_rect(owner).unwrap_or((0, 0, 1, 1));
-            let hwnd = unsafe {
-                CreateWindowExW(
-                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-                    class_name,
-                    w!(""),
-                    WS_POPUP,
-                    x,
-                    y,
-                    w.max(1) as i32,
-                    h.max(1) as i32,
-                    Some(owner),
-                    None,
-                    Some(hinstance),
-                    None,
-                )
+        let module = unsafe { GetModuleHandleW(None) }
+            .map_err(|err| format!("getting module handle: {err}"))?;
+        let hinstance = HINSTANCE(module.0);
+        let class_name = w!("CncDdrawWgpuPresent");
+        static REGISTERED: OnceLock<()> = OnceLock::new();
+        REGISTERED.get_or_init(|| {
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(present_wndproc),
+                hInstance: hinstance,
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            unsafe {
+                let _ = RegisterClassW(&wc);
             }
-            .map_err(|err| format!("creating presentation overlay window: {err}"))?;
-            set_present_hwnd(hwnd);
-            let hinst_nz = NonZeroIsize::new(module.0 as isize)
-                .ok_or_else(|| "invalid module handle".to_string())?;
-            Ok(Self {
-                owner,
-                hwnd,
-                hinstance: hinst_nz,
-                last_rect: None,
-                visible: false,
-            })
+        });
+
+        let (x, y, w, h) = client_screen_rect(owner).unwrap_or((0, 0, 1, 1));
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                class_name,
+                w!(""),
+                WS_POPUP,
+                x,
+                y,
+                w.max(1) as i32,
+                h.max(1) as i32,
+                Some(owner),
+                None,
+                Some(hinstance),
+                None,
+            )
+        }
+        .map_err(|err| format!("creating presentation overlay window: {err}"))?;
+        set_present_hwnd(hwnd);
+        let hinst_nz = NonZeroIsize::new(module.0 as isize)
+            .ok_or_else(|| "invalid module handle".to_string())?;
+        Ok(Self {
+            owner,
+            hwnd,
+            hinstance: hinst_nz,
+            last_rect: None,
+            visible: false,
         })
     }
 
@@ -86,38 +84,36 @@ impl OverlayWindow {
         self.hinstance
     }
 
-    /// Synchronizes overlay bounds with the owner's client area in native physical pixels.
+    /// Synchronizes overlay bounds with the owner's client area.
     /// Returns `Some((width, height))` if visible and drawable, or `None` if hidden/minimized.
     pub fn sync_to_owner(&mut self) -> Result<Option<(u32, u32)>, String> {
-        with_per_monitor_dpi(|| {
-            let (x, y, target_w, target_h) = client_screen_rect(self.owner)?;
-            if unsafe { IsIconic(self.owner) }.as_bool()
-                || !unsafe { IsWindowVisible(self.owner) }.as_bool()
-                || target_w == 0
-                || target_h == 0
-            {
-                self.hide();
-                return Ok(None);
+        let (x, y, target_w, target_h) = client_screen_rect(self.owner)?;
+        if unsafe { IsIconic(self.owner) }.as_bool()
+            || !unsafe { IsWindowVisible(self.owner) }.as_bool()
+            || target_w == 0
+            || target_h == 0
+        {
+            self.hide();
+            return Ok(None);
+        }
+        let rect = (x, y, target_w, target_h);
+        if self.last_rect != Some(rect) || !self.visible {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    rect.0,
+                    rect.1,
+                    rect.2 as i32,
+                    rect.3 as i32,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+                );
             }
-            let rect = (x, y, target_w, target_h);
-            if self.last_rect != Some(rect) || !self.visible {
-                unsafe {
-                    let _ = SetWindowPos(
-                        self.hwnd,
-                        None,
-                        rect.0,
-                        rect.1,
-                        rect.2 as i32,
-                        rect.3 as i32,
-                        SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
-                    );
-                }
-                self.last_rect = Some(rect);
-                self.visible = true;
-            }
-            keep_present_on_top(self.owner, self.hwnd);
-            Ok(Some((target_w, target_h)))
-        })
+            self.last_rect = Some(rect);
+            self.visible = true;
+        }
+        keep_present_on_top(self.owner, self.hwnd);
+        Ok(Some((target_w, target_h)))
     }
 
     pub fn hide(&mut self) {
@@ -354,62 +350,6 @@ mod tests {
             let _ = DestroyWindow(overlay);
             let _ = DestroyWindow(popup);
             let _ = DestroyWindow(parent);
-        }
-    }
-
-    #[test]
-    fn overlay_uses_per_monitor_dpi_without_altering_owner_thread_dpi() {
-        use super::super::{with_per_monitor_dpi, with_window_dpi};
-        use super::OverlayWindow;
-        use windows::Win32::Foundation::RECT;
-        use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-
-        unsafe {
-            let owner = CreateWindowExW(
-                Default::default(),
-                w!("STATIC"),
-                w!("dpi-owner"),
-                WS_POPUP | WS_VISIBLE,
-                0,
-                0,
-                320,
-                240,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-
-            let mut owner_rc_before = RECT::default();
-            GetClientRect(owner, &mut owner_rc_before).unwrap();
-
-            let mut overlay = OverlayWindow::new(owner).unwrap();
-            let synced = overlay.sync_to_owner().unwrap().unwrap();
-            let expected_phys = with_per_monitor_dpi(|| {
-                let mut rc = RECT::default();
-                GetClientRect(owner, &mut rc).unwrap();
-                (rc.right as u32, rc.bottom as u32)
-            });
-            assert_eq!(synced, expected_phys);
-
-            // Calling thread DPI context must be restored after OverlayWindow::new & sync_to_owner.
-            let mut owner_rc_after = RECT::default();
-            GetClientRect(owner, &mut owner_rc_after).unwrap();
-            assert_eq!(owner_rc_after, owner_rc_before);
-
-            // Switching from PMv2 back into owner's DPI context must also recover owner's 96-DPI coords.
-            let recovered = with_per_monitor_dpi(|| {
-                with_window_dpi(owner, || {
-                    let mut rc = RECT::default();
-                    GetClientRect(owner, &mut rc).unwrap();
-                    rc
-                })
-            });
-            assert_eq!(recovered, owner_rc_before);
-
-            drop(overlay);
-            let _ = DestroyWindow(owner);
         }
     }
 }

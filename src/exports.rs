@@ -21,8 +21,9 @@ use windows::Win32::System::Threading::{
     EnterCriticalSection, InitializeCriticalSection, LeaveCriticalSection, CRITICAL_SECTION,
 };
 
-use crate::{clipper, compat, draw};
+use crate::{clipper, compat, draw, window};
 
+const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_THREAD_ATTACH: u32 = 2;
 
 #[unsafe(no_mangle)]
@@ -31,7 +32,10 @@ pub unsafe extern "system" fn DllMain(
     reason: u32,
     _reserved: *mut c_void,
 ) -> BOOL {
-    if reason == DLL_THREAD_ATTACH {
+    if reason == DLL_PROCESS_ATTACH {
+        // Must run before WinMain creates any HWND so host and overlay share one DPI space.
+        window::enable_dpi_awareness();
+    } else if reason == DLL_THREAD_ATTACH {
         compat::on_thread_attach();
     }
     BOOL(1)
