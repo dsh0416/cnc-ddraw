@@ -1,12 +1,10 @@
 //! DirectDraw clipper implementation backed by Win32 GDI regions.
 #![allow(non_snake_case)]
 
-use std::ffi::c_void;
-use std::mem::{size_of, MaybeUninit};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use crate::window::{client_rect, is_window};
 use windows::core::{implement, Interface, Owned, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_POINTER, HWND, RECT};
 use windows::Win32::Graphics::DirectDraw::{
@@ -18,6 +16,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use crate::draw::DisplayShared;
+use crate::ffi::ptr as ffi_ptr;
+use crate::win32::AtomicHwnd;
+use crate::window::{client_rect, is_window};
 
 const fn dd_hresult(code: u32) -> HRESULT {
     HRESULT((0x8876_0000 | code) as i32)
@@ -33,11 +34,12 @@ struct OwnedRgn(Owned<HRGN>);
 
 impl OwnedRgn {
     fn from_rect(rect: &RECT) -> Option<Self> {
+        // SAFETY: `rect` is a valid shared reference to a Win32 RECT.
         let rgn = unsafe { CreateRectRgnIndirect(rect) };
         if rgn.is_invalid() {
             None
         } else {
-            // SAFETY: CreateRectRgnIndirect returned a new region for this owner.
+            // SAFETY: CreateRectRgnIndirect returned a new region owned exclusively by `Owned`.
             Some(Self(unsafe { Owned::new(rgn) }))
         }
     }
@@ -48,6 +50,7 @@ impl OwnedRgn {
 
     fn intersect(&self, bounds: &RECT) -> Result<Self> {
         let clipped = Self::from_rect(bounds).ok_or(E_INVALIDARG)?;
+        // SAFETY: Both `self` and `clipped` hold valid live GDI region handles.
         let kind = unsafe {
             CombineRgn(
                 Some(clipped.handle()),
@@ -63,6 +66,7 @@ impl OwnedRgn {
     }
 
     fn data_size(&self) -> u32 {
+        // SAFETY: Passing `None` with size 0 queries the required RGNDATA byte length.
         unsafe { GetRegionData(self.handle(), 0, None) }
     }
 
@@ -80,7 +84,7 @@ impl OwnedRgn {
         }
         let mut data = vec![RECT::default(); (size as usize).div_ceil(size_of::<RECT>())];
         // SAFETY: The live region cannot change during this query. The buffer
-        // holds at least size bytes, and RECT accepts every integer bit pattern.
+        // holds at least `size` bytes, and `RECT` accepts every integer bit pattern.
         let written =
             unsafe { GetRegionData(self.handle(), size, Some(data.as_mut_ptr().cast())) } as usize;
         if written > size as usize || written < size_of::<RGNDATAHEADER>() {
@@ -94,14 +98,15 @@ impl OwnedRgn {
 
     /// # Safety
     /// The SDK caller supplies a readable header. For valid dimensions the
-    /// allocation must also contain nCount initialized RECTs at dwSize.
+    /// allocation must also contain `nCount` initialized `RECT`s at `dwSize`.
     unsafe fn from_clip_list(list: *const RGNDATA) -> Result<Self> {
         // The variable-length header may place rectangles at an unaligned offset.
         #[repr(C, packed)]
         struct PackedRect(RECT);
 
         let header = list.cast::<RGNDATAHEADER>();
-        // Ignore unused header members, which legacy clients can leave uninitialized.
+        // SAFETY: Caller supplies a readable `RGNDATAHEADER`; only `dwSize` and `nCount` are read
+        // via unaligned loads so uninitialized legacy fields are never touched.
         let (offset, count) = unsafe {
             (
                 (&raw const (*header).dwSize).read_unaligned() as usize,
@@ -114,7 +119,7 @@ impl OwnedRgn {
         {
             return Err(DDERR_INVALIDCLIPLIST.into());
         }
-        // SAFETY: The caller provides the payload and PackedRect has byte alignment.
+        // SAFETY: The caller provides `count` initialized rects at `offset`; `PackedRect` has align 1.
         let rects = unsafe {
             std::slice::from_raw_parts(list.cast::<u8>().add(offset).cast::<PackedRect>(), count)
         };
@@ -123,6 +128,7 @@ impl OwnedRgn {
         for packed in &rects[1..] {
             let rect = packed.0;
             let next = Self::from_rect(&rect).ok_or(DDERR_INVALIDCLIPLIST)?;
+            // SAFETY: Both `combined` and `next` are valid live GDI regions.
             let kind = unsafe {
                 CombineRgn(
                     Some(combined.handle()),
@@ -141,7 +147,7 @@ impl OwnedRgn {
 
 #[implement(IDirectDrawClipper, Agile = false)]
 pub struct Clipper {
-    hwnd: AtomicIsize,
+    hwnd: AtomicHwnd,
     region: Mutex<Option<OwnedRgn>>,
     display: Option<Weak<DisplayShared>>,
     initialized: AtomicBool,
@@ -155,7 +161,7 @@ pub fn create_clipper(
         return Err(E_INVALIDARG.into());
     }
     Ok(Clipper {
-        hwnd: AtomicIsize::new(0),
+        hwnd: AtomicHwnd::new(),
         region: Mutex::new(None),
         display: display.map(|d| Arc::downgrade(&d)),
         initialized: AtomicBool::new(true),
@@ -165,7 +171,7 @@ pub fn create_clipper(
 
 pub fn create_uninitialized_clipper() -> IDirectDrawClipper {
     Clipper {
-        hwnd: AtomicIsize::new(0),
+        hwnd: AtomicHwnd::new(),
         region: Mutex::new(None),
         display: None,
         initialized: AtomicBool::new(false),
@@ -175,7 +181,7 @@ pub fn create_uninitialized_clipper() -> IDirectDrawClipper {
 
 impl Clipper {
     fn current_hwnd(&self) -> HWND {
-        HWND(self.hwnd.load(Ordering::Acquire) as *mut c_void)
+        self.hwnd.load().unwrap_or_default()
     }
 
     fn hwnd_region(&self) -> Option<OwnedRgn> {
@@ -227,7 +233,8 @@ pub fn clip_rects(clipper: &IDirectDrawClipper, bounds: RECT) -> Result<Option<V
 
 impl IDirectDrawClipper_Impl for Clipper_Impl {
     fn GetClipList(&self, rect: *mut RECT, clip_list: *mut RGNDATA, size: *mut u32) -> Result<()> {
-        let size = unsafe { size.cast::<MaybeUninit<u32>>().as_mut() }.ok_or(E_INVALIDARG)?;
+        // SAFETY: Caller supplies a writable `u32` size slot (and initialized input when `clip_list` is non-null).
+        let size = unsafe { ffi_ptr::out_slot(size, E_INVALIDARG)? };
         let manual = self.region.lock().unwrap_or_else(|e| e.into_inner());
         let hwnd_rgn = if manual.is_none() {
             self.hwnd_region()
@@ -239,7 +246,8 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
             .or(hwnd_rgn.as_ref())
             .ok_or(DDERR_NOCLIPLIST)?;
 
-        let clipped = unsafe { rect.as_ref() }
+        // SAFETY: Caller passes nullable readable bounds `RECT`.
+        let clipped = unsafe { ffi_ptr::opt_ref(rect) }
             .map(|bounds| base_rgn.intersect(bounds))
             .transpose()?;
         let effective = clipped.as_ref().unwrap_or(base_rgn);
@@ -253,7 +261,7 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
             return Ok(());
         }
 
-        // When a buffer is supplied, size is an initialized input capacity as well as an output.
+        // SAFETY: When `clip_list` is non-null, `*size` holds its initialized byte capacity per COM GetClipList.
         let written =
             unsafe { GetRegionData(effective.handle(), size.assume_init(), Some(clip_list)) };
         if written == 0 {
@@ -266,11 +274,8 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
     }
 
     fn GetHWnd(&self, out: *mut HWND) -> Result<()> {
-        if out.is_null() {
-            return Err(E_INVALIDARG.into());
-        }
-        unsafe { out.write(self.current_hwnd()) };
-        Ok(())
+        // SAFETY: Caller supplies a writable `HWND` output slot.
+        unsafe { ffi_ptr::write_out(out, self.current_hwnd(), E_INVALIDARG) }
     }
 
     fn Initialize(&self, _: Ref<IDirectDraw>, flags: u32) -> Result<()> {
@@ -285,11 +290,8 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
     }
 
     fn IsClipListChanged(&self, out: *mut BOOL) -> Result<()> {
-        if out.is_null() {
-            return Err(E_POINTER.into());
-        }
-        unsafe { out.write(BOOL(0)) };
-        Ok(())
+        // SAFETY: Caller supplies a writable `BOOL` output slot.
+        unsafe { ffi_ptr::write_out(out, BOOL(0), E_POINTER) }
     }
 
     fn SetClipList(&self, clip_list: *mut RGNDATA, flags: u32) -> Result<()> {
@@ -316,7 +318,7 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
         if !hwnd.is_invalid() && !is_window(hwnd) {
             return Err(E_INVALIDARG.into());
         }
-        self.hwnd.store(hwnd.0 as isize, Ordering::Release);
+        self.hwnd.store((!hwnd.is_invalid()).then_some(hwnd));
         if !hwnd.is_invalid() {
             *self.region.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
@@ -327,6 +329,7 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::MaybeUninit;
     use windows::Win32::Graphics::Gdi::RDH_RECTANGLES;
 
     #[repr(C)]
@@ -360,6 +363,7 @@ mod tests {
             rect: bounds,
         };
         let clipper = create_clipper(0, None).unwrap();
+        // SAFETY: Passing stack-allocated valid `ExtendedRegion` and writable `size` slot.
         unsafe {
             clipper.SetClipList((&raw mut data).cast(), 0).unwrap();
             let mut size = MaybeUninit::uninit();
@@ -417,6 +421,7 @@ mod tests {
                 },
             ],
         };
+        // SAFETY: Passing stack-allocated valid `TwoRectRgn` matching `nCount == 2`.
         unsafe {
             clipper
                 .SetClipList((&raw const data).cast::<RGNDATA>().cast_mut(), 0)

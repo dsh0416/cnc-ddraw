@@ -80,6 +80,7 @@ impl SurfaceDc {
             Format::Xrgb => {}
         }
         let mut dc = Self {
+            // SAFETY: Passing None creates a memory DC compatible with the screen.
             handle: unsafe { CreateCompatibleDC(None) },
             bitmap: HBITMAP::default(),
             previous: HGDIOBJ::default(),
@@ -92,6 +93,8 @@ impl SurfaceDc {
         if dc.handle.is_invalid() {
             return Err(DDERR_CANTCREATEDC.into());
         }
+        // SAFETY: `info` is a valid `BITMAPINFOHEADER` + color table/bitfields; `dc.handle` is a
+        // valid memory DC; `CreateDIBSection` initializes `dc.bits` with `byte_len` writable bytes.
         unsafe {
             dc.bitmap = CreateDIBSection(
                 Some(dc.handle),
@@ -135,6 +138,7 @@ impl SurfaceDc {
         let saved_state = if own_dc {
             0
         } else {
+            // SAFETY: `self.handle` is a valid memory DC owned by `self`.
             unsafe { SaveDC(self.handle) }
         };
         (self.handle, saved_state)
@@ -147,14 +151,14 @@ impl SurfaceDc {
         uniqueness: u32,
         saved_state: i32,
     ) {
-        // GDI queues draws on the calling thread; finish them before copying back.
+        // SAFETY: Flush queued GDI draws on this thread and restore DC state if saved.
         unsafe {
             let _ = GdiFlush();
             if saved_state != 0 {
                 let _ = RestoreDC(self.handle, saved_state);
             }
         }
-        // SAFETY: the caller has finished drawing and flushed GDI, and the DIB is live.
+        // SAFETY: The caller has finished drawing and flushed GDI, and the DIB is live.
         let bits = unsafe { std::slice::from_raw_parts(self.bits.cast::<u8>(), self.byte_len) };
         copy_rows(bits, self.pitch, pixels, pitch, self.row_bytes);
         self.synced_uniqueness = uniqueness;
@@ -167,6 +171,7 @@ impl SurfaceDc {
             q.rgbGreen = e.peGreen;
             q.rgbRed = e.peRed;
         }
+        // SAFETY: `self.handle` has an 8-bit DIB selected and `quads` has 256 initialized entries.
         unsafe {
             let _ = SetDIBColorTable(self.handle, 0, &quads);
         }
@@ -188,6 +193,7 @@ fn copy_rows(src: &[u8], src_pitch: usize, dst: &mut [u8], dst_pitch: usize, row
 
 impl Drop for SurfaceDc {
     fn drop(&mut self) {
+        // SAFETY: Restores the original bitmap before deleting the memory DC and DIB section.
         unsafe {
             if !self.previous.is_invalid() {
                 let _ = SelectObject(self.handle, self.previous);

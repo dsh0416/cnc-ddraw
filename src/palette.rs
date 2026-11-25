@@ -8,6 +8,7 @@ use windows::Win32::Graphics::DirectDraw::{
 use windows::Win32::Graphics::Gdi::PALETTEENTRY;
 
 use crate::draw::DisplayShared;
+use crate::ffi::ptr as ffi_ptr;
 
 #[implement(IDirectDrawPalette, Agile = false)]
 struct Palette {
@@ -31,7 +32,9 @@ pub unsafe fn create_palette(
     if flags & DDPCAPS_8BIT as u32 == 0 || flags & !allowed != 0 {
         return Err(E_NOTIMPL.into());
     }
-    let mut colors = *unsafe { entries.cast::<[PALETTEENTRY; 256]>().as_ref() }.ok_or(E_POINTER)?;
+    // SAFETY: Caller guarantees `entries` addresses 256 initialized `PALETTEENTRY` items when non-null.
+    let mut colors =
+        *unsafe { ffi_ptr::req_ref(entries.cast::<[PALETTEENTRY; 256]>(), E_POINTER)? };
     preserve_endpoints(flags, &mut colors);
     Ok(Palette {
         flags,
@@ -78,11 +81,8 @@ fn range(flags: u32, start: u32, count: u32) -> Result<std::ops::Range<usize>> {
 
 impl IDirectDrawPalette_Impl for Palette_Impl {
     fn GetCaps(&self, out: *mut u32) -> Result<()> {
-        if out.is_null() {
-            return Err(E_POINTER.into());
-        }
-        unsafe { out.write(self.flags) };
-        Ok(())
+        // SAFETY: Caller supplies a writable `u32` output slot per COM GetCaps.
+        unsafe { ffi_ptr::write_out(out, self.flags, E_POINTER) }
     }
 
     fn GetEntries(&self, flags: u32, start: u32, count: u32, out: *mut PALETTEENTRY) -> Result<()> {
@@ -94,6 +94,7 @@ impl IDirectDrawPalette_Impl for Palette_Impl {
             return Err(E_POINTER.into());
         }
         let colors = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `out` is non-null and writable for `count` `PALETTEENTRY` items; `range()` bounds `span`.
         unsafe { std::ptr::copy_nonoverlapping(colors[span].as_ptr(), out, count as usize) };
         Ok(())
     }

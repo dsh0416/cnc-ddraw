@@ -189,6 +189,8 @@ impl Renderer {
         raw.hinstance = Some(overlay.hinstance());
 
         let instance = wgpu::Instance::new(&instance_descriptor());
+        // SAFETY: `overlay` owns the Win32 presentation HWND and is declared after `surface`
+        // in `Renderer`, so `surface` is always dropped before `overlay` destroys the window.
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
                 raw_window_handle: raw.into(),

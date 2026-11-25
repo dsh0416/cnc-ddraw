@@ -2077,8 +2077,8 @@ mod tests {
             dwSize: size_of::<DDSURFACEDESC>() as u32,
             ..Default::default()
         };
-        // SAFETY: Valid COM Lock call with initialized `dwSize`.
         assert_eq!(
+            // SAFETY: Valid COM Lock call with initialized `dwSize`.
             unsafe {
                 primary.Lock(
                     std::ptr::null_mut(),

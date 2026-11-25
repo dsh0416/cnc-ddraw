@@ -86,6 +86,7 @@ pub extern "C" fn DDIsWindowed() -> BOOL {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DDGetProcAddress(module: HMODULE, proc_name: PCSTR) -> FARPROC {
+    // SAFETY: Forwarding caller's module handle and procedure name/ordinal to Win32 GetProcAddress.
     unsafe { GetProcAddress(module, proc_name) }
 }
 
@@ -115,6 +116,7 @@ impl IClassFactory_Impl for ClassFactory_Impl {
         if out.is_null() || riid.is_null() {
             return Err(E_POINTER.into());
         }
+        // SAFETY: Caller passes a writable interface pointer slot per IClassFactory::CreateInstance.
         unsafe { out.write(ptr::null_mut()) };
         if !outer.is_null() {
             return Err(CLASS_E_NOAGGREGATION.into());
@@ -123,6 +125,7 @@ impl IClassFactory_Impl for ClassFactory_Impl {
             FactoryClass::DirectDraw => draw::create_uninitialized_draw()?.cast()?,
             FactoryClass::DirectDrawClipper => clipper::create_uninitialized_clipper().cast()?,
         };
+        // SAFETY: `unk` is live, `riid` is readable, and `out` is a writable interface slot.
         unsafe { unk.query(riid, out).ok() }
     }
 
