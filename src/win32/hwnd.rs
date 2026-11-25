@@ -18,6 +18,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub(crate) type SafeWndProc = fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
 
+/// Opaque Win32 `HWND` wrapper that implements `Send + Sync` so higher-level window state
+/// structs do not need broad `unsafe impl Send`.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SendHwnd(pub(crate) HWND);
+
+// SAFETY: A Win32 `HWND` is an opaque kernel handle integer, not a Rust pointer/reference.
+// All Win32 operations on it are synchronized by our owning locks or dispatched on the UI thread.
+unsafe impl Send for SendHwnd {}
+// SAFETY: Sharing an opaque `HWND` value across threads carries no Rust aliasing hazard.
+unsafe impl Sync for SendHwnd {}
+
+impl SendHwnd {
+    pub(crate) fn get(self) -> HWND {
+        self.0
+    }
+}
+
 pub(crate) fn desktop_window() -> HWND {
     // SAFETY: GetDesktopWindow takes no arguments.
     unsafe { GetDesktopWindow() }

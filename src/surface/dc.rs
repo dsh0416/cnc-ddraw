@@ -2,7 +2,7 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 
-use super::{Format, SurfaceData, DDERR_CANTCREATEDC};
+use super::model::{Format, SurfaceData, DDERR_CANTCREATEDC};
 use crate::simd_blit;
 use windows::core::Result;
 use windows::Win32::Foundation::E_OUTOFMEMORY;
@@ -19,6 +19,16 @@ struct DibInfo {
     table: [u32; 256],
 }
 
+/// Opaque GDI `HDC` wrapper implementing `Send + Sync` so `SurfaceData` and `SurfaceSlot`
+/// automatically derive thread-safety without broad `unsafe impl Send/Sync`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct SendHdc(pub(super) HDC);
+
+// SAFETY: A GDI `HDC` is an opaque handle; concurrent access is serialized by `SurfaceSlot`'s Mutex.
+unsafe impl Send for SendHdc {}
+// SAFETY: Sharing an opaque `HDC` identifier across threads carries no Rust aliasing hazard.
+unsafe impl Sync for SendHdc {}
+
 pub(super) struct SurfaceDc {
     handle: HDC,
     bitmap: HBITMAP,
@@ -29,6 +39,10 @@ pub(super) struct SurfaceDc {
     byte_len: usize,
     synced_uniqueness: u32,
 }
+
+// SAFETY: `SurfaceDc` exclusively owns its memory DC, DIB bitmap, and DIB section memory.
+// It is accessed strictly under `SurfaceSlot`'s Mutex outside active GDI drawing intervals.
+unsafe impl Send for SurfaceDc {}
 
 impl SurfaceDc {
     pub(super) fn new(surface: &SurfaceData) -> Result<Self> {

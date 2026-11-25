@@ -1,11 +1,12 @@
 //! HWND geometry, monitor, and cursor queries with Rust-owned output storage.
 use std::mem::size_of;
 
-use windows::core::Result;
+use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, GetMonitorInfoW, MapWindowPoints, MonitorFromWindow, ScreenToClient,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    ClientToScreen, EnumDisplaySettingsW, GetMonitorInfoW, MapWindowPoints, MonitorFromWindow,
+    ScreenToClient, DEVMODEW, ENUM_CURRENT_SETTINGS, MONITORINFO, MONITORINFOEXW,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetCapture;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -114,4 +115,32 @@ pub(crate) fn window_from_point(pt: POINT) -> HWND {
 pub(crate) fn get_capture() -> HWND {
     // SAFETY: GetCapture takes no arguments.
     unsafe { GetCapture() }
+}
+
+/// Queries the current display refresh rate (Hz) of the monitor hosting `hwnd` (or primary monitor).
+pub(crate) fn monitor_refresh_hz(hwnd: HWND) -> Option<u32> {
+    let mut mode = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let mut monitor = MONITORINFOEXW::default();
+    let device_name = if hwnd.is_invalid() {
+        PCWSTR::null()
+    } else {
+        monitor.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: `cbSize` is initialized and `monitorInfo` is the leading field of `MONITORINFOEXW`.
+        unsafe {
+            GetMonitorInfoW(
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                &mut monitor.monitorInfo,
+            )
+            .ok()
+            .ok()?;
+        }
+        PCWSTR(monitor.szDevice.as_ptr())
+    };
+    // SAFETY: `device_name` is NULL or points into the NUL-terminated `monitor.szDevice`, and
+    // `mode.dmSize` is initialized.
+    let ok = unsafe { EnumDisplaySettingsW(device_name, ENUM_CURRENT_SETTINGS, &mut mode) };
+    (ok.as_bool() && mode.dmDisplayFrequency > 1).then_some(mode.dmDisplayFrequency)
 }

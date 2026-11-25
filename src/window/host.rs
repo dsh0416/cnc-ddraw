@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::win32::geometry::{adjust_window_rect_ex, is_window, monitor_info, window_rect};
 use crate::win32::hwnd::{
     ex_style, set_window_long, set_window_placement, set_window_pos, style, window_placement,
+    SendHwnd,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +26,7 @@ pub enum PresentationMode {
 
 #[derive(Clone, Copy)]
 pub struct HostWindow {
-    hwnd: HWND,
+    hwnd: SendHwnd,
     placement: WINDOWPLACEMENT,
     orig_style: i32,
     orig_ex_style: i32,
@@ -48,7 +49,7 @@ impl HostWindow {
         }
         let placement = window_placement(hwnd)?;
         let mut host = Self {
-            hwnd,
+            hwnd: SendHwnd(hwnd),
             placement,
             orig_style,
             orig_ex_style: ex_style(hwnd),
@@ -83,7 +84,7 @@ impl HostWindow {
                 self.mode = PresentationMode::Windowed;
             }
             PresentationMode::Windowed => {
-                if let Some(rc) = window_rect(self.hwnd)
+                if let Some(rc) = window_rect(self.hwnd.get())
                     .ok()
                     .filter(|r| r.right > r.left && r.bottom > r.top)
                 {
@@ -110,22 +111,23 @@ impl HostWindow {
     }
 
     fn apply_borderless_fullscreen(&self) -> Result<()> {
-        let info = monitor_info(self.hwnd)?;
+        let hwnd = self.hwnd.get();
+        let info = monitor_info(hwnd)?;
         let rect = info.rcMonitor;
         let edge_styles =
             WS_EX_CLIENTEDGE.0 | WS_EX_WINDOWEDGE.0 | WS_EX_DLGMODALFRAME.0 | WS_EX_STATICEDGE.0;
         set_window_long(
-            self.hwnd,
+            hwnd,
             GWL_STYLE,
             ((self.orig_style as u32 & !WS_OVERLAPPEDWINDOW.0) | WS_POPUP.0) as i32,
         )?;
         set_window_long(
-            self.hwnd,
+            hwnd,
             GWL_EXSTYLE,
             (self.orig_ex_style as u32 & !edge_styles) as i32,
         )?;
         set_window_pos(
-            self.hwnd,
+            hwnd,
             None,
             rect.left,
             rect.top,
@@ -136,7 +138,8 @@ impl HostWindow {
     }
 
     fn apply_windowed(&mut self, logical_w: u32, logical_h: u32, cfg: &Config) -> Result<()> {
-        let info = monitor_info(self.hwnd)?;
+        let hwnd = self.hwnd.get();
+        let info = monitor_info(hwnd)?;
         let work = info.rcWork;
         let mut next_style = (self.orig_style as u32) & !(WS_POPUP.0 | WS_OVERLAPPEDWINDOW.0);
         if cfg.border {
@@ -148,8 +151,8 @@ impl HostWindow {
             next_style |= WS_POPUP.0;
         }
         let next_ex_style = self.orig_ex_style as u32;
-        set_window_long(self.hwnd, GWL_STYLE, next_style as i32)?;
-        set_window_long(self.hwnd, GWL_EXSTYLE, next_ex_style as i32)?;
+        set_window_long(hwnd, GWL_STYLE, next_style as i32)?;
+        set_window_long(hwnd, GWL_EXSTYLE, next_ex_style as i32)?;
 
         let (x, y, win_w, win_h) = if let Some(rc) = self.saved_windowed_rect {
             (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top)
@@ -186,7 +189,7 @@ impl HostWindow {
         };
 
         set_window_pos(
-            self.hwnd,
+            hwnd,
             None,
             x,
             y,
@@ -197,14 +200,15 @@ impl HostWindow {
     }
 
     pub fn restore(self) -> Result<()> {
-        if !is_window(self.hwnd) {
+        let hwnd = self.hwnd.get();
+        if !is_window(hwnd) {
             return Ok(());
         }
-        set_window_long(self.hwnd, GWL_STYLE, self.orig_style)?;
-        set_window_long(self.hwnd, GWL_EXSTYLE, self.orig_ex_style)?;
-        set_window_placement(self.hwnd, &self.placement)?;
+        set_window_long(hwnd, GWL_STYLE, self.orig_style)?;
+        set_window_long(hwnd, GWL_EXSTYLE, self.orig_ex_style)?;
+        set_window_placement(hwnd, &self.placement)?;
         set_window_pos(
-            self.hwnd,
+            hwnd,
             None,
             0,
             0,

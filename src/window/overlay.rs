@@ -15,15 +15,15 @@ use crate::win32::current_module_handle;
 use crate::win32::geometry::{client_rect, client_to_screen, is_window};
 use crate::win32::hwnd::{
     create_window_ex_w, destroy_window, ex_style, foreground_window, is_iconic, is_visible,
-    prev_siblings, register_overlay_class, set_window_pos,
+    prev_siblings, register_overlay_class, set_window_pos, SendHwnd,
 };
 
 use super::input::{is_related_dialog_window, is_same_process_window, present_wndproc};
 use super::{clear_present_hwnd, present_hwnd, set_present_hwnd};
 
 pub struct OverlayWindow {
-    owner: HWND,
-    hwnd: HWND,
+    owner: SendHwnd,
+    hwnd: SendHwnd,
     hinstance: NonZeroIsize,
     last_rect: Option<(i32, i32, u32, u32)>,
     visible: bool,
@@ -55,8 +55,8 @@ impl OverlayWindow {
         let hinst_nz = NonZeroIsize::new(module.0 as isize)
             .ok_or_else(|| "invalid module handle".to_string())?;
         Ok(Self {
-            owner,
-            hwnd,
+            owner: SendHwnd(owner),
+            hwnd: SendHwnd(hwnd),
             hinstance: hinst_nz,
             last_rect: None,
             visible: false,
@@ -64,7 +64,7 @@ impl OverlayWindow {
     }
 
     pub fn raw_handle(&self) -> Result<NonZeroIsize, String> {
-        NonZeroIsize::new(self.hwnd.0 as isize)
+        NonZeroIsize::new(self.hwnd.get().0 as isize)
             .ok_or_else(|| "invalid presentation window handle".to_string())
     }
 
@@ -75,15 +75,17 @@ impl OverlayWindow {
     /// Synchronizes overlay bounds with the owner's client area.
     /// Returns `Some((width, height))` if visible and drawable, or `None` if hidden/minimized.
     pub fn sync_to_owner(&mut self) -> Result<Option<(u32, u32)>, String> {
-        let (x, y, target_w, target_h) = client_screen_rect(self.owner)?;
-        if is_iconic(self.owner) || !is_visible(self.owner) || target_w == 0 || target_h == 0 {
+        let owner = self.owner.get();
+        let hwnd = self.hwnd.get();
+        let (x, y, target_w, target_h) = client_screen_rect(owner)?;
+        if is_iconic(owner) || !is_visible(owner) || target_w == 0 || target_h == 0 {
             self.hide();
             return Ok(None);
         }
         let rect = (x, y, target_w, target_h);
         if self.last_rect != Some(rect) || !self.visible {
             let _ = set_window_pos(
-                self.hwnd,
+                hwnd,
                 None,
                 rect.0,
                 rect.1,
@@ -94,14 +96,14 @@ impl OverlayWindow {
             self.last_rect = Some(rect);
             self.visible = true;
         }
-        keep_present_on_top(self.owner, self.hwnd);
+        keep_present_on_top(owner, hwnd);
         Ok(Some((target_w, target_h)))
     }
 
     pub fn hide(&mut self) {
         if self.visible {
             let _ = set_window_pos(
-                self.hwnd,
+                self.hwnd.get(),
                 None,
                 0,
                 0,
@@ -116,9 +118,10 @@ impl OverlayWindow {
 
 impl Drop for OverlayWindow {
     fn drop(&mut self) {
-        clear_present_hwnd(self.hwnd);
-        if is_window(self.hwnd) {
-            destroy_window(self.hwnd);
+        let hwnd = self.hwnd.get();
+        clear_present_hwnd(hwnd);
+        if is_window(hwnd) {
+            destroy_window(hwnd);
         }
     }
 }
