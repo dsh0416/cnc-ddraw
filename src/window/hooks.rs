@@ -1,144 +1,92 @@
-//! Thin Win32 hooking layer: PE32 IAT patching, host WndProc subclassing, and WH_GETMESSAGE.
-use std::ffi::{c_void, CStr};
+//! Thin Win32 ABI hook stubs, host WndProc subclassing, and WH_GETMESSAGE installation.
+//! All hook decision logic lives in `hook_logic` (`#![forbid(unsafe_code)]`) and PE32 IAT patching
+//! lives in `crate::win32::iat`.
+use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::Mutex;
 
 use windows::core::{BOOL, PCSTR};
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, GetDC, GetDeviceCaps, ReleaseDC, ScreenToClient, BITSPIXEL,
-    GET_DEVICE_CAPS_INDEX, HDC, HORZRES, LOGPIXELSX, LOGPIXELSY, VERTRES,
-};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient, HDC};
 use windows::Win32::System::LibraryLoader::{
-    FindResourceA, GetModuleHandleW, LoadResource, LockResource, SizeofResource,
+    FindResourceA, LoadResource, LockResource, SizeofResource,
 };
-use windows::Win32::System::Memory::{VirtualProtect, PAGE_PROTECTION_FLAGS, PAGE_READWRITE};
-use windows::Win32::UI::Input::KeyboardAndMouse::GetCapture;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CallNextHookEx, CallWindowProcA, CallWindowProcW, ClipCursor,
-    CreateDialogIndirectParamA, CreateDialogParamA, DefWindowProcA, DefWindowProcW,
-    DialogBoxIndirectParamA, DialogBoxParamA, GetClientRect, GetClipCursor, GetCursorPos,
-    GetDesktopWindow, GetSystemMetrics, GetWindowLongA, GetWindowLongW, GetWindowRect,
-    IsWindowUnicode, KillTimer, MoveWindow, SetCursorPos, SetWindowLongA, SetWindowLongW,
-    SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, DLGPROC, DLGTEMPLATE,
-    GWLP_WNDPROC, HHOOK, MSG, RT_DIALOG, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN,
-    SYSTEM_METRICS_INDEX, WH_GETMESSAGE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_MBUTTONDOWN, WM_MOUSEWHEEL, WM_MOVE, WM_NCACTIVATE, WM_RBUTTONDOWN, WM_SIZE, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WM_TIMER, WM_WINDOWPOSCHANGED, WNDPROC,
+    CallNextHookEx, CallWindowProcA, CallWindowProcW, CreateDialogIndirectParamA,
+    CreateDialogParamA, DialogBoxIndirectParamA, DialogBoxParamA, GetClientRect, GetClipCursor,
+    GetWindowLongA, GetWindowLongW, GetWindowRect, SetWindowLongA, SetWindowLongW,
+    SetWindowsHookExW, UnhookWindowsHookEx, DLGPROC, DLGTEMPLATE, GWLP_WNDPROC, HHOOK, MSG,
+    RT_DIALOG, WH_GETMESSAGE, WNDPROC,
 };
 
-use crate::config;
+use crate::win32::geometry::is_window;
+use crate::win32::hwnd::{def_window_proc_a, def_window_proc_w, is_unicode, kill_timer};
+use crate::win32::{device_caps, iat, system_dpi, system_metrics, AtomicHwnd};
 
 use super::dialog_template::FontPatch;
-use super::input::{
-    client_origin_in_bound, client_to_logical, hit_test_logical_child, is_mouse_message,
-    is_related_dialog_window, logical_to_client,
-};
-use super::overlay::ensure_present_on_top_if_active;
-use super::{
-    bound_hwnd_raw, is_present_hwnd, is_scaling_active, logical_mode, present_hwnd_raw,
-    FLUSH_TIMER_ID, WM_APP_FLUSH,
-};
-use crate::win32::geometry::{
-    client_to_screen, is_window, map_rect, screen_to_client, window_rect,
-};
+use super::hook_logic::{self, SubclassAction};
+use super::{bound_hwnd, FLUSH_TIMER_ID};
 
 static ORIG_WNDPROC: AtomicIsize = AtomicIsize::new(0);
-static SUBCLASSED_HWND: AtomicIsize = AtomicIsize::new(0);
+static SUBCLASSED_HWND: AtomicHwnd = AtomicHwnd::new();
 static SUBCLASSED_UNICODE: AtomicBool = AtomicBool::new(false);
 static GETMSG_HOOK: AtomicIsize = AtomicIsize::new(0);
 static ACTIVATE_PASSED: AtomicBool = AtomicBool::new(false);
 static ACTIVATEAPP_PASSED: AtomicBool = AtomicBool::new(false);
 
-struct PatchedSlot {
-    slot: usize,
-    original: usize,
-}
-
-static IAT_PATCHES: Mutex<Vec<PatchedSlot>> = Mutex::new(Vec::new());
-
 pub(crate) fn subclassed_hwnd() -> Option<HWND> {
-    let raw = SUBCLASSED_HWND.load(Ordering::Relaxed);
-    (raw != 0).then_some(HWND(raw as *mut c_void))
-}
-
-fn virtual_window_rect(hwnd: HWND, include_dialogs: bool) -> Option<RECT> {
-    let (bound, w, h, _) = logical_mode()?;
-    if hwnd == bound || hwnd == unsafe { GetDesktopWindow() } {
-        return Some(RECT {
-            left: 0,
-            top: 0,
-            right: w as i32,
-            bottom: h as i32,
-        });
-    }
-    if include_dialogs && is_related_dialog_window(bound, hwnd) {
-        return Some(map_rect(None, Some(bound), window_rect(hwnd).ok()?));
-    }
-    None
+    SUBCLASSED_HWND.load()
 }
 
 unsafe extern "system" fn hook_GetClientRect(hwnd: HWND, rect: *mut RECT) -> BOOL {
     if !rect.is_null() {
-        if let Some(value) = virtual_window_rect(hwnd, false) {
+        if let Some(value) = hook_logic::virtual_window_rect(hwnd, false) {
+            // SAFETY: Caller passed a non-null writable RECT pointer per Win32 GetClientRect.
             unsafe { rect.write(value) };
             return BOOL(1);
         }
     }
+    // SAFETY: Forwarding unchanged ABI arguments to Win32 GetClientRect.
     BOOL::from(unsafe { GetClientRect(hwnd, rect) }.is_ok())
 }
 
 unsafe extern "system" fn hook_GetWindowRect(hwnd: HWND, rect: *mut RECT) -> BOOL {
     if !rect.is_null() {
-        if let Some(value) = virtual_window_rect(hwnd, true) {
+        if let Some(value) = hook_logic::virtual_window_rect(hwnd, true) {
+            // SAFETY: Caller passed a non-null writable RECT pointer per Win32 GetWindowRect.
             unsafe { rect.write(value) };
             return BOOL(1);
         }
     }
+    // SAFETY: Forwarding unchanged ABI arguments to Win32 GetWindowRect.
     BOOL::from(unsafe { GetWindowRect(hwnd, rect) }.is_ok())
 }
 
 unsafe extern "system" fn hook_GetSystemMetrics(index: i32) -> i32 {
-    if let Some((_, w, h, _)) = logical_mode() {
-        if index == SM_CXSCREEN.0 {
-            return w as i32;
-        }
-        if index == SM_CYSCREEN.0 {
-            return h as i32;
-        }
-    }
-    unsafe { GetSystemMetrics(SYSTEM_METRICS_INDEX(index)) }
+    hook_logic::virtual_system_metrics(index).unwrap_or_else(|| system_metrics(index))
 }
 
 unsafe extern "system" fn hook_ClientToScreen(hwnd: HWND, pt: *mut POINT) -> BOOL {
     if !pt.is_null() {
-        if let Some((bound, _, _, _)) = logical_mode() {
-            if hwnd == bound {
-                return BOOL(1);
-            }
-            if is_related_dialog_window(bound, hwnd) {
-                let pt = unsafe { &mut *pt };
-                let ok = client_to_screen(hwnd, pt) && screen_to_client(bound, pt);
-                return BOOL::from(ok);
-            }
+        // SAFETY: Caller passed a valid, initialized mutable POINT per Win32 ClientToScreen.
+        let point = unsafe { &mut *pt };
+        if let Some(ok) = hook_logic::virtual_client_to_screen(hwnd, point) {
+            return BOOL::from(ok);
         }
     }
+    // SAFETY: Forwarding unchanged ABI arguments to Win32 ClientToScreen.
     unsafe { ClientToScreen(hwnd, pt) }
 }
 
 unsafe extern "system" fn hook_ScreenToClient(hwnd: HWND, pt: *mut POINT) -> BOOL {
     if !pt.is_null() {
-        if let Some((bound, _, _, _)) = logical_mode() {
-            if hwnd == bound {
-                return BOOL(1);
-            }
-            if is_related_dialog_window(bound, hwnd) {
-                let pt = unsafe { &mut *pt };
-                let ok = client_to_screen(bound, pt) && screen_to_client(hwnd, pt);
-                return BOOL::from(ok);
-            }
+        // SAFETY: Caller passed a valid, initialized mutable POINT per Win32 ScreenToClient.
+        let point = unsafe { &mut *pt };
+        if let Some(ok) = hook_logic::virtual_screen_to_client(hwnd, point) {
+            return BOOL::from(ok);
         }
     }
+    // SAFETY: Forwarding unchanged ABI arguments to Win32 ScreenToClient.
     unsafe { ScreenToClient(hwnd, pt) }
 }
 
@@ -146,84 +94,38 @@ unsafe extern "system" fn hook_GetCursorPos(pt: *mut POINT) -> BOOL {
     if pt.is_null() {
         return BOOL(0);
     }
-    let mut raw = POINT::default();
-    if unsafe { GetCursorPos(&mut raw) }.is_err() {
+    let Some(pos) = hook_logic::virtual_cursor_pos() else {
         return BOOL(0);
-    }
-    if let Some((bound, w, h, _)) = logical_mode() {
-        if screen_to_client(bound, &mut raw) {
-            let (lx, ly) = client_to_logical(bound, raw.x, raw.y, w, h);
-            raw = POINT { x: lx, y: ly };
-        }
-    }
-    unsafe { *pt = raw };
+    };
+    // SAFETY: Caller passed a non-null writable POINT pointer per Win32 GetCursorPos.
+    unsafe { pt.write(pos) };
     BOOL(1)
 }
 
 unsafe extern "system" fn hook_SetCursorPos(x: i32, y: i32) -> BOOL {
-    if let Some((bound, w, h, _)) = logical_mode() {
-        let (cx, cy) = logical_to_client(bound, x, y, w, h);
-        let mut pt = POINT { x: cx, y: cy };
-        if client_to_screen(bound, &mut pt) {
-            return BOOL::from(unsafe { SetCursorPos(pt.x, pt.y) }.is_ok());
-        }
-    }
-    BOOL::from(unsafe { SetCursorPos(x, y) }.is_ok())
+    BOOL::from(hook_logic::set_virtual_cursor_pos(x, y))
 }
 
 unsafe extern "system" fn hook_ClipCursor(rect: *const RECT) -> BOOL {
-    if let Some((bound, w, h, _)) = logical_mode() {
-        if let Some(r) = unsafe { rect.as_ref() } {
-            let (l, t) = logical_to_client(bound, r.left, r.top, w, h);
-            let (ri, b) = logical_to_client(
-                bound,
-                r.right.saturating_sub(1),
-                r.bottom.saturating_sub(1),
-                w,
-                h,
-            );
-            let mapped = map_rect(
-                Some(bound),
-                None,
-                RECT {
-                    left: l,
-                    top: t,
-                    right: ri + 1,
-                    bottom: b + 1,
-                },
-            );
-            return BOOL::from(unsafe { ClipCursor(Some(&mapped)) }.is_ok());
-        }
-    }
-    let opt = if rect.is_null() { None } else { Some(rect) };
-    BOOL::from(unsafe { ClipCursor(opt) }.is_ok())
+    // SAFETY: Caller passes either NULL or a valid readable RECT per Win32 ClipCursor.
+    let rect_ref = unsafe { rect.as_ref() };
+    BOOL::from(hook_logic::clip_virtual_cursor(rect_ref))
 }
 
 unsafe extern "system" fn hook_GetClipCursor(rect: *mut RECT) -> BOOL {
     if !rect.is_null() {
-        if let Some((_, w, h, _)) = logical_mode() {
-            unsafe {
-                *rect = RECT {
-                    left: 0,
-                    top: 0,
-                    right: w as i32,
-                    bottom: h as i32,
-                };
-            }
+        if let Some(value) = hook_logic::virtual_clip_cursor() {
+            // SAFETY: Caller passed a non-null writable RECT pointer per Win32 GetClipCursor.
+            unsafe { rect.write(value) };
             return BOOL(1);
         }
     }
+    // SAFETY: Forwarding unchanged ABI arguments to Win32 GetClipCursor.
     BOOL::from(unsafe { GetClipCursor(rect) }.is_ok())
 }
 
 unsafe extern "system" fn hook_WindowFromPoint(point: POINT) -> HWND {
-    if let Some((bound, _, _, _)) = logical_mode() {
-        if let Some(hit) = hit_test_logical_child(bound, point.x, point.y) {
-            return hit;
-        }
-        return bound;
-    }
-    unsafe { WindowFromPoint(point) }
+    hook_logic::virtual_window_from_point(point)
 }
 
 unsafe extern "system" fn hook_SetWindowPos(
@@ -235,37 +137,19 @@ unsafe extern "system" fn hook_SetWindowPos(
     cy: i32,
     flags: u32,
 ) -> BOOL {
-    if is_scaling_active() && hwnd.0 as isize == bound_hwnd_raw() {
-        return BOOL(1);
-    }
-    let ok = unsafe {
-        SetWindowPos(
-            hwnd,
-            Some(insert_after),
-            x,
-            y,
-            cx,
-            cy,
-            SET_WINDOW_POS_FLAGS(flags),
-        )
-    }
-    .is_ok();
-    if let Some((bound, _, _, _)) = logical_mode() {
-        if !is_present_hwnd(hwnd) && is_related_dialog_window(bound, hwnd) {
-            ensure_present_on_top_if_active(bound);
-        }
-    }
-    BOOL::from(ok)
+    BOOL::from(hook_logic::handle_set_window_pos(
+        hwnd,
+        insert_after,
+        x,
+        y,
+        cx,
+        cy,
+        flags,
+    ))
 }
 
 unsafe extern "system" fn hook_BringWindowToTop(hwnd: HWND) -> BOOL {
-    let ok = unsafe { BringWindowToTop(hwnd) }.is_ok();
-    if let Some((bound, _, _, _)) = logical_mode() {
-        if !is_present_hwnd(hwnd) && (hwnd == bound || is_related_dialog_window(bound, hwnd)) {
-            ensure_present_on_top_if_active(bound);
-        }
-    }
-    BOOL::from(ok)
+    BOOL::from(hook_logic::handle_bring_window_to_top(hwnd))
 }
 
 unsafe extern "system" fn hook_MoveWindow(
@@ -276,52 +160,25 @@ unsafe extern "system" fn hook_MoveWindow(
     height: i32,
     repaint: BOOL,
 ) -> BOOL {
-    if is_scaling_active() && hwnd.0 as isize == bound_hwnd_raw() {
-        return BOOL(1);
-    }
-    BOOL::from(unsafe { MoveWindow(hwnd, x, y, width, height, repaint.as_bool()) }.is_ok())
+    BOOL::from(hook_logic::handle_move_window(
+        hwnd,
+        x,
+        y,
+        width,
+        height,
+        repaint.as_bool(),
+    ))
 }
 
 unsafe extern "system" fn hook_GetDeviceCaps(hdc: HDC, index: i32) -> i32 {
-    if bound_hwnd_raw() != 0 && (index == LOGPIXELSX.0 as i32 || index == LOGPIXELSY.0 as i32) {
-        return 96;
-    }
-    if let Some((_, w, h, bpp)) = logical_mode() {
-        if index == BITSPIXEL.0 as i32 && bpp > 0 {
-            return bpp as i32;
-        }
-        if index == HORZRES.0 as i32 {
-            return w as i32;
-        }
-        if index == VERTRES.0 as i32 {
-            return h as i32;
-        }
-    }
-    unsafe { GetDeviceCaps(Some(hdc), GET_DEVICE_CAPS_INDEX(index as u32)) }
-}
-
-fn system_dpi() -> u32 {
-    unsafe {
-        let dc = GetDC(None);
-        let dpi = if !dc.is_invalid() {
-            let v = GetDeviceCaps(Some(dc), LOGPIXELSY);
-            let _ = ReleaseDC(None, dc);
-            v
-        } else {
-            96
-        };
-        if dpi > 0 {
-            dpi as u32
-        } else {
-            96
-        }
-    }
+    hook_logic::virtual_device_caps(index).unwrap_or_else(|| device_caps(hdc, index))
 }
 
 // Win32 requires a DWORD-aligned template. The indirect caller may leave padding
 // uninitialized, so copy it as raw storage and only read actual template fields.
-type DialogStorage = Vec<std::mem::MaybeUninit<u32>>;
+type DialogStorage = Vec<MaybeUninit<u32>>;
 
+/// # Safety
 /// The source must be readable through `len` bytes and `patch` must describe that source.
 unsafe fn copy_patched_template(
     src: *const u8,
@@ -331,9 +188,9 @@ unsafe fn copy_patched_template(
     let words = len.div_ceil(4);
     let mut out = DialogStorage::new();
     out.try_reserve_exact(words).ok()?;
-    out.resize_with(words, std::mem::MaybeUninit::uninit);
+    out.resize_with(words, MaybeUninit::uninit);
     let dst = out.as_mut_ptr().cast::<u8>();
-    // SAFETY: the destination spans at least len bytes, is freshly allocated,
+    // SAFETY: The destination spans at least `len` bytes, is freshly allocated,
     // and the parser located a full point-size word within the source.
     unsafe {
         std::ptr::copy_nonoverlapping(src, dst, len);
@@ -344,15 +201,18 @@ unsafe fn copy_patched_template(
     Some(out)
 }
 
-/// The module and resource identifier must satisfy the FindResourceA contract.
+/// # Safety
+/// The module and resource identifier must satisfy the `FindResourceA` contract.
 unsafe fn load_and_patch_dialog_resource(
     hinst: HINSTANCE,
     template_name: PCSTR,
 ) -> Option<DialogStorage> {
     let dpi = system_dpi();
-    if dpi <= 96 || bound_hwnd_raw() == 0 {
+    if dpi <= 96 || bound_hwnd().is_none() {
         return None;
     }
+    // SAFETY: Resource handles come from the caller's live module and `LockResource` returns
+    // `SizeofResource` initialized bytes valid for the duration of this call.
     unsafe {
         let hmod = if hinst.0.is_null() {
             None
@@ -369,26 +229,26 @@ unsafe fn load_and_patch_dialog_resource(
         if ptr.is_null() {
             return None;
         }
-        // LockResource returns SizeofResource initialized bytes, valid while
-        // the caller's module remains loaded for this call.
         let patch = FontPatch::from_bytes(std::slice::from_raw_parts(ptr, size), dpi)?;
         copy_patched_template(ptr, size, patch)
     }
 }
 
+/// # Safety
 /// Win32 passes no length. The indirect-dialog caller must supply one complete
-/// DLGTEMPLATE or DLGTEMPLATEEX that remains readable and stable during the call.
+/// `DLGTEMPLATE` or `DLGTEMPLATEEX` that remains readable and stable during the call.
 unsafe fn patch_dialog_indirect_ptr(tpl: *const DLGTEMPLATE) -> Option<DialogStorage> {
     let dpi = system_dpi();
-    if dpi <= 96 || bound_hwnd_raw() == 0 || tpl.is_null() {
+    if dpi <= 96 || bound_hwnd().is_none() || tpl.is_null() {
         return None;
     }
     let raw = tpl.cast::<u8>();
-    // SAFETY: the parser requests only initialized structural words at their
+    // SAFETY: The parser requests only initialized structural words at their
     // documented offsets in the caller's valid template, never alignment padding.
     let patch = FontPatch::parse(None, dpi, |offset| unsafe {
         raw.add(offset).cast::<u16>().read_unaligned()
     })?;
+    // SAFETY: `patch.len` was computed over the live template starting at `raw`.
     unsafe { copy_patched_template(raw, patch.len, patch) }
 }
 
@@ -399,7 +259,9 @@ unsafe extern "system" fn hook_CreateDialogParamA(
     dlg_proc: DLGPROC,
     init_param: LPARAM,
 ) -> HWND {
+    // SAFETY: Forwarding the caller's valid module and dialog resource identifier.
     if let Some(patched) = unsafe { load_and_patch_dialog_resource(hinst, template_name) } {
+        // SAFETY: `patched` is a DWORD-aligned, valid DLGTEMPLATE clone alive during the call.
         if let Ok(hwnd) = unsafe {
             CreateDialogIndirectParamA(
                 Some(hinst),
@@ -412,6 +274,7 @@ unsafe extern "system" fn hook_CreateDialogParamA(
             return hwnd;
         }
     }
+    // SAFETY: Forwarding unchanged ABI arguments to Win32 CreateDialogParamA.
     unsafe {
         CreateDialogParamA(
             Some(hinst),
@@ -431,7 +294,9 @@ unsafe extern "system" fn hook_CreateDialogIndirectParamA(
     dlg_proc: DLGPROC,
     init_param: LPARAM,
 ) -> HWND {
+    // SAFETY: Caller supplies a valid indirect dialog template per Win32 contract.
     if let Some(patched) = unsafe { patch_dialog_indirect_ptr(template) } {
+        // SAFETY: `patched` is a DWORD-aligned, valid DLGTEMPLATE clone alive during the call.
         if let Ok(hwnd) = unsafe {
             CreateDialogIndirectParamA(
                 Some(hinst),
@@ -444,6 +309,7 @@ unsafe extern "system" fn hook_CreateDialogIndirectParamA(
             return hwnd;
         }
     }
+    // SAFETY: Forwarding unchanged ABI arguments to Win32 CreateDialogIndirectParamA.
     unsafe { CreateDialogIndirectParamA(Some(hinst), template, Some(parent), dlg_proc, init_param) }
         .unwrap_or_default()
 }
@@ -455,7 +321,9 @@ unsafe extern "system" fn hook_DialogBoxParamA(
     dlg_proc: DLGPROC,
     init_param: LPARAM,
 ) -> isize {
+    // SAFETY: Forwarding the caller's valid module and dialog resource identifier.
     if let Some(patched) = unsafe { load_and_patch_dialog_resource(hinst, template_name) } {
+        // SAFETY: `patched` remains alive for the full modal lifetime of DialogBoxIndirectParamA.
         return unsafe {
             DialogBoxIndirectParamA(
                 Some(hinst),
@@ -466,6 +334,7 @@ unsafe extern "system" fn hook_DialogBoxParamA(
             )
         };
     }
+    // SAFETY: Forwarding unchanged ABI arguments to Win32 DialogBoxParamA.
     unsafe {
         DialogBoxParamA(
             Some(hinst),
@@ -484,7 +353,9 @@ unsafe extern "system" fn hook_DialogBoxIndirectParamA(
     dlg_proc: DLGPROC,
     init_param: LPARAM,
 ) -> isize {
+    // SAFETY: Caller supplies a valid indirect dialog template per Win32 contract.
     if let Some(patched) = unsafe { patch_dialog_indirect_ptr(template) } {
+        // SAFETY: `patched` remains alive for the full modal lifetime of DialogBoxIndirectParamA.
         return unsafe {
             DialogBoxIndirectParamA(
                 Some(hinst),
@@ -495,52 +366,18 @@ unsafe extern "system" fn hook_DialogBoxIndirectParamA(
             )
         };
     }
+    // SAFETY: Forwarding unchanged ABI arguments to Win32 DialogBoxIndirectParamA.
     unsafe { DialogBoxIndirectParamA(Some(hinst), template, Some(parent), dlg_proc, init_param) }
 }
 
 unsafe extern "system" fn getmsg_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && lparam.0 != 0 {
-        if let Some((bound, w, h, _)) = logical_mode() {
-            let msg = unsafe { &mut *(lparam.0 as *mut MSG) };
-            let is_bound = msg.hwnd == bound;
-            let is_dialog = is_related_dialog_window(bound, msg.hwnd);
-            if is_bound || is_dialog {
-                let mut cursor = POINT::default();
-                if unsafe { GetCursorPos(&mut cursor) }.is_ok()
-                    && screen_to_client(bound, &mut cursor)
-                {
-                    let (lx, ly) = client_to_logical(bound, cursor.x, cursor.y, w, h);
-                    msg.pt = POINT { x: lx, y: ly };
-                    if is_mouse_message(msg.message) {
-                        if matches!(
-                            msg.message,
-                            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN
-                        ) {
-                            ensure_present_on_top_if_active(bound);
-                        }
-                        let captured = unsafe { GetCapture() };
-                        let target = if captured == msg.hwnd || is_bound {
-                            msg.hwnd
-                        } else {
-                            hit_test_logical_child(bound, lx, ly).unwrap_or(bound)
-                        };
-                        msg.hwnd = target;
-                        if msg.message == WM_MOUSEWHEEL || target == bound {
-                            msg.lParam =
-                                LPARAM(((ly as u16 as u32) << 16 | (lx as u16 as u32)) as isize);
-                        } else {
-                            let (tx, ty) = client_origin_in_bound(bound, target);
-                            let cx = lx - tx;
-                            let cy = ly - ty;
-                            msg.lParam =
-                                LPARAM(((cy as u16 as u32) << 16 | (cx as u16 as u32)) as isize);
-                        }
-                    }
-                }
-            }
-        }
+        // SAFETY: For WH_GETMESSAGE with `code >= 0`, Win32 guarantees `lparam` points to a mutable MSG.
+        let msg = unsafe { &mut *(lparam.0 as *mut MSG) };
+        hook_logic::rewrite_getmsg(msg);
     }
     let hook = HHOOK(GETMSG_HOOK.load(Ordering::Relaxed) as *mut c_void);
+    // SAFETY: Forwarding to the next hook in the chain per WH_GETMESSAGE contract.
     unsafe { CallNextHookEx(Some(hook), code, wparam, lparam) }
 }
 
@@ -548,97 +385,36 @@ unsafe extern "system" fn subclass_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
-    mut lparam: LPARAM,
+    lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_APP_FLUSH {
-        crate::draw::flush_pending_present(false);
-        return LRESULT(0);
-    }
-    if msg == WM_TIMER && wparam.0 == FLUSH_TIMER_ID {
-        unsafe {
-            let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
-        }
-        crate::draw::flush_pending_present(true);
-        return LRESULT(0);
-    }
-    let toggle_vk = config::get().toggle_fullscreen_vk;
-    if toggle_vk != 0 {
-        let alt_down = (lparam.0 as u32) & (1 << 29) != 0;
-        let was_down = (lparam.0 as u32) & (1 << 30) != 0;
-        if msg == WM_SYSKEYDOWN && wparam.0 as u32 == toggle_vk && alt_down {
-            if !was_down {
-                crate::draw::toggle_fullscreen_hotkey();
-            }
-            return LRESULT(0);
-        }
-        if msg == WM_SYSCHAR && wparam.0 as u32 == toggle_vk && alt_down {
-            // Suppress default Windows Alt+Enter system beep.
-            return LRESULT(0);
-        }
-    }
-    let shield_focus = is_scaling_active()
-        && (config::get().noactivateapp || !crate::draw::is_fullscreen_active());
-    if shield_focus && matches!(msg, WM_KILLFOCUS | WM_NCACTIVATE) {
-        return if SUBCLASSED_UNICODE.load(Ordering::Relaxed) {
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        } else {
-            unsafe { DefWindowProcA(hwnd, msg, wparam, lparam) }
-        };
-    }
-    if msg == WM_ACTIVATE && shield_focus {
-        let active = (wparam.0 & 0xffff) != 0;
-        if !ACTIVATE_PASSED.swap(true, Ordering::Relaxed) && active {
-            // Allow the initial activation through once so the game initializes its focus flag.
-        } else {
-            return LRESULT(0);
-        }
-    }
-    if msg == WM_ACTIVATEAPP {
-        if wparam.0 == 0 {
-            unsafe {
-                let _ = ClipCursor(None);
-            }
-        } else {
-            crate::draw::on_host_window_changed();
-        }
-        if shield_focus {
-            if !ACTIVATEAPP_PASSED.swap(true, Ordering::Relaxed) && wparam.0 != 0 {
-                // Allow initial activation once.
+    let forwarded_lparam = match hook_logic::handle_subclass_message(
+        hwnd,
+        msg,
+        wparam,
+        lparam,
+        &ACTIVATE_PASSED,
+        &ACTIVATEAPP_PASSED,
+    ) {
+        SubclassAction::Return(res) => return res,
+        SubclassAction::DefWindowProc => {
+            return if SUBCLASSED_UNICODE.load(Ordering::Relaxed) {
+                def_window_proc_w(hwnd, msg, wparam, lparam)
             } else {
-                return LRESULT(0);
-            }
+                def_window_proc_a(hwnd, msg, wparam, lparam)
+            };
         }
-    }
-    if matches!(msg, WM_MOVE | WM_SIZE | WM_WINDOWPOSCHANGED) && hwnd.0 as isize == bound_hwnd_raw()
-    {
-        crate::draw::on_host_window_changed();
-    }
-    // Only remap physical coordinates on `bound` when no owned presentation overlay exists;
-    // when `PRESENT_HWND` is active, `present_wndproc` and `getmsg_hook` deliver logical coords.
-    if is_mouse_message(msg) && present_hwnd_raw() == 0 {
-        if let Some((bound, w, h, _)) = logical_mode() {
-            if hwnd == bound {
-                let raw = lparam.0 as u32;
-                let mut px = (raw & 0xffff) as i16 as i32;
-                let mut py = ((raw >> 16) & 0xffff) as i16 as i32;
-                if msg == WM_MOUSEWHEEL {
-                    let mut pt = POINT { x: px, y: py };
-                    if screen_to_client(bound, &mut pt) {
-                        px = pt.x;
-                        py = pt.y;
-                    }
-                }
-                let (lx, ly) = client_to_logical(bound, px, py, w, h);
-                lparam = LPARAM(((ly as u16 as u32) << 16 | (lx as u16 as u32)) as isize);
-            }
-        }
-    }
+        SubclassAction::Forward(lp) => lp,
+    };
     let prev_raw = ORIG_WNDPROC.load(Ordering::Relaxed);
+    // SAFETY: `prev_raw` was returned by `SetWindowLong(GWLP_WNDPROC)` for this window and
+    // is invoked through the matching Unicode/ANSI `CallWindowProc`.
     let prev: WNDPROC = unsafe { std::mem::transmute(prev_raw) };
     if SUBCLASSED_UNICODE.load(Ordering::Relaxed) {
-        unsafe { CallWindowProcW(prev, hwnd, msg, wparam, lparam) }
+        // SAFETY: Invoking the original window procedure with validated arguments.
+        unsafe { CallWindowProcW(prev, hwnd, msg, wparam, forwarded_lparam) }
     } else {
-        unsafe { CallWindowProcA(prev, hwnd, msg, wparam, lparam) }
+        // SAFETY: Invoking the original ANSI window procedure with validated arguments.
+        unsafe { CallWindowProcA(prev, hwnd, msg, wparam, forwarded_lparam) }
     }
 }
 
@@ -647,6 +423,7 @@ pub(crate) fn install_getmsg_hook(tid: u32) {
     if tid == 0 {
         return;
     }
+    // SAFETY: `getmsg_hook` matches `HOOKPROC` and runs on thread `tid` until unhooked.
     if let Ok(hook) = unsafe { SetWindowsHookExW(WH_GETMESSAGE, Some(getmsg_hook), None, tid) } {
         GETMSG_HOOK.store(hook.0 as isize, Ordering::Relaxed);
     }
@@ -655,6 +432,7 @@ pub(crate) fn install_getmsg_hook(tid: u32) {
 pub(crate) fn uninstall_getmsg_hook() {
     let raw = GETMSG_HOOK.swap(0, Ordering::Relaxed);
     if raw != 0 {
+        // SAFETY: `raw` was returned by `SetWindowsHookExW` and swapped out exclusively.
         unsafe {
             let _ = UnhookWindowsHookEx(HHOOK(raw as *mut c_void));
         }
@@ -666,108 +444,57 @@ pub(crate) fn install_subclass(hwnd: HWND) {
     if hwnd.is_invalid() || !is_window(hwnd) {
         return;
     }
-    let is_unicode = unsafe { IsWindowUnicode(hwnd) }.as_bool();
+    let unicode = is_unicode(hwnd);
     let new_proc = subclass_wndproc as *const () as usize as i32;
-    let prev = if is_unicode {
-        let cur = unsafe { GetWindowLongW(hwnd, GWLP_WNDPROC) };
-        if cur == new_proc || cur == 0 {
-            return;
+    // SAFETY: Replacing GWLP_WNDPROC with `subclass_wndproc` matching the window's encoding.
+    let prev = unsafe {
+        if unicode {
+            let cur = GetWindowLongW(hwnd, GWLP_WNDPROC);
+            if cur == new_proc || cur == 0 {
+                return;
+            }
+            SetWindowLongW(hwnd, GWLP_WNDPROC, new_proc)
+        } else {
+            let cur = GetWindowLongA(hwnd, GWLP_WNDPROC);
+            if cur == new_proc || cur == 0 {
+                return;
+            }
+            SetWindowLongA(hwnd, GWLP_WNDPROC, new_proc)
         }
-        unsafe { SetWindowLongW(hwnd, GWLP_WNDPROC, new_proc) }
-    } else {
-        let cur = unsafe { GetWindowLongA(hwnd, GWLP_WNDPROC) };
-        if cur == new_proc || cur == 0 {
-            return;
-        }
-        unsafe { SetWindowLongA(hwnd, GWLP_WNDPROC, new_proc) }
     };
     if prev != 0 {
         ORIG_WNDPROC.store(prev as isize, Ordering::Relaxed);
-        SUBCLASSED_UNICODE.store(is_unicode, Ordering::Relaxed);
-        SUBCLASSED_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+        SUBCLASSED_UNICODE.store(unicode, Ordering::Relaxed);
+        SUBCLASSED_HWND.store(Some(hwnd));
         ACTIVATE_PASSED.store(false, Ordering::Relaxed);
         ACTIVATEAPP_PASSED.store(false, Ordering::Relaxed);
     }
 }
 
 pub(crate) fn uninstall_subclass() {
-    let raw = SUBCLASSED_HWND.swap(0, Ordering::Relaxed);
+    let Some(hwnd) = SUBCLASSED_HWND.swap(None) else {
+        ORIG_WNDPROC.store(0, Ordering::Relaxed);
+        return;
+    };
     let prev = ORIG_WNDPROC.swap(0, Ordering::Relaxed);
-    if raw == 0 || prev == 0 {
+    if prev == 0 || !is_window(hwnd) {
         return;
     }
-    let hwnd = HWND(raw as *mut c_void);
-    if !is_window(hwnd) {
-        return;
-    }
-    unsafe {
-        let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
-    }
+    kill_timer(hwnd, FLUSH_TIMER_ID);
     let our_proc = subclass_wndproc as *const () as usize as i32;
-    if SUBCLASSED_UNICODE.load(Ordering::Relaxed) {
-        if unsafe { GetWindowLongW(hwnd, GWLP_WNDPROC) } == our_proc {
-            unsafe {
+    // SAFETY: Restores the original WNDPROC only if `subclass_wndproc` is still installed.
+    unsafe {
+        if SUBCLASSED_UNICODE.load(Ordering::Relaxed) {
+            if GetWindowLongW(hwnd, GWLP_WNDPROC) == our_proc {
                 let _ = SetWindowLongW(hwnd, GWLP_WNDPROC, prev as i32);
             }
-        }
-    } else if unsafe { GetWindowLongA(hwnd, GWLP_WNDPROC) } == our_proc {
-        unsafe {
+        } else if GetWindowLongA(hwnd, GWLP_WNDPROC) == our_proc {
             let _ = SetWindowLongA(hwnd, GWLP_WNDPROC, prev as i32);
         }
     }
 }
 
-#[repr(C)]
-struct DosHeader {
-    e_magic: u16,
-    _pad: [u8; 58],
-    e_lfanew: i32,
-}
-
-#[repr(C)]
-struct DataDirectory {
-    virtual_address: u32,
-    size: u32,
-}
-
-#[repr(C)]
-struct OptionalHeader32Prefix {
-    magic: u16,
-    _pad: [u8; 90],
-    number_of_rva_and_sizes: u32,
-    data_directory: [DataDirectory; 16],
-}
-
-#[repr(C)]
-struct NtHeaders32 {
-    signature: u32,
-    _file_header: [u8; 20],
-    optional: OptionalHeader32Prefix,
-}
-
-#[repr(C)]
-struct ImportDescriptor {
-    original_first_thunk: u32,
-    time_date_stamp: u32,
-    forwarder_chain: u32,
-    name: u32,
-    first_thunk: u32,
-}
-
 pub(crate) fn install_iat_hooks() {
-    let Ok(mut patches) = IAT_PATCHES.lock() else {
-        return;
-    };
-    if !patches.is_empty() {
-        return;
-    }
-    let Ok(module) = (unsafe { GetModuleHandleW(None) }) else {
-        return;
-    };
-    let base = module.0 as usize;
-    if base == 0 {
-        return;
-    }
     let targets: &[(&str, &str, usize)] = &[
         (
             "user32.dll",
@@ -860,191 +587,30 @@ pub(crate) fn install_iat_hooks() {
             hook_GetDeviceCaps as *const () as usize,
         ),
     ];
-
-    unsafe {
-        let dos = &*(base as *const DosHeader);
-        if dos.e_magic != 0x5A4D || dos.e_lfanew <= 0 {
-            return;
-        }
-        let nt = &*((base + dos.e_lfanew as usize) as *const NtHeaders32);
-        if nt.signature != 0x0000_4550 || nt.optional.magic != 0x010B {
-            return;
-        }
-        if nt.optional.number_of_rva_and_sizes <= 1 {
-            return;
-        }
-        let import_rva = nt.optional.data_directory[1].virtual_address as usize;
-        if import_rva == 0 {
-            return;
-        }
-        let mut desc = (base + import_rva) as *const ImportDescriptor;
-        while (*desc).name != 0 {
-            let dll_name =
-                CStr::from_ptr((base + (*desc).name as usize) as *const i8).to_string_lossy();
-            let has_dll = targets
-                .iter()
-                .any(|(d, _, _)| dll_name.eq_ignore_ascii_case(d));
-            if has_dll && (*desc).original_first_thunk != 0 && (*desc).first_thunk != 0 {
-                let mut orig_thunk = (base + (*desc).original_first_thunk as usize) as *const u32;
-                let mut iat_thunk = (base + (*desc).first_thunk as usize) as *mut usize;
-                while *orig_thunk != 0 {
-                    // Skip ordinal-only imports (bit 31 set on PE32).
-                    if *orig_thunk & 0x8000_0000 == 0 {
-                        let name_ptr = (base + *orig_thunk as usize + 2) as *const i8;
-                        let fn_name = CStr::from_ptr(name_ptr).to_string_lossy();
-                        if let Some(&(_, _, replacement)) = targets
-                            .iter()
-                            .find(|(d, f, _)| dll_name.eq_ignore_ascii_case(d) && fn_name == *f)
-                        {
-                            let mut old_prot = PAGE_PROTECTION_FLAGS(0);
-                            if VirtualProtect(
-                                iat_thunk.cast(),
-                                std::mem::size_of::<usize>(),
-                                PAGE_READWRITE,
-                                &mut old_prot,
-                            )
-                            .is_ok()
-                            {
-                                let original = *iat_thunk;
-                                if original != replacement {
-                                    *iat_thunk = replacement;
-                                    patches.push(PatchedSlot {
-                                        slot: iat_thunk as usize,
-                                        original,
-                                    });
-                                }
-                                let mut _ignored = PAGE_PROTECTION_FLAGS(0);
-                                let _ = VirtualProtect(
-                                    iat_thunk.cast(),
-                                    std::mem::size_of::<usize>(),
-                                    old_prot,
-                                    &mut _ignored,
-                                );
-                            }
-                        }
-                    }
-                    orig_thunk = orig_thunk.add(1);
-                    iat_thunk = iat_thunk.add(1);
-                }
-            }
-            desc = desc.add(1);
-        }
-    }
+    // SAFETY: Every hook function matches its Win32 import's exact stdcall ABI and remains
+    // loaded in this DLL until `uninstall_iat_hooks` restores the IAT.
+    unsafe { iat::install(targets) };
 }
 
 pub(crate) fn uninstall_iat_hooks() {
-    let Ok(mut patches) = IAT_PATCHES.lock() else {
-        return;
-    };
-    for patch in patches.drain(..) {
-        unsafe {
-            let slot = patch.slot as *mut usize;
-            let mut old_prot = PAGE_PROTECTION_FLAGS(0);
-            if VirtualProtect(
-                slot.cast(),
-                std::mem::size_of::<usize>(),
-                PAGE_READWRITE,
-                &mut old_prot,
-            )
-            .is_ok()
-            {
-                *slot = patch.original;
-                let mut _ignored = PAGE_PROTECTION_FLAGS(0);
-                let _ = VirtualProtect(
-                    slot.cast(),
-                    std::mem::size_of::<usize>(),
-                    old_prot,
-                    &mut _ignored,
-                );
-            }
-        }
-    }
+    iat::uninstall();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_POPUP};
-
-    const DS_SETFONT: u32 = 0x40;
-
-    fn push_utf16z(buf: &mut Vec<u8>, s: &str) {
-        for cu in s.encode_utf16() {
-            buf.extend_from_slice(&cu.to_le_bytes());
-        }
-        buf.extend_from_slice(&0u16.to_le_bytes());
-    }
-
-    fn build_standard_template(cx: i16, cy: i16, pt: u16, with_item: bool) -> Vec<u8> {
-        let mut buf = Vec::new();
-        let style = WS_POPUP.0 | DS_SETFONT;
-        buf.extend_from_slice(&style.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes()); // dwExtendedStyle
-        buf.extend_from_slice(&(u16::from(with_item)).to_le_bytes()); // cdit
-        buf.extend_from_slice(&0i16.to_le_bytes()); // x
-        buf.extend_from_slice(&0i16.to_le_bytes()); // y
-        buf.extend_from_slice(&cx.to_le_bytes());
-        buf.extend_from_slice(&cy.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes()); // menu
-        buf.extend_from_slice(&0u16.to_le_bytes()); // class
-        buf.extend_from_slice(&0u16.to_le_bytes()); // title
-        buf.extend_from_slice(&pt.to_le_bytes());
-        push_utf16z(&mut buf, "MS Sans Serif");
-        if with_item {
-            while buf.len() % 4 != 0 {
-                buf.push(0);
-            }
-            buf.extend_from_slice(&0x5000_0000u32.to_le_bytes()); // WS_CHILD | WS_VISIBLE
-            buf.extend_from_slice(&0u32.to_le_bytes());
-            buf.extend_from_slice(&10i16.to_le_bytes());
-            buf.extend_from_slice(&10i16.to_le_bytes());
-            buf.extend_from_slice(&50i16.to_le_bytes());
-            buf.extend_from_slice(&14i16.to_le_bytes());
-            buf.extend_from_slice(&100u16.to_le_bytes()); // id
-            buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
-            buf.extend_from_slice(&0x0082u16.to_le_bytes()); // Static
-            push_utf16z(&mut buf, "OK");
-            buf.extend_from_slice(&0u16.to_le_bytes()); // creation data
-        }
-        buf
-    }
-
-    fn build_ex_template(pt: u16) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&1u16.to_le_bytes()); // dlgVer
-        buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // signature
-        buf.extend_from_slice(&0u32.to_le_bytes()); // helpID
-        buf.extend_from_slice(&0u32.to_le_bytes()); // exStyle
-        buf.extend_from_slice(&(WS_POPUP.0 | DS_SETFONT).to_le_bytes()); // style
-        buf.extend_from_slice(&0u16.to_le_bytes()); // cDlgItems
-        buf.extend_from_slice(&0i16.to_le_bytes()); // x
-        buf.extend_from_slice(&0i16.to_le_bytes()); // y
-        buf.extend_from_slice(&200i16.to_le_bytes()); // cx
-        buf.extend_from_slice(&100i16.to_le_bytes()); // cy
-        buf.extend_from_slice(&0u16.to_le_bytes()); // menu
-        buf.extend_from_slice(&0u16.to_le_bytes()); // class
-        push_utf16z(&mut buf, "Ex"); // title
-        buf.extend_from_slice(&pt.to_le_bytes());
-        buf.extend_from_slice(&400u16.to_le_bytes()); // weight
-        buf.push(0); // italic
-        buf.push(1); // charset
-        push_utf16z(&mut buf, "MS Shell Dlg");
-        buf
-    }
+    use crate::win32::hwnd::destroy_window;
+    use crate::window::dialog_template::tests::{build_ex_template, build_standard_template};
 
     #[test]
-    fn dialog_template_point_size_scaling() {
+    fn copy_patched_template_writes_scaled_point_size() {
         let std_tpl = build_standard_template(200, 100, 8, true);
-        assert!(FontPatch::from_bytes(&std_tpl, 96).is_none());
         for (template, offset) in [(&std_tpl, 24), (&build_ex_template(8), 36)] {
-            for (dpi, expected) in [(192, 4), (240, 3)] {
+            for (dpi, expected) in [(192, 4u16), (240, 3u16)] {
                 let patch = FontPatch::from_bytes(template, dpi).unwrap();
-                assert_eq!(patch.len, template.len());
-                assert_eq!(patch.offset, offset);
-                assert_eq!(patch.point_size, expected);
                 let mut expected_bytes = template.clone();
                 expected_bytes[offset..offset + 2].copy_from_slice(&expected.to_le_bytes());
-                // Both fixtures initialize every byte, including control padding.
+                // SAFETY: Both fixtures initialize every byte, including control padding.
                 unsafe {
                     let copy =
                         copy_patched_template(template.as_ptr(), template.len(), patch).unwrap();
@@ -1057,73 +623,22 @@ mod tests {
     }
 
     #[test]
-    fn truncated_templates_are_rejected() {
-        for template in [
-            build_standard_template(200, 100, 8, true),
-            build_ex_template(8),
-        ] {
-            for len in 0..template.len() {
-                assert!(
-                    FontPatch::from_bytes(&template[..len], 192).is_none(),
-                    "accepted {len} bytes"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn control_creation_data_lengths_follow_each_format() {
-        let mut standard = build_standard_template(200, 100, 8, true);
-        let end = standard.len();
-        standard[end - 2..].copy_from_slice(&5u16.to_le_bytes());
-        standard.extend_from_slice(&[1, 2, 3]);
-        assert!(FontPatch::parse(None, 192, |i| u16::from_le_bytes([
-            standard[i],
-            standard[i + 1]
-        ]))
-        .is_none());
-
-        let mut extended = build_ex_template(8);
-        extended[16..18].copy_from_slice(&1u16.to_le_bytes());
-        extended.resize(extended.len().next_multiple_of(4) + 24, 0);
-        extended.extend_from_slice(&[0xff, 0xff, 0x82, 0, 0, 0, 3, 0, 1, 2, 3]);
-
-        for template in [standard, extended] {
-            assert_eq!(
-                FontPatch::from_bytes(&template, 192).unwrap().len,
-                template.len()
-            );
-            assert!(FontPatch::from_bytes(&template[..template.len() - 1], 192).is_none());
-        }
-    }
-
-    #[test]
-    fn system_message_font_can_omit_typeface() {
-        let mut standard = build_standard_template(200, 100, 0x7fff, false);
-        standard.truncate(26); // template ends immediately after pointsize
-        assert!(FontPatch::parse(None, 192, |i| u16::from_le_bytes([
-            standard[i],
-            standard[i + 1]
-        ]))
-        .is_none());
-    }
-
-    #[test]
     fn patched_dialog_keeps_96_dpi_pixel_dimensions() {
         crate::window::enable_dpi_awareness();
         let dpi = system_dpi();
         let raw = build_standard_template(200, 100, 8, false);
-        let patched = FontPatch::from_bytes(&raw, dpi)
-            .map(|patch| unsafe { copy_patched_template(raw.as_ptr(), raw.len(), patch).unwrap() });
+        let patched = FontPatch::from_bytes(&raw, dpi).map(|patch| {
+            // SAFETY: `raw` is a complete initialized dialog template.
+            unsafe { copy_patched_template(raw.as_ptr(), raw.len(), patch).unwrap() }
+        });
         let template = patched
             .as_ref()
             .map_or(raw.as_ptr().cast(), |p| p.as_ptr().cast());
+        // SAFETY: `template` points to a valid DWORD-aligned DLGTEMPLATE.
         let hwnd = unsafe { CreateDialogIndirectParamA(None, template, None, None, LPARAM(0)) }
             .expect("CreateDialogIndirectParamA should create patched dialog");
         let rc = super::super::client_rect(hwnd).unwrap();
-        unsafe {
-            let _ = DestroyWindow(hwnd);
-        }
+        destroy_window(hwnd);
         // At 96 DPI, 200x100 DLU with 8pt MS Sans Serif is 300x163 px.
         assert!(
             (280..=320).contains(&rc.right) && (145..=180).contains(&rc.bottom),

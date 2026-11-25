@@ -4,6 +4,7 @@
 #![allow(non_snake_case)]
 
 mod dialog_template;
+mod hook_logic;
 #[allow(unsafe_code)]
 pub mod hooks;
 pub mod host;
@@ -73,10 +74,6 @@ pub(crate) fn bound_hwnd() -> Option<HWND> {
     BOUND_HWND.load()
 }
 
-pub(crate) fn bound_hwnd_raw() -> isize {
-    BOUND_HWND.load_raw()
-}
-
 pub(crate) fn bound_thread_id() -> u32 {
     BOUND_THREAD.load(Ordering::Relaxed)
 }
@@ -89,10 +86,6 @@ pub fn is_ui_thread_or_unbound() -> bool {
 
 pub(crate) fn present_hwnd() -> Option<HWND> {
     PRESENT_HWND.load()
-}
-
-pub(crate) fn present_hwnd_raw() -> isize {
-    PRESENT_HWND.load_raw()
 }
 
 pub(crate) fn is_scaling_active() -> bool {
@@ -231,9 +224,9 @@ mod tests {
         set_present_hwnd(old_present);
         set_present_hwnd(new_present);
         clear_present_hwnd(old_present);
-        assert_eq!(present_hwnd_raw(), new_present.0 as isize);
+        assert_eq!(present_hwnd(), Some(new_present));
         clear_present_hwnd(new_present);
-        assert_eq!(present_hwnd_raw(), 0);
+        assert_eq!(present_hwnd(), None);
 
         let old_id = NEXT_BIND_ID.fetch_add(1, Ordering::Relaxed);
         let new_id = NEXT_BIND_ID.fetch_add(1, Ordering::Relaxed);

@@ -7,8 +7,10 @@ use windows::Win32::Graphics::Gdi::{
     ClientToScreen, GetMonitorInfoW, MapWindowPoints, MonitorFromWindow, ScreenToClient,
     MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::GetCapture;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, GetClientRect, GetWindowRect, IsWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+    AdjustWindowRectEx, ClipCursor, GetClientRect, GetCursorPos, GetWindowRect, IsWindow,
+    SetCursorPos, WindowFromPoint, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 
 pub(crate) fn is_window(hwnd: HWND) -> bool {
@@ -85,4 +87,31 @@ pub(crate) fn adjust_window_rect_ex(
     unsafe {
         let _ = AdjustWindowRectEx(rect, style, has_menu, ex_style);
     }
+}
+
+pub(crate) fn cursor_pos() -> Result<POINT> {
+    let mut pt = POINT::default();
+    // SAFETY: `pt` is a valid writable POINT.
+    unsafe { GetCursorPos(&mut pt)? };
+    Ok(pt)
+}
+
+pub(crate) fn set_cursor_pos(x: i32, y: i32) -> bool {
+    // SAFETY: SetCursorPos accepts integer screen coordinates.
+    unsafe { SetCursorPos(x, y).is_ok() }
+}
+
+pub(crate) fn clip_cursor(rect: Option<&RECT>) -> bool {
+    // SAFETY: `rect` is either None or a valid shared reference to a RECT.
+    unsafe { ClipCursor(rect.map(|r| r as *const RECT)).is_ok() }
+}
+
+pub(crate) fn window_from_point(pt: POINT) -> HWND {
+    // SAFETY: WindowFromPoint takes a POINT by value and returns a handle or NULL.
+    unsafe { WindowFromPoint(pt) }
+}
+
+pub(crate) fn get_capture() -> HWND {
+    // SAFETY: GetCapture takes no arguments.
+    unsafe { GetCapture() }
 }

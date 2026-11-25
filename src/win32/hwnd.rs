@@ -7,16 +7,21 @@ use windows::Win32::Foundation::{
     GetLastError, SetLastError, ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, EnumThreadWindows, GetClassNameW,
-    GetForegroundWindow, GetParent, GetWindow, GetWindowLongW, GetWindowPlacement,
-    GetWindowThreadProcessId, IsChild, IsIconic, IsWindowUnicode, IsWindowVisible, KillTimer,
-    PostMessageA, PostMessageW, RegisterClassW, SendMessageW, SetTimer, SetWindowLongW,
-    SetWindowPlacement, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, GW_HWNDPREV,
-    GW_OWNER, SET_WINDOW_POS_FLAGS, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX,
-    WINDOW_STYLE, WNDCLASSW,
+    BringWindowToTop, CreateWindowExW, DefWindowProcA, DefWindowProcW, DestroyWindow,
+    EnumThreadWindows, GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetParent, GetWindow,
+    GetWindowLongW, GetWindowPlacement, GetWindowThreadProcessId, IsChild, IsIconic,
+    IsWindowUnicode, IsWindowVisible, KillTimer, MoveWindow, PostMessageA, PostMessageW,
+    RegisterClassW, SendMessageW, SetTimer, SetWindowLongW, SetWindowPlacement, SetWindowPos,
+    GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, SET_WINDOW_POS_FLAGS,
+    WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WNDCLASSW,
 };
 
 pub(crate) type SafeWndProc = fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
+
+pub(crate) fn desktop_window() -> HWND {
+    // SAFETY: GetDesktopWindow takes no arguments.
+    unsafe { GetDesktopWindow() }
+}
 
 pub(crate) fn foreground_window() -> HWND {
     // SAFETY: GetForegroundWindow takes no arguments.
@@ -188,6 +193,23 @@ pub(crate) fn set_window_pos(
     unsafe { SetWindowPos(hwnd, insert_after, x, y, cx, cy, flags) }
 }
 
+pub(crate) fn bring_window_to_top(hwnd: HWND) -> bool {
+    // SAFETY: BringWindowToTop validates the HWND internally.
+    unsafe { BringWindowToTop(hwnd).is_ok() }
+}
+
+pub(crate) fn move_window(
+    hwnd: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    repaint: bool,
+) -> bool {
+    // SAFETY: MoveWindow validates the HWND internally.
+    unsafe { MoveWindow(hwnd, x, y, width, height, repaint).is_ok() }
+}
+
 pub(crate) fn destroy_window(hwnd: HWND) {
     // SAFETY: DestroyWindow validates the HWND internally.
     unsafe {
@@ -218,6 +240,11 @@ pub(crate) fn send_message_w(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
 pub(crate) fn def_window_proc_w(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // SAFETY: DefWindowProcW forwards unhandled window messages to the default Win32 handler.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+pub(crate) fn def_window_proc_a(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: DefWindowProcA forwards unhandled window messages to the default ANSI Win32 handler.
+    unsafe { DefWindowProcA(hwnd, msg, wparam, lparam) }
 }
 
 pub(crate) fn set_timer(hwnd: HWND, id: usize, elapse_ms: u32) {
