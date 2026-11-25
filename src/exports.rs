@@ -1,12 +1,12 @@
 //! Legacy DirectDraw DLL entry points, thread lock, helper exports, and COM class factory.
 #![allow(non_snake_case)]
 
-use std::cell::UnsafeCell;
 use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
 
+use parking_lot::ReentrantMutex;
 use windows::core::{implement, IUnknown, Interface, Ref, Result, BOOL, GUID, HRESULT, PCSTR};
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, FARPROC, HINSTANCE,
@@ -17,9 +17,6 @@ use windows::Win32::Graphics::DirectDraw::{
 };
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::System::LibraryLoader::GetProcAddress;
-use windows::Win32::System::Threading::{
-    EnterCriticalSection, InitializeCriticalSection, LeaveCriticalSection, CRITICAL_SECTION,
-};
 
 use crate::{clipper, compat, draw, window};
 
@@ -27,11 +24,7 @@ const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_THREAD_ATTACH: u32 = 2;
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn DllMain(
-    _module: HINSTANCE,
-    reason: u32,
-    _reserved: *mut c_void,
-) -> BOOL {
+pub extern "system" fn DllMain(_module: HINSTANCE, reason: u32, _reserved: *mut c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         // Must run before WinMain creates any HWND so host and overlay share one DPI space.
         window::enable_dpi_awareness();
@@ -41,64 +34,53 @@ pub unsafe extern "system" fn DllMain(
     BOOL(1)
 }
 
-struct ThreadLock(UnsafeCell<CRITICAL_SECTION>);
-
-// Win32 CRITICAL_SECTION is thread-safe by design once initialized.
-unsafe impl Sync for ThreadLock {}
-
-fn dd_thread_lock() -> &'static ThreadLock {
-    static LOCK: OnceLock<&'static ThreadLock> = OnceLock::new();
-    LOCK.get_or_init(|| {
-        let boxed = Box::leak(Box::new(ThreadLock(UnsafeCell::new(
-            CRITICAL_SECTION::default(),
-        ))));
-        unsafe { InitializeCriticalSection(boxed.0.get()) };
-        boxed
-    })
-}
-
+static DD_THREAD_LOCK: ReentrantMutex<()> = ReentrantMutex::new(());
 static ZOOM_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn AcquireDDThreadLock() -> u32 {
-    unsafe { EnterCriticalSection(dd_thread_lock().0.get()) };
+pub extern "system" fn AcquireDDThreadLock() -> u32 {
+    // The matching Release export consumes this acquisition.
+    std::mem::forget(DD_THREAD_LOCK.lock());
     0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn ReleaseDDThreadLock() -> u32 {
-    unsafe { LeaveCriticalSection(dd_thread_lock().0.get()) };
+pub extern "system" fn ReleaseDDThreadLock() -> u32 {
+    if DD_THREAD_LOCK.is_owned_by_current_thread() {
+        // SAFETY: Each owned recursion level has exactly one forgotten guard.
+        unsafe { DD_THREAD_LOCK.force_unlock() };
+    }
     0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn CompleteCreateSysmemSurface(_arg: u32) -> u32 {
+pub extern "system" fn CompleteCreateSysmemSurface(_arg: u32) -> u32 {
     0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn D3DParseUnknownCommand(
+pub extern "system" fn D3DParseUnknownCommand(
     _cmd: *mut c_void,
-    ret_cmd: *mut *mut c_void,
+    ret_cmd: Option<&mut MaybeUninit<*mut c_void>>,
 ) -> HRESULT {
-    if !ret_cmd.is_null() {
-        unsafe { ret_cmd.write(ptr::null_mut()) };
+    if let Some(ret_cmd) = ret_cmd {
+        ret_cmd.write(ptr::null_mut());
     }
     E_FAIL
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn DDInternalLock(_a: u32, _b: u32) -> u32 {
+pub extern "system" fn DDInternalLock(_a: u32, _b: u32) -> u32 {
     0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn DDInternalUnlock(_a: u32) -> u32 {
+pub extern "system" fn DDInternalUnlock(_a: u32) -> u32 {
     0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn DDIsWindowed() -> BOOL {
+pub extern "C" fn DDIsWindowed() -> BOOL {
     BOOL::from(!draw::is_fullscreen_active())
 }
 
@@ -108,7 +90,7 @@ pub unsafe extern "system" fn DDGetProcAddress(module: HMODULE, proc_name: PCSTR
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn DDEnableZoom() {
+pub extern "C" fn DDEnableZoom() {
     ZOOM_ENABLED.store(true, Ordering::Relaxed);
 }
 
@@ -138,7 +120,7 @@ impl IClassFactory_Impl for ClassFactory_Impl {
             return Err(CLASS_E_NOAGGREGATION.into());
         }
         let unk: IUnknown = match self.class {
-            FactoryClass::DirectDraw => draw::create_uninitialized_draw().cast()?,
+            FactoryClass::DirectDraw => draw::create_uninitialized_draw()?.cast()?,
             FactoryClass::DirectDrawClipper => clipper::create_uninitialized_clipper().cast()?,
         };
         unsafe { unk.query(riid, out).ok() }
@@ -150,30 +132,30 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn DllCanUnloadNow() -> HRESULT {
+pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     S_FALSE
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn DllGetClassObject(
-    clsid: *const GUID,
-    riid: *const GUID,
-    out: *mut *mut c_void,
+pub extern "system" fn DllGetClassObject(
+    clsid: Option<&GUID>,
+    riid: Option<&GUID>,
+    out: Option<&mut MaybeUninit<*mut c_void>>,
 ) -> HRESULT {
-    if out.is_null() || clsid.is_null() || riid.is_null() {
+    let (Some(clsid), Some(riid), Some(out)) = (clsid, riid, out) else {
         return E_POINTER;
-    }
-    unsafe { out.write(ptr::null_mut()) };
-    let clsid = unsafe { *clsid };
-    let class = if clsid == CLSID_DirectDraw || clsid == CLSID_DirectDraw7 {
+    };
+    out.write(ptr::null_mut());
+    let class = if *clsid == CLSID_DirectDraw || *clsid == CLSID_DirectDraw7 {
         FactoryClass::DirectDraw
-    } else if clsid == CLSID_DirectDrawClipper {
+    } else if *clsid == CLSID_DirectDrawClipper {
         FactoryClass::DirectDrawClipper
     } else {
         return CLASS_E_CLASSNOTAVAILABLE;
     };
     let factory: IClassFactory = ClassFactory { class }.into();
-    unsafe { factory.query(riid, out) }
+    // SAFETY: The factory is live, riid is readable and out is a writable interface slot.
+    unsafe { factory.query(riid, out.as_mut_ptr()) }
 }
 
 #[cfg(test)]
@@ -182,20 +164,22 @@ mod tests {
 
     #[test]
     fn thread_lock_is_reentrant() {
-        unsafe {
-            assert_eq!(AcquireDDThreadLock(), 0);
-            assert_eq!(AcquireDDThreadLock(), 0);
-            assert_eq!(ReleaseDDThreadLock(), 0);
-            assert_eq!(ReleaseDDThreadLock(), 0);
-        }
+        assert_eq!(AcquireDDThreadLock(), 0);
+        assert_eq!(AcquireDDThreadLock(), 0);
+        assert_eq!(ReleaseDDThreadLock(), 0);
+        assert!(!std::thread::spawn(|| DD_THREAD_LOCK.try_lock().is_some())
+            .join()
+            .unwrap());
+        assert_eq!(ReleaseDDThreadLock(), 0);
+        assert!(std::thread::spawn(|| DD_THREAD_LOCK.try_lock().is_some())
+            .join()
+            .unwrap());
     }
 
     #[test]
     fn zoom_and_windowed_helpers_succeed() {
-        unsafe {
-            assert_eq!(DDIsWindowed(), BOOL(1));
-            DDEnableZoom();
-            assert!(ZOOM_ENABLED.load(Ordering::Relaxed));
-        }
+        assert_eq!(DDIsWindowed(), BOOL(1));
+        DDEnableZoom();
+        assert!(ZOOM_ENABLED.load(Ordering::Relaxed));
     }
 }

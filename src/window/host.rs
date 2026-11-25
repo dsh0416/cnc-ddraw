@@ -10,14 +10,15 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, GetWindowLongW, GetWindowPlacement, GetWindowRect, IsWindow,
-    SetWindowLongW, SetWindowPlacement, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINDOWPLACEMENT, WINDOW_EX_STYLE,
-    WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    AdjustWindowRectEx, GetWindowLongW, GetWindowPlacement, SetWindowLongW, SetWindowPlacement,
+    SetWindowPos, GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE,
+    WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE,
+    WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU,
+    WS_THICKFRAME,
 };
 
+use super::geometry::{is_window, window_rect};
 use crate::config::Config;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,10 +115,9 @@ impl HostWindow {
                 self.mode = PresentationMode::Windowed;
             }
             PresentationMode::Windowed => {
-                let mut rc = RECT::default();
-                if unsafe { GetWindowRect(self.hwnd, &mut rc) }.is_ok()
-                    && rc.right > rc.left
-                    && rc.bottom > rc.top
+                if let Some(rc) = window_rect(self.hwnd)
+                    .ok()
+                    .filter(|r| r.right > r.left && r.bottom > r.top)
                 {
                     self.saved_windowed_rect = Some(rc);
                     self.has_custom_window_rect = true;
@@ -235,7 +235,7 @@ impl HostWindow {
     }
 
     pub fn restore(self) -> Result<()> {
-        if !unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
+        if !is_window(self.hwnd) {
             return Ok(());
         }
         set_style(self.hwnd, GWL_STYLE, self.orig_style)?;
@@ -280,8 +280,7 @@ mod tests {
             )
             .unwrap();
             let orig_style = GetWindowLongW(hwnd, GWL_STYLE);
-            let mut orig_rect = RECT::default();
-            GetWindowRect(hwnd, &mut orig_rect).unwrap();
+            let orig_rect = window_rect(hwnd).unwrap();
 
             let cfg = Config {
                 width: 800,
@@ -307,8 +306,7 @@ mod tests {
 
             host.restore().unwrap();
             assert_eq!(GetWindowLongW(hwnd, GWL_STYLE), orig_style);
-            let mut restored = RECT::default();
-            GetWindowRect(hwnd, &mut restored).unwrap();
+            let restored = window_rect(hwnd).unwrap();
             assert_eq!(restored, orig_rect);
 
             let _ = DestroyWindow(hwnd);

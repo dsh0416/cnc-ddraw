@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use windows::core::{BOOL, PCSTR};
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, GetDC, GetDeviceCaps, MapWindowPoints, ReleaseDC, ScreenToClient, BITSPIXEL,
+    ClientToScreen, GetDC, GetDeviceCaps, ReleaseDC, ScreenToClient, BITSPIXEL,
     GET_DEVICE_CAPS_INDEX, HDC, HORZRES, LOGPIXELSX, LOGPIXELSY, VERTRES,
 };
 use windows::Win32::System::LibraryLoader::{
@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CallNextHookEx, CallWindowProcA, CallWindowProcW, ClipCursor,
     CreateDialogIndirectParamA, CreateDialogParamA, DefWindowProcA, DefWindowProcW,
     DialogBoxIndirectParamA, DialogBoxParamA, GetClientRect, GetClipCursor, GetCursorPos,
-    GetDesktopWindow, GetSystemMetrics, GetWindowLongA, GetWindowLongW, GetWindowRect, IsWindow,
+    GetDesktopWindow, GetSystemMetrics, GetWindowLongA, GetWindowLongW, GetWindowRect,
     IsWindowUnicode, KillTimer, MoveWindow, SetCursorPos, SetWindowLongA, SetWindowLongW,
     SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, DLGPROC, DLGTEMPLATE,
     GWLP_WNDPROC, HHOOK, MSG, RT_DIALOG, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN,
@@ -29,6 +29,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config;
 
+use super::dialog_template::FontPatch;
+use super::geometry::{client_to_screen, is_window, map_rect, screen_to_client, window_rect};
 use super::input::{
     client_origin_in_bound, client_to_logical, hit_test_logical_child, is_mouse_message,
     is_related_dialog_window, logical_to_client,
@@ -57,20 +59,27 @@ pub(crate) fn subclassed_hwnd_raw() -> isize {
     SUBCLASSED_HWND.load(Ordering::Relaxed)
 }
 
+fn virtual_window_rect(hwnd: HWND, include_dialogs: bool) -> Option<RECT> {
+    let (bound, w, h, _) = logical_mode()?;
+    if hwnd == bound || hwnd == unsafe { GetDesktopWindow() } {
+        return Some(RECT {
+            left: 0,
+            top: 0,
+            right: w as i32,
+            bottom: h as i32,
+        });
+    }
+    if include_dialogs && is_related_dialog_window(bound, hwnd) {
+        return Some(map_rect(None, Some(bound), window_rect(hwnd).ok()?));
+    }
+    None
+}
+
 unsafe extern "system" fn hook_GetClientRect(hwnd: HWND, rect: *mut RECT) -> BOOL {
     if !rect.is_null() {
-        if let Some((bound, w, h, _)) = logical_mode() {
-            if hwnd == bound || hwnd == unsafe { GetDesktopWindow() } {
-                unsafe {
-                    *rect = RECT {
-                        left: 0,
-                        top: 0,
-                        right: w as i32,
-                        bottom: h as i32,
-                    };
-                }
-                return BOOL(1);
-            }
+        if let Some(value) = virtual_window_rect(hwnd, false) {
+            unsafe { rect.write(value) };
+            return BOOL(1);
         }
     }
     BOOL::from(unsafe { GetClientRect(hwnd, rect) }.is_ok())
@@ -78,26 +87,9 @@ unsafe extern "system" fn hook_GetClientRect(hwnd: HWND, rect: *mut RECT) -> BOO
 
 unsafe extern "system" fn hook_GetWindowRect(hwnd: HWND, rect: *mut RECT) -> BOOL {
     if !rect.is_null() {
-        if let Some((bound, w, h, _)) = logical_mode() {
-            if hwnd == bound || hwnd == unsafe { GetDesktopWindow() } {
-                unsafe {
-                    *rect = RECT {
-                        left: 0,
-                        top: 0,
-                        right: w as i32,
-                        bottom: h as i32,
-                    };
-                }
-                return BOOL(1);
-            }
-            if is_related_dialog_window(bound, hwnd) && unsafe { GetWindowRect(hwnd, rect) }.is_ok()
-            {
-                let pts = unsafe { std::slice::from_raw_parts_mut(rect.cast::<POINT>(), 2) };
-                unsafe {
-                    MapWindowPoints(None, Some(bound), pts);
-                }
-                return BOOL(1);
-            }
+        if let Some(value) = virtual_window_rect(hwnd, true) {
+            unsafe { rect.write(value) };
+            return BOOL(1);
         }
     }
     BOOL::from(unsafe { GetWindowRect(hwnd, rect) }.is_ok())
@@ -122,8 +114,8 @@ unsafe extern "system" fn hook_ClientToScreen(hwnd: HWND, pt: *mut POINT) -> BOO
                 return BOOL(1);
             }
             if is_related_dialog_window(bound, hwnd) {
-                let ok = unsafe { ClientToScreen(hwnd, pt) }.as_bool()
-                    && unsafe { ScreenToClient(bound, pt) }.as_bool();
+                let pt = unsafe { &mut *pt };
+                let ok = client_to_screen(hwnd, pt) && screen_to_client(bound, pt);
                 return BOOL::from(ok);
             }
         }
@@ -138,8 +130,8 @@ unsafe extern "system" fn hook_ScreenToClient(hwnd: HWND, pt: *mut POINT) -> BOO
                 return BOOL(1);
             }
             if is_related_dialog_window(bound, hwnd) {
-                let ok = unsafe { ClientToScreen(bound, pt) }.as_bool()
-                    && unsafe { ScreenToClient(hwnd, pt) }.as_bool();
+                let pt = unsafe { &mut *pt };
+                let ok = client_to_screen(bound, pt) && screen_to_client(hwnd, pt);
                 return BOOL::from(ok);
             }
         }
@@ -156,12 +148,9 @@ unsafe extern "system" fn hook_GetCursorPos(pt: *mut POINT) -> BOOL {
         return BOOL(0);
     }
     if let Some((bound, w, h, _)) = logical_mode() {
-        if unsafe { ScreenToClient(bound, &mut raw) }.as_bool() {
+        if screen_to_client(bound, &mut raw) {
             let (lx, ly) = client_to_logical(bound, raw.x, raw.y, w, h);
-            unsafe {
-                *pt = POINT { x: lx, y: ly };
-            }
-            return BOOL(1);
+            raw = POINT { x: lx, y: ly };
         }
     }
     unsafe { *pt = raw };
@@ -172,7 +161,7 @@ unsafe extern "system" fn hook_SetCursorPos(x: i32, y: i32) -> BOOL {
     if let Some((bound, w, h, _)) = logical_mode() {
         let (cx, cy) = logical_to_client(bound, x, y, w, h);
         let mut pt = POINT { x: cx, y: cy };
-        if unsafe { ClientToScreen(bound, &mut pt) }.as_bool() {
+        if client_to_screen(bound, &mut pt) {
             return BOOL::from(unsafe { SetCursorPos(pt.x, pt.y) }.is_ok());
         }
     }
@@ -190,22 +179,16 @@ unsafe extern "system" fn hook_ClipCursor(rect: *const RECT) -> BOOL {
                 w,
                 h,
             );
-            let mut pts = [
-                POINT { x: l, y: t },
-                POINT {
-                    x: ri + 1,
-                    y: b + 1,
+            let mapped = map_rect(
+                Some(bound),
+                None,
+                RECT {
+                    left: l,
+                    top: t,
+                    right: ri + 1,
+                    bottom: b + 1,
                 },
-            ];
-            unsafe {
-                MapWindowPoints(Some(bound), None, &mut pts);
-            }
-            let mapped = RECT {
-                left: pts[0].x,
-                top: pts[0].y,
-                right: pts[1].x,
-                bottom: pts[1].y,
-            };
+            );
             return BOOL::from(unsafe { ClipCursor(Some(&mapped)) }.is_ok());
         }
     }
@@ -314,8 +297,6 @@ unsafe extern "system" fn hook_GetDeviceCaps(hdc: HDC, index: i32) -> i32 {
     unsafe { GetDeviceCaps(Some(hdc), GET_DEVICE_CAPS_INDEX(index as u32)) }
 }
 
-const DS_SETFONT: u32 = 0x40;
-
 fn system_dpi() -> u32 {
     unsafe {
         let dc = GetDC(None);
@@ -334,133 +315,37 @@ fn system_dpi() -> u32 {
     }
 }
 
-fn scale_dialog_point_size(pt: u16, dpi: u32) -> u16 {
-    if dpi <= 96 || pt == 0 {
-        return pt;
-    }
-    ((pt as u32 * 96) / dpi).max(1) as u16
-}
+// Win32 requires a DWORD-aligned template. The indirect caller may leave padding
+// uninitialized, so copy it as raw storage and only read actual template fields.
+type DialogStorage = Vec<std::mem::MaybeUninit<u32>>;
 
-fn read_u16_at(ptr: *const u8, off: usize) -> u16 {
-    unsafe { ptr.add(off).cast::<u16>().read_unaligned() }
-}
-
-fn read_u32_at(ptr: *const u8, off: usize) -> u32 {
-    unsafe { ptr.add(off).cast::<u32>().read_unaligned() }
-}
-
-fn skip_sz_or_ord(ptr: *const u8, mut off: usize, allow_ordinal: bool) -> usize {
-    let first = read_u16_at(ptr, off);
-    if first == 0 {
-        off + 2
-    } else if allow_ordinal && first == 0xFFFF {
-        off + 4
-    } else {
-        off += 2;
-        while read_u16_at(ptr, off) != 0 {
-            off += 2;
-        }
-        off + 2
+/// The source must be readable through `len` bytes and `patch` must describe that source.
+unsafe fn copy_patched_template(
+    src: *const u8,
+    len: usize,
+    patch: FontPatch,
+) -> Option<DialogStorage> {
+    let words = len.div_ceil(4);
+    let mut out = DialogStorage::new();
+    out.try_reserve_exact(words).ok()?;
+    out.resize_with(words, std::mem::MaybeUninit::uninit);
+    let dst = out.as_mut_ptr().cast::<u8>();
+    // SAFETY: the destination spans at least len bytes, is freshly allocated,
+    // and the parser located a full point-size word within the source.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, len);
+        dst.add(patch.offset)
+            .cast::<u16>()
+            .write_unaligned(patch.point_size);
     }
-}
-
-fn align4(off: usize) -> usize {
-    (off + 3) & !3
-}
-
-/// Computes the byte length and `pointsize` field offset of a Win32 `DLGTEMPLATE` or
-/// `DLGTEMPLATEEX` so dialog templates built for 96 DPI keep their exact 96-DPI pixel layout
-/// even when the process is DPI-aware on a high-DPI monitor (e.g. 240 DPI / 250%).
-unsafe fn measure_dialog_template(tpl: *const u8) -> Option<(usize, Option<usize>)> {
-    if tpl.is_null() {
-        return None;
-    }
-    let ver = read_u16_at(tpl, 0);
-    let sig = read_u16_at(tpl, 2);
-    let is_ex = ver == 1 && sig == 0xFFFF;
-    let (style, item_count, mut off) = if is_ex {
-        (read_u32_at(tpl, 12), read_u16_at(tpl, 16) as usize, 26)
-    } else {
-        (read_u32_at(tpl, 0), read_u16_at(tpl, 8) as usize, 18)
-    };
-    // menu, windowClass, title
-    off = skip_sz_or_ord(tpl, off, true);
-    off = skip_sz_or_ord(tpl, off, true);
-    off = skip_sz_or_ord(tpl, off, false);
-    let font_pt_off = if style & DS_SETFONT != 0 {
-        let pt_off = off;
-        off += 2; // pointsize
-        if is_ex {
-            off += 4; // weight (u16), italic (u8), charset (u8)
-        }
-        off = skip_sz_or_ord(tpl, off, false); // typeface
-        Some(pt_off)
-    } else {
-        None
-    };
-    let item_fixed = if is_ex { 24 } else { 18 };
-    for _ in 0..item_count {
-        off = align4(off);
-        off += item_fixed;
-        off = skip_sz_or_ord(tpl, off, true); // windowClass
-        off = skip_sz_or_ord(tpl, off, true); // title
-        let extra = read_u16_at(tpl, off) as usize;
-        off += 2 + extra;
-    }
-    Some((off, font_pt_off))
-}
-
-/// Clones a `DLGTEMPLATE`/`DLGTEMPLATEEX` and scales its font point size by `96 / dpi` so
-/// legacy 96-DPI Win32 dialogs (like RA2's Map Selection dialog `0x6B`) match 96-DPI dimensions.
-fn patch_dialog_template_bytes(src: &[u8], dpi: u32) -> Option<Vec<u8>> {
-    if dpi <= 96 || src.len() < 18 {
-        return None;
-    }
-    let ver = u16::from_le_bytes([src[0], src[1]]);
-    let sig = u16::from_le_bytes([src[2], src[3]]);
-    let is_ex = ver == 1 && sig == 0xFFFF;
-    let (style, mut off) = if is_ex {
-        if src.len() < 26 {
-            return None;
-        }
-        (u32::from_le_bytes([src[12], src[13], src[14], src[15]]), 26)
-    } else {
-        (u32::from_le_bytes([src[0], src[1], src[2], src[3]]), 18)
-    };
-    if style & DS_SETFONT == 0 {
-        return None;
-    }
-    for allow_ord in [true, true, false] {
-        if off + 2 > src.len() {
-            return None;
-        }
-        let first = u16::from_le_bytes([src[off], src[off + 1]]);
-        if first == 0 {
-            off += 2;
-        } else if allow_ord && first == 0xFFFF {
-            off += 4;
-        } else {
-            off += 2;
-            while off + 2 <= src.len() && u16::from_le_bytes([src[off], src[off + 1]]) != 0 {
-                off += 2;
-            }
-            off += 2;
-        }
-    }
-    if off + 2 > src.len() {
-        return None;
-    }
-    let old_pt = u16::from_le_bytes([src[off], src[off + 1]]);
-    let new_pt = scale_dialog_point_size(old_pt, dpi);
-    if new_pt == old_pt {
-        return None;
-    }
-    let mut out = src.to_vec();
-    out[off..off + 2].copy_from_slice(&new_pt.to_le_bytes());
     Some(out)
 }
 
-fn load_and_patch_dialog_resource(hinst: HINSTANCE, template_name: PCSTR) -> Option<Vec<u8>> {
+/// The module and resource identifier must satisfy the FindResourceA contract.
+unsafe fn load_and_patch_dialog_resource(
+    hinst: HINSTANCE,
+    template_name: PCSTR,
+) -> Option<DialogStorage> {
     let dpi = system_dpi();
     if dpi <= 96 || bound_hwnd_raw() == 0 {
         return None;
@@ -473,7 +358,7 @@ fn load_and_patch_dialog_resource(hinst: HINSTANCE, template_name: PCSTR) -> Opt
         };
         let hres = FindResourceA(hmod, template_name, PCSTR(RT_DIALOG.0 as *const u8)).ok()?;
         let size = SizeofResource(hmod, hres) as usize;
-        if size < 18 {
+        if size == 0 || size > isize::MAX as usize {
             return None;
         }
         let hglob = LoadResource(hmod, hres).ok()?;
@@ -481,31 +366,27 @@ fn load_and_patch_dialog_resource(hinst: HINSTANCE, template_name: PCSTR) -> Opt
         if ptr.is_null() {
             return None;
         }
-        patch_dialog_template_bytes(std::slice::from_raw_parts(ptr, size), dpi)
+        // LockResource returns SizeofResource initialized bytes, valid while
+        // the caller's module remains loaded for this call.
+        let patch = FontPatch::from_bytes(std::slice::from_raw_parts(ptr, size), dpi)?;
+        copy_patched_template(ptr, size, patch)
     }
 }
 
-fn patch_dialog_indirect_ptr(tpl: *const DLGTEMPLATE) -> Option<Vec<u8>> {
+/// Win32 passes no length. The indirect-dialog caller must supply one complete
+/// DLGTEMPLATE or DLGTEMPLATEEX that remains readable and stable during the call.
+unsafe fn patch_dialog_indirect_ptr(tpl: *const DLGTEMPLATE) -> Option<DialogStorage> {
     let dpi = system_dpi();
     if dpi <= 96 || bound_hwnd_raw() == 0 || tpl.is_null() {
         return None;
     }
-    unsafe {
-        let raw = tpl.cast::<u8>();
-        let (len, font_pt_off) = measure_dialog_template(raw)?;
-        let pt_off = font_pt_off?;
-        if pt_off + 2 > len {
-            return None;
-        }
-        let old_pt = read_u16_at(raw, pt_off);
-        let new_pt = scale_dialog_point_size(old_pt, dpi);
-        if new_pt == old_pt {
-            return None;
-        }
-        let mut out = std::slice::from_raw_parts(raw, len).to_vec();
-        out[pt_off..pt_off + 2].copy_from_slice(&new_pt.to_le_bytes());
-        Some(out)
-    }
+    let raw = tpl.cast::<u8>();
+    // SAFETY: the parser requests only initialized structural words at their
+    // documented offsets in the caller's valid template, never alignment padding.
+    let patch = FontPatch::parse(None, dpi, |offset| unsafe {
+        raw.add(offset).cast::<u16>().read_unaligned()
+    })?;
+    unsafe { copy_patched_template(raw, patch.len, patch) }
 }
 
 unsafe extern "system" fn hook_CreateDialogParamA(
@@ -515,7 +396,7 @@ unsafe extern "system" fn hook_CreateDialogParamA(
     dlg_proc: DLGPROC,
     init_param: LPARAM,
 ) -> HWND {
-    if let Some(patched) = load_and_patch_dialog_resource(hinst, template_name) {
+    if let Some(patched) = unsafe { load_and_patch_dialog_resource(hinst, template_name) } {
         if let Ok(hwnd) = unsafe {
             CreateDialogIndirectParamA(
                 Some(hinst),
@@ -547,7 +428,7 @@ unsafe extern "system" fn hook_CreateDialogIndirectParamA(
     dlg_proc: DLGPROC,
     init_param: LPARAM,
 ) -> HWND {
-    if let Some(patched) = patch_dialog_indirect_ptr(template) {
+    if let Some(patched) = unsafe { patch_dialog_indirect_ptr(template) } {
         if let Ok(hwnd) = unsafe {
             CreateDialogIndirectParamA(
                 Some(hinst),
@@ -571,7 +452,7 @@ unsafe extern "system" fn hook_DialogBoxParamA(
     dlg_proc: DLGPROC,
     init_param: LPARAM,
 ) -> isize {
-    if let Some(patched) = load_and_patch_dialog_resource(hinst, template_name) {
+    if let Some(patched) = unsafe { load_and_patch_dialog_resource(hinst, template_name) } {
         return unsafe {
             DialogBoxIndirectParamA(
                 Some(hinst),
@@ -600,7 +481,7 @@ unsafe extern "system" fn hook_DialogBoxIndirectParamA(
     dlg_proc: DLGPROC,
     init_param: LPARAM,
 ) -> isize {
-    if let Some(patched) = patch_dialog_indirect_ptr(template) {
+    if let Some(patched) = unsafe { patch_dialog_indirect_ptr(template) } {
         return unsafe {
             DialogBoxIndirectParamA(
                 Some(hinst),
@@ -623,7 +504,7 @@ unsafe extern "system" fn getmsg_hook(code: i32, wparam: WPARAM, lparam: LPARAM)
             if is_bound || is_dialog {
                 let mut cursor = POINT::default();
                 if unsafe { GetCursorPos(&mut cursor) }.is_ok()
-                    && unsafe { ScreenToClient(bound, &mut cursor) }.as_bool()
+                    && screen_to_client(bound, &mut cursor)
                 {
                     let (lx, ly) = client_to_logical(bound, cursor.x, cursor.y, w, h);
                     msg.pt = POINT { x: lx, y: ly };
@@ -739,7 +620,7 @@ unsafe extern "system" fn subclass_wndproc(
                 let mut py = ((raw >> 16) & 0xffff) as i16 as i32;
                 if msg == WM_MOUSEWHEEL {
                     let mut pt = POINT { x: px, y: py };
-                    if unsafe { ScreenToClient(bound, &mut pt) }.as_bool() {
+                    if screen_to_client(bound, &mut pt) {
                         px = pt.x;
                         py = pt.y;
                     }
@@ -779,7 +660,7 @@ pub(crate) fn uninstall_getmsg_hook() {
 
 pub(crate) fn install_subclass(hwnd: HWND) {
     uninstall_subclass();
-    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+    if hwnd.is_invalid() || !is_window(hwnd) {
         return;
     }
     let is_unicode = unsafe { IsWindowUnicode(hwnd) }.as_bool();
@@ -813,7 +694,7 @@ pub(crate) fn uninstall_subclass() {
         return;
     }
     let hwnd = HWND(raw as *mut c_void);
-    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+    if !is_window(hwnd) {
         return;
     }
     unsafe {
@@ -1082,6 +963,8 @@ mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WS_POPUP};
 
+    const DS_SETFONT: u32 = 0x40;
+
     fn push_utf16z(buf: &mut Vec<u8>, s: &str) {
         for cu in s.encode_utf16() {
             buf.extend_from_slice(&cu.to_le_bytes());
@@ -1149,35 +1032,77 @@ mod tests {
     #[test]
     fn dialog_template_point_size_scaling() {
         let std_tpl = build_standard_template(200, 100, 8, true);
-        let (measured_len, pt_off) = unsafe { measure_dialog_template(std_tpl.as_ptr()) }.unwrap();
-        assert_eq!(measured_len, std_tpl.len());
-        let pt_off = pt_off.unwrap();
-        assert_eq!(
-            u16::from_le_bytes([std_tpl[pt_off], std_tpl[pt_off + 1]]),
-            8
-        );
-        assert!(patch_dialog_template_bytes(&std_tpl, 96).is_none());
-        let patched_240 = patch_dialog_template_bytes(&std_tpl, 240).unwrap();
-        assert_eq!(patched_240.len(), std_tpl.len());
-        assert_eq!(
-            u16::from_le_bytes([patched_240[pt_off], patched_240[pt_off + 1]]),
-            3
-        );
-        let patched_192 = patch_dialog_template_bytes(&std_tpl, 192).unwrap();
-        assert_eq!(
-            u16::from_le_bytes([patched_192[pt_off], patched_192[pt_off + 1]]),
-            4
-        );
+        assert!(FontPatch::from_bytes(&std_tpl, 96).is_none());
+        for (template, offset) in [(&std_tpl, 24), (&build_ex_template(8), 36)] {
+            for (dpi, expected) in [(192, 4), (240, 3)] {
+                let patch = FontPatch::from_bytes(template, dpi).unwrap();
+                assert_eq!(patch.len, template.len());
+                assert_eq!(patch.offset, offset);
+                assert_eq!(patch.point_size, expected);
+                let mut expected_bytes = template.clone();
+                expected_bytes[offset..offset + 2].copy_from_slice(&expected.to_le_bytes());
+                // Both fixtures initialize every byte, including control padding.
+                unsafe {
+                    let copy =
+                        copy_patched_template(template.as_ptr(), template.len(), patch).unwrap();
+                    let bytes =
+                        std::slice::from_raw_parts(copy.as_ptr().cast::<u8>(), template.len());
+                    assert_eq!(bytes, expected_bytes);
+                }
+            }
+        }
+    }
 
-        let ex_tpl = build_ex_template(8);
-        let (ex_len, ex_pt_off) = unsafe { measure_dialog_template(ex_tpl.as_ptr()) }.unwrap();
-        assert_eq!(ex_len, ex_tpl.len());
-        let ex_pt_off = ex_pt_off.unwrap();
-        let ex_patched = patch_dialog_template_bytes(&ex_tpl, 240).unwrap();
-        assert_eq!(
-            u16::from_le_bytes([ex_patched[ex_pt_off], ex_patched[ex_pt_off + 1]]),
-            3
-        );
+    #[test]
+    fn truncated_templates_are_rejected() {
+        for template in [
+            build_standard_template(200, 100, 8, true),
+            build_ex_template(8),
+        ] {
+            for len in 0..template.len() {
+                assert!(
+                    FontPatch::from_bytes(&template[..len], 192).is_none(),
+                    "accepted {len} bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn control_creation_data_lengths_follow_each_format() {
+        let mut standard = build_standard_template(200, 100, 8, true);
+        let end = standard.len();
+        standard[end - 2..].copy_from_slice(&5u16.to_le_bytes());
+        standard.extend_from_slice(&[1, 2, 3]);
+        assert!(FontPatch::parse(None, 192, |i| u16::from_le_bytes([
+            standard[i],
+            standard[i + 1]
+        ]))
+        .is_none());
+
+        let mut extended = build_ex_template(8);
+        extended[16..18].copy_from_slice(&1u16.to_le_bytes());
+        extended.resize(extended.len().next_multiple_of(4) + 24, 0);
+        extended.extend_from_slice(&[0xff, 0xff, 0x82, 0, 0, 0, 3, 0, 1, 2, 3]);
+
+        for template in [standard, extended] {
+            assert_eq!(
+                FontPatch::from_bytes(&template, 192).unwrap().len,
+                template.len()
+            );
+            assert!(FontPatch::from_bytes(&template[..template.len() - 1], 192).is_none());
+        }
+    }
+
+    #[test]
+    fn system_message_font_can_omit_typeface() {
+        let mut standard = build_standard_template(200, 100, 0x7fff, false);
+        standard.truncate(26); // template ends immediately after pointsize
+        assert!(FontPatch::parse(None, 192, |i| u16::from_le_bytes([
+            standard[i],
+            standard[i + 1]
+        ]))
+        .is_none());
     }
 
     #[test]
@@ -1185,20 +1110,15 @@ mod tests {
         crate::window::enable_dpi_awareness();
         let dpi = system_dpi();
         let raw = build_standard_template(200, 100, 8, false);
-        let active = patch_dialog_template_bytes(&raw, dpi).unwrap_or(raw);
-        let hwnd = unsafe {
-            CreateDialogIndirectParamA(
-                None,
-                active.as_ptr().cast::<DLGTEMPLATE>(),
-                None,
-                None,
-                LPARAM(0),
-            )
-        }
-        .expect("CreateDialogIndirectParamA should create patched dialog");
-        let mut rc = RECT::default();
+        let patched = FontPatch::from_bytes(&raw, dpi)
+            .map(|patch| unsafe { copy_patched_template(raw.as_ptr(), raw.len(), patch).unwrap() });
+        let template = patched
+            .as_ref()
+            .map_or(raw.as_ptr().cast(), |p| p.as_ptr().cast());
+        let hwnd = unsafe { CreateDialogIndirectParamA(None, template, None, None, LPARAM(0)) }
+            .expect("CreateDialogIndirectParamA should create patched dialog");
+        let rc = super::super::client_rect(hwnd).unwrap();
         unsafe {
-            GetClientRect(hwnd, &mut rc).unwrap();
             let _ = DestroyWindow(hwnd);
         }
         // At 96 DPI, 200x100 DLU with 8pt MS Sans Serif is 300x163 px.

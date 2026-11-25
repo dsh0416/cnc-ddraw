@@ -96,6 +96,7 @@ name = "cnc-ddraw"
 version = "0.1.0"
 dependencies = [
  "fearless_simd",
+ "parking_lot",
  "pollster",
  "raw-window-handle",
  "wgpu",

@@ -59,6 +59,10 @@ Press **Alt+Enter** at any time to toggle between borderless fullscreen and wind
 - `src/renderer.rs` and `src/present.wgsl` share one presentation pipeline across Vulkan and DX12. Raw primary surface bytes (`R8Uint` indexed, `R16Uint` RGB555/RGB565, `R32Uint` XRGB8888) are uploaded directly without CPU conversion and unpacked in WGSL with a 256-entry palette/gamma LUT texture into a centered, aspect-preserving (or stretched) viewport.
 - `src/simd_blit.rs` uses `fearless_simd` for runtime-dispatched (SSE2 / SSE4.2 / AVX2 / AVX-512) branchless CPU color-keyed blits and rectangular color fills on CPU-backed surfaces.
 
+`src/descriptor.rs` checks DirectDraw structure sizes at the COM boundary and reads the fields selected by the caller's flags. Output descriptors can arrive with only `dwSize` initialized. Set `DDPF_RGB` when supplying true-color depths and masks. `EnumDisplayModes` treats a pixel format with no flags as a wildcard. Surface creation and resizing copy the visible pixels from each input row. `src/surface/dc.rs` owns the GDI bitmap and accounts for its scanline stride separately from the game's pitch.
+
+The CPU blitter, SIMD kernels, configuration parser and dialog template parser use `#![forbid(unsafe_code)]`. The crate also enforces `unsafe_op_in_unsafe_fn`, so native entry points need an explicit block for each group of unsafe operations. For DPI scaling, indirect standard dialog templates with nonzero control creation data use the original Win32 template. Resource-backed templates have a known length and can be copied in full.
+
 The implemented DirectDraw COM objects are single-threaded. Release the display and its surfaces, or detach the HWND with `SetCooperativeLevel(NULL, DDSCL_NORMAL)`, before destroying the window. Direct3D 3D game rendering remains outside this experiment's scope.
 
 ## Verify

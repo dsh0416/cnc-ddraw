@@ -1,14 +1,9 @@
 //! Optional `ddraw.ini` configuration loader compatible with classic cnc-ddraw keys.
-use std::ffi::c_void;
+#![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::System::LibraryLoader::{
-    GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-};
+use crate::win32::module_path_at;
 
 const VK_RETURN_CODE: u32 = 0x0D;
 
@@ -249,38 +244,21 @@ fn parse_u32_radix(value: &str) -> Option<u32> {
     }
 }
 
-fn module_path(module: Option<HMODULE>) -> Option<PathBuf> {
-    let mut buf = [0u16; 1024];
-    let len = unsafe { GetModuleFileNameW(module, &mut buf) } as usize;
-    if len == 0 || len >= buf.len() {
-        return None;
-    }
-    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
-}
-
 fn dll_directory() -> Option<PathBuf> {
-    let mut module = HMODULE::default();
-    let ok = unsafe {
-        GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            PCWSTR(dll_directory as *const () as *const c_void as *const u16),
-            &mut module,
-        )
-    }
-    .is_ok();
-    if ok {
-        module_path(Some(module)).and_then(|p| p.parent().map(Path::to_path_buf))
-    } else {
-        None
-    }
+    module_path_at(dll_directory as *const () as _).and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
 pub fn dll_or_exe_directory() -> Option<PathBuf> {
-    dll_directory().or_else(|| module_path(None).and_then(|p| p.parent().map(Path::to_path_buf)))
+    dll_directory().or_else(|| {
+        std::env::current_exe()
+            .ok()?
+            .parent()
+            .map(Path::to_path_buf)
+    })
 }
 
 fn load_from_disk() -> Config {
-    let exe_path = module_path(None);
+    let exe_path = std::env::current_exe().ok();
     let exe_stem = exe_path
         .as_ref()
         .and_then(|p| p.file_stem())

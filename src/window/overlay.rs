@@ -4,15 +4,15 @@ use std::ffi::c_void;
 use std::num::NonZeroIsize;
 use std::sync::OnceLock;
 
+use super::geometry::{client_rect, client_to_screen, is_window};
 use windows::core::w;
-use windows::Win32::Foundation::{HINSTANCE, HWND, POINT, RECT};
-use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::Foundation::{HINSTANCE, HWND, POINT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, GetForegroundWindow, GetWindow, GetWindowLongW,
-    IsIconic, IsWindow, IsWindowVisible, RegisterClassW, SetWindowPos, GWL_EXSTYLE, GW_HWNDPREV,
-    HWND_NOTOPMOST, HWND_TOP, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindow, GetWindowLongW, IsIconic,
+    IsWindowVisible, RegisterClassW, SetWindowPos, GWL_EXSTYLE, GW_HWNDPREV, HWND_NOTOPMOST,
+    HWND_TOP, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use super::input::{is_related_dialog_window, is_same_process_window, present_wndproc};
@@ -137,7 +137,7 @@ impl OverlayWindow {
 impl Drop for OverlayWindow {
     fn drop(&mut self) {
         clear_present_hwnd(self.hwnd);
-        if unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
+        if is_window(self.hwnd) {
             unsafe {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -146,11 +146,9 @@ impl Drop for OverlayWindow {
 }
 
 pub fn client_screen_rect(hwnd: HWND) -> Result<(i32, i32, u32, u32), String> {
-    let mut client = RECT::default();
-    unsafe { GetClientRect(hwnd, &mut client) }
-        .map_err(|err| format!("getting client area: {err}"))?;
+    let client = client_rect(hwnd).map_err(|err| format!("getting client area: {err}"))?;
     let mut origin = POINT { x: 0, y: 0 };
-    let _ = unsafe { ClientToScreen(hwnd, &mut origin) };
+    client_to_screen(hwnd, &mut origin);
     Ok((
         origin.x,
         origin.y,

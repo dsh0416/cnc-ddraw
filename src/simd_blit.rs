@@ -1,6 +1,7 @@
 //! CPU-side SIMD-accelerated blitting and color-fill kernels powered by `fearless_simd`.
 //! Used for pure CPU-backed DirectDraw surface operations (color-keyed blits and fills)
 //! that cannot be offloaded to GPU shaders because games freely `Lock()` surface memory.
+#![forbid(unsafe_code)]
 use fearless_simd::{dispatch, prelude::*, Level, Simd};
 
 #[derive(Clone, Copy, Debug)]

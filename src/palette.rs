@@ -16,7 +16,9 @@ struct Palette {
     display: Weak<DisplayShared>,
 }
 
-pub fn create_palette(
+/// # Safety
+/// For supported flags, a non-null entries pointer must address 256 initialized palette entries.
+pub unsafe fn create_palette(
     flags: u32,
     entries: *const PALETTEENTRY,
     display: Arc<DisplayShared>,
@@ -29,11 +31,7 @@ pub fn create_palette(
     if flags & DDPCAPS_8BIT as u32 == 0 || flags & !allowed != 0 {
         return Err(E_NOTIMPL.into());
     }
-    if entries.is_null() {
-        return Err(E_POINTER.into());
-    }
-    let mut colors = [PALETTEENTRY::default(); 256];
-    unsafe { std::ptr::copy_nonoverlapping(entries, colors.as_mut_ptr(), colors.len()) };
+    let mut colors = *unsafe { entries.cast::<[PALETTEENTRY; 256]>().as_ref() }.ok_or(E_POINTER)?;
     preserve_endpoints(flags, &mut colors);
     Ok(Palette {
         flags,
@@ -50,6 +48,12 @@ pub fn check_owner(palette: &IDirectDrawPalette, display: &Arc<DisplayShared>) -
     } else {
         Err(E_INVALIDARG.into())
     }
+}
+
+pub(crate) fn snapshot(palette: &IDirectDrawPalette) -> Result<[PALETTEENTRY; 256]> {
+    let object = palette.cast_object_ref::<Palette>()?;
+    let colors = object.entries.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(*colors)
 }
 
 fn preserve_endpoints(flags: u32, colors: &mut [PALETTEENTRY; 256]) {
@@ -104,9 +108,9 @@ impl IDirectDrawPalette_Impl for Palette_Impl {
         }
         {
             let mut colors = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-            unsafe {
-                std::ptr::copy_nonoverlapping(src, colors[span].as_mut_ptr(), count as usize)
-            };
+            // SAFETY: SetEntries supplies count readable entries. range() bounds count to 256.
+            colors[span]
+                .copy_from_slice(unsafe { std::slice::from_raw_parts(src, count as usize) });
             preserve_endpoints(self.flags, &mut colors);
         }
         if let Some(display) = self.display.upgrade() {

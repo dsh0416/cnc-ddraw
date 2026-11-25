@@ -1,18 +1,17 @@
 //! Logical <-> physical coordinate conversion, Win32 dialog hit-testing, and overlay mouse routing.
 use std::ffi::c_void;
 
+use super::geometry::{client_rect, client_to_screen, screen_to_client, window_rect};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, EnumThreadWindows, GetClassNameW, GetClientRect, GetParent, GetWindow,
-    GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsChild, IsWindowUnicode,
-    IsWindowVisible, PostMessageA, PostMessageW, SendMessageW, GWL_STYLE, GW_CHILD, GW_HWNDNEXT,
-    GW_OWNER, HTCLIENT, HTTRANSPARENT, MA_NOACTIVATE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
-    WS_DISABLED,
+    DefWindowProcW, EnumThreadWindows, GetClassNameW, GetParent, GetWindow, GetWindowLongW,
+    GetWindowThreadProcessId, IsChild, IsWindowUnicode, IsWindowVisible, PostMessageA,
+    PostMessageW, SendMessageW, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, GW_OWNER, HTCLIENT,
+    HTTRANSPARENT, MA_NOACTIVATE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
+    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WS_DISABLED,
 };
 
 use crate::config;
@@ -23,11 +22,8 @@ use super::{bound_hwnd_raw, bound_thread_id, compute_viewport, is_present_hwnd, 
 const SS_NOTIFY: u32 = 0x0100;
 
 pub(crate) fn client_to_logical(hwnd: HWND, px: i32, py: i32, lw: u32, lh: u32) -> (i32, i32) {
-    let mut client = RECT::default();
-    if unsafe { GetClientRect(hwnd, &mut client) }.is_err()
-        || client.right <= 0
-        || client.bottom <= 0
-    {
+    let client = client_rect(hwnd).unwrap_or_default();
+    if client.right <= 0 || client.bottom <= 0 {
         return (px.clamp(0, lw as i32 - 1), py.clamp(0, lh as i32 - 1));
     }
     let (vx, vy, vw, vh) = compute_viewport(
@@ -45,11 +41,8 @@ pub(crate) fn client_to_logical(hwnd: HWND, px: i32, py: i32, lw: u32, lh: u32) 
 }
 
 pub(crate) fn logical_to_client(hwnd: HWND, lx: i32, ly: i32, lw: u32, lh: u32) -> (i32, i32) {
-    let mut client = RECT::default();
-    if unsafe { GetClientRect(hwnd, &mut client) }.is_err()
-        || client.right <= 0
-        || client.bottom <= 0
-    {
+    let client = client_rect(hwnd).unwrap_or_default();
+    if client.right <= 0 || client.bottom <= 0 {
         return (lx, ly);
     }
     let (vx, vy, vw, vh) = compute_viewport(
@@ -65,10 +58,9 @@ pub(crate) fn logical_to_client(hwnd: HWND, lx: i32, ly: i32, lw: u32, lh: u32) 
 }
 
 fn window_rect_in_bound(bound: HWND, hwnd: HWND) -> Option<RECT> {
-    let mut rc = RECT::default();
-    unsafe { GetWindowRect(hwnd, &mut rc) }.ok()?;
+    let mut rc = window_rect(hwnd).ok()?;
     let mut origin = POINT { x: 0, y: 0 };
-    if unsafe { ClientToScreen(bound, &mut origin) }.as_bool() {
+    if client_to_screen(bound, &mut origin) {
         rc.left -= origin.x;
         rc.right -= origin.x;
         rc.top -= origin.y;
@@ -80,9 +72,7 @@ fn window_rect_in_bound(bound: HWND, hwnd: HWND) -> Option<RECT> {
 pub(crate) fn client_origin_in_bound(bound: HWND, hwnd: HWND) -> (i32, i32) {
     let mut target_origin = POINT { x: 0, y: 0 };
     let mut bound_origin = POINT { x: 0, y: 0 };
-    if unsafe { ClientToScreen(hwnd, &mut target_origin) }.as_bool()
-        && unsafe { ClientToScreen(bound, &mut bound_origin) }.as_bool()
-    {
+    if client_to_screen(hwnd, &mut target_origin) && client_to_screen(bound, &mut bound_origin) {
         (
             target_origin.x - bound_origin.x,
             target_origin.y - bound_origin.y,
@@ -283,7 +273,7 @@ pub(crate) unsafe extern "system" fn present_wndproc(
                 let mut py = ((raw >> 16) & 0xffff) as i16 as i32;
                 if msg == WM_MOUSEWHEEL {
                     let mut pt = POINT { x: px, y: py };
-                    if unsafe { ScreenToClient(bound, &mut pt) }.as_bool() {
+                    if screen_to_client(bound, &mut pt) {
                         px = pt.x;
                         py = pt.y;
                     }

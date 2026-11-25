@@ -2,6 +2,8 @@
 //! logical<->physical coordinate mapping, and PE32 IAT / WndProc / WH_GETMESSAGE hooks.
 #![allow(non_snake_case)]
 
+mod dialog_template;
+mod geometry;
 pub mod hooks;
 pub mod host;
 pub mod input;
@@ -10,12 +12,13 @@ pub mod overlay;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
 
+use crate::win32::current_thread_id;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    IsWindow, KillTimer, PostMessageW, SetProcessDPIAware, SetTimer,
+    KillTimer, PostMessageW, SetProcessDPIAware, SetTimer,
 };
 
+pub(crate) use geometry::{client_rect, is_window};
 pub use host::{HostWindow, PresentationMode};
 pub use overlay::OverlayWindow;
 
@@ -81,7 +84,7 @@ pub(crate) fn bound_thread_id() -> u32 {
 /// Returns true when the caller is on the bound UI thread (or no window is bound yet).
 pub fn is_ui_thread_or_unbound() -> bool {
     let bound = BOUND_THREAD.load(Ordering::Relaxed);
-    bound == 0 || bound == unsafe { GetCurrentThreadId() }
+    bound == 0 || bound == current_thread_id()
 }
 
 pub(crate) fn present_hwnd_raw() -> isize {
@@ -113,7 +116,7 @@ pub fn bind_window(hwnd: HWND, scaling_active: bool) -> usize {
         return 0;
     }
     let id = NEXT_BIND_ID.fetch_add(1, Ordering::Relaxed);
-    let tid = unsafe { GetCurrentThreadId() };
+    let tid = current_thread_id();
     ACTIVE_BIND_ID.store(id, Ordering::Relaxed);
     BOUND_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
     BOUND_THREAD.store(tid, Ordering::Relaxed);
@@ -174,20 +177,20 @@ pub fn unbind_window(bind_id: usize) {
     hooks::uninstall_iat_hooks();
 }
 
-pub fn can_schedule_flush() -> bool {
+fn flush_window() -> Option<HWND> {
     let raw = hooks::subclassed_hwnd_raw();
-    raw != 0 && unsafe { IsWindow(Some(HWND(raw as *mut c_void))) }.as_bool()
+    let hwnd = HWND(raw as *mut c_void);
+    (raw != 0 && is_window(hwnd)).then_some(hwnd)
+}
+
+pub fn can_schedule_flush() -> bool {
+    flush_window().is_some()
 }
 
 pub fn schedule_flush() -> bool {
-    let raw = hooks::subclassed_hwnd_raw();
-    if raw == 0 {
+    let Some(hwnd) = flush_window() else {
         return false;
-    }
-    let hwnd = HWND(raw as *mut c_void);
-    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-        return false;
-    }
+    };
     unsafe {
         PostMessageW(
             Some(hwnd),
@@ -200,25 +203,17 @@ pub fn schedule_flush() -> bool {
 }
 
 pub fn arm_flush_timer(ms: u32) {
-    let raw = hooks::subclassed_hwnd_raw();
-    if raw != 0 {
-        let hwnd = HWND(raw as *mut c_void);
-        if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-            unsafe {
-                let _ = SetTimer(Some(hwnd), FLUSH_TIMER_ID, ms.max(1), None);
-            }
+    if let Some(hwnd) = flush_window() {
+        unsafe {
+            let _ = SetTimer(Some(hwnd), FLUSH_TIMER_ID, ms.max(1), None);
         }
     }
 }
 
 pub fn disarm_flush_timer() {
-    let raw = hooks::subclassed_hwnd_raw();
-    if raw != 0 {
-        let hwnd = HWND(raw as *mut c_void);
-        if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-            unsafe {
-                let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
-            }
+    if let Some(hwnd) = flush_window() {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
         }
     }
 }

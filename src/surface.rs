@@ -1,22 +1,22 @@
 //! CPU-backed DirectDraw 1-7 surfaces. A lock exposes stable storage until Unlock.
 #![allow(non_snake_case)]
 
+mod blit;
+mod dc;
+use blit::blit;
+use dc::SurfaceDc;
+
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::mem::{size_of, ManuallyDrop};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::mem::{size_of, ManuallyDrop, MaybeUninit};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use windows::core::{implement, Error, IUnknown, Interface, OutRef, Ref, Result, GUID, HRESULT};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, HANDLE, RECT};
 use windows::Win32::Graphics::DirectDraw::*;
-use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, RestoreDC, SaveDC,
-    SelectObject, SetDIBColorTable, BITMAPINFO, BITMAPINFOHEADER, BI_BITFIELDS, BI_RGB, BLACKNESS,
-    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PALETTEENTRY, PATCOPY, RGBQUAD, SRCCOPY, WHITENESS,
-};
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::Graphics::Gdi::{BLACKNESS, HDC, PALETTEENTRY, PATCOPY, SRCCOPY, WHITENESS};
 
 use crate::clipper;
 use crate::draw::DisplayShared;
@@ -81,34 +81,6 @@ fn zeros(size: usize) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-pub fn desc2_to_desc(d2: &DDSURFACEDESC2) -> Result<DDSURFACEDESC> {
-    if d2.dwSize as usize != size_of::<DDSURFACEDESC2>() {
-        return Err(E_INVALIDARG.into());
-    }
-    let mut d = DDSURFACEDESC {
-        dwSize: size_of::<DDSURFACEDESC>() as u32,
-        dwFlags: d2.dwFlags,
-        dwHeight: d2.dwHeight,
-        dwWidth: d2.dwWidth,
-        dwBackBufferCount: unsafe { d2.Anonymous2.dwBackBufferCount },
-        dwAlphaBitDepth: d2.dwAlphaBitDepth,
-        dwReserved: d2.dwReserved,
-        lpSurface: d2.lpSurface,
-        ddckCKDestOverlay: unsafe { d2.Anonymous4.ddckCKDestOverlay },
-        ddckCKDestBlt: d2.ddckCKDestBlt,
-        ddckCKSrcOverlay: d2.ddckCKSrcOverlay,
-        ddckCKSrcBlt: d2.ddckCKSrcBlt,
-        ddpfPixelFormat: unsafe { d2.Anonymous5.ddpfPixelFormat },
-        ddsCaps: DDSCAPS {
-            dwCaps: d2.ddsCaps.dwCaps,
-        },
-        ..Default::default()
-    };
-    d.Anonymous1.lPitch = unsafe { d2.Anonymous1.lPitch };
-    d.Anonymous2.dwMipMapCount = unsafe { d2.Anonymous3.dwMipMapCount };
-    Ok(d)
-}
-
 pub fn desc_to_desc2(d: &DDSURFACEDESC) -> DDSURFACEDESC2 {
     let mut d2 = DDSURFACEDESC2 {
         dwSize: size_of::<DDSURFACEDESC2>() as u32,
@@ -162,19 +134,12 @@ impl PixelFormat {
         {
             return Err(DDERR_INVALIDPIXELFORMAT.into());
         }
-        unsafe {
-            let masks = (
-                pf.Anonymous2.dwRBitMask,
-                pf.Anonymous3.dwGBitMask,
-                pf.Anonymous4.dwBBitMask,
-            );
-            match (pf.Anonymous1.dwRGBBitCount, masks) {
-                (8, _) if pf.dwFlags & DDPF_PALETTEINDEXED8 as u32 != 0 => Ok(Self::Indexed),
-                (16, (0xf800, 0x07e0, 0x001f)) => Ok(Self::Rgb565),
-                (16, (0x7c00, 0x03e0, 0x001f)) => Ok(Self::Rgb555),
-                (32, (0xff0000, 0xff00, 0xff)) => Ok(Self::Xrgb),
-                _ => Err(DDERR_INVALIDPIXELFORMAT.into()),
-            }
+        match crate::descriptor::rgb_layout(pf) {
+            (8, _) if pf.dwFlags & DDPF_PALETTEINDEXED8 as u32 != 0 => Ok(Self::Indexed),
+            (16, [0xf800, 0x07e0, 0x001f]) => Ok(Self::Rgb565),
+            (16, [0x7c00, 0x03e0, 0x001f]) => Ok(Self::Rgb555),
+            (32, [0xff0000, 0xff00, 0xff]) => Ok(Self::Xrgb),
+            _ => Err(DDERR_INVALIDPIXELFORMAT.into()),
         }
     }
 
@@ -186,13 +151,17 @@ impl PixelFormat {
         }
     }
 
+    fn rgb_masks(self) -> [u32; 3] {
+        match self {
+            Self::Indexed => [0, 0, 0],
+            Self::Rgb555 => [0x7c00, 0x03e0, 0x001f],
+            Self::Rgb565 => [0xf800, 0x07e0, 0x001f],
+            Self::Xrgb => [0xff0000, 0xff00, 0xff],
+        }
+    }
+
     fn description(self) -> DDPIXELFORMAT {
-        let (red, green, blue) = match self {
-            Self::Indexed => (0, 0, 0),
-            Self::Rgb555 => (0x7c00, 0x03e0, 0x001f),
-            Self::Rgb565 => (0xf800, 0x07e0, 0x001f),
-            Self::Xrgb => (0xff0000, 0xff00, 0xff),
-        };
+        let [red, green, blue] = self.rgb_masks();
         let mut pf = DDPIXELFORMAT {
             dwSize: size_of::<DDPIXELFORMAT>() as u32,
             dwFlags: DDPF_RGB as u32,
@@ -266,21 +235,16 @@ enum Access {
     Ready,
     Locked {
         rect: RECT,
-        owner_tid: u32,
+        owner_tid: ThreadId,
     },
     Gdi {
         handle: HDC,
         saved_state: i32,
-        owner_tid: u32,
+        owner_tid: ThreadId,
     },
 }
 
 const CROSS_THREAD_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-
-#[inline]
-fn current_tid() -> u32 {
-    unsafe { GetCurrentThreadId() }
-}
 
 /// Thread-safe synchronization wrapper around `SurfaceData` supporting cross-thread
 /// `DDLOCK_WAIT` / `DDBLT_WAIT` / `DDFLIP_WAIT` coordination without spurious `DDERR_SURFACEBUSY`.
@@ -316,7 +280,7 @@ impl SurfaceSlot {
         if !guard.locked() {
             return Ok(guard);
         }
-        let tid = current_tid();
+        let tid = Some(thread::current().id());
         if !wait || guard.lock_owner_tid() == tid {
             return Err(DDERR_SURFACEBUSY.into());
         }
@@ -367,7 +331,7 @@ fn lock_pair_ready<'a>(
         let hi_owner = g_hi.lock_owner_tid();
         drop(g_hi);
         drop(g_lo);
-        if !wait || hi_owner == current_tid() {
+        if !wait || hi_owner == Some(thread::current().id()) {
             return Err(DDERR_SURFACEBUSY.into());
         }
         drop(hi.lock_ready(true)?);
@@ -389,7 +353,7 @@ fn lock_chain_ready<'a>(
         for &idx in &order {
             let g = slots[idx].lock();
             if g.locked() {
-                let same_thread = g.lock_owner_tid() == current_tid();
+                let same_thread = g.lock_owner_tid() == Some(thread::current().id());
                 drop(g);
                 if !wait || same_thread {
                     return Err(DDERR_SURFACEBUSY.into());
@@ -420,118 +384,84 @@ struct OverlayState {
     visible: bool,
 }
 
-#[repr(C)]
-struct DibInfo {
-    header: BITMAPINFOHEADER,
-    // GDI interprets the trailing bytes as either RGBQUADs or three DWORD masks.
-    table: [u32; 256],
+/// The byte allocation and the layout used to address it travel together when flipping or resizing.
+struct PixelStorage {
+    pitch: usize,
+    pixel_offset: usize,
+    image_len: usize,
+    pixels: Vec<u8>,
 }
 
-struct SurfaceDc {
-    handle: HDC,
-    bitmap: HBITMAP,
-    previous: HGDIOBJ,
-    bits: *mut c_void,
-    synced_uniqueness: u32,
-}
-
-impl SurfaceDc {
-    fn new(surface: &SurfaceData) -> Result<Self> {
-        let mut info = DibInfo {
-            header: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: surface.width as i32,
-                biHeight: -(surface.height as i32), // top-down, same pitch as the surface
-                biPlanes: 1,
-                biBitCount: (surface.format.bytes() * 8) as u16,
-                biCompression: BI_RGB.0,
-                biSizeImage: surface.image_len as u32,
-                ..Default::default()
-            },
-            table: [0; 256],
+impl PixelStorage {
+    fn new(width: u32, height: u32, format: Format, supplied_pitch: Option<i32>) -> Result<Self> {
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return Err(E_INVALIDARG.into());
+        }
+        let row_bytes = (width as usize)
+            .checked_mul(format.bytes())
+            .ok_or(E_OUTOFMEMORY)?;
+        let pitch = match supplied_pitch {
+            Some(p) if p > 0 && p as usize >= row_bytes => p as usize,
+            Some(_) => return Err(E_INVALIDARG.into()),
+            None => row_bytes
+                .checked_next_multiple_of(4)
+                .filter(|&p| p <= i32::MAX as usize)
+                .ok_or(E_OUTOFMEMORY)?,
         };
-        match surface.format {
-            Format::Indexed => {
-                info.header.biClrUsed = 256;
-                for (slot, color) in info.table.iter_mut().zip(surface.palette_entries()?) {
-                    *slot = u32::from_le_bytes([color.peBlue, color.peGreen, color.peRed, 0]);
-                }
-            }
-            Format::Rgb555 | Format::Rgb565 => {
-                info.header.biCompression = BI_BITFIELDS.0;
-                let format = surface.format.description();
-                info.table[..3].copy_from_slice(&unsafe {
-                    [
-                        format.Anonymous2.dwRBitMask,
-                        format.Anonymous3.dwGBitMask,
-                        format.Anonymous4.dwBBitMask,
-                    ]
-                });
-            }
-            Format::Xrgb => {}
+        let image_len = pitch.checked_mul(height as usize).ok_or(E_OUTOFMEMORY)?;
+        let (pixel_offset, bottom_guard) = guard_padding(pitch);
+        let alloc_len = pixel_offset
+            .checked_add(image_len)
+            .and_then(|v| v.checked_add(bottom_guard))
+            .ok_or(E_OUTOFMEMORY)?;
+        Ok(Self {
+            pitch,
+            pixel_offset,
+            image_len,
+            pixels: zeros(alloc_len)?,
+        })
+    }
+
+    /// # Safety
+    /// If DDSD_LPSURFACE is set and non-null, the caller must provide row_bytes
+    /// initialized bytes at each row start. Pitch padding is never accessed.
+    unsafe fn import_pixels(&mut self, desc: &DDSURFACEDESC, row_bytes: usize) -> Result<()> {
+        if desc.dwFlags & DDSD_LPSURFACE as u32 == 0 || desc.lpSurface.is_null() {
+            return Ok(());
         }
-        let mut dc = Self {
-            handle: unsafe { CreateCompatibleDC(None) },
-            bitmap: HBITMAP::default(),
-            previous: HGDIOBJ::default(),
-            bits: std::ptr::null_mut(),
-            synced_uniqueness: 0,
+        let src_pitch = match supplied_pitch(desc) {
+            Some(p) if p > 0 && p as usize >= row_bytes => p as usize,
+            Some(_) => return Err(E_INVALIDARG.into()),
+            None => self.pitch,
         };
-        if dc.handle.is_invalid() {
-            return Err(DDERR_CANTCREATEDC.into());
+        let height = self.image_len / self.pitch;
+        (height - 1)
+            .checked_mul(src_pitch)
+            .and_then(|n| n.checked_add(row_bytes))
+            .filter(|&len| len <= isize::MAX as usize)
+            .ok_or(E_INVALIDARG)?;
+        let image = &mut self.pixels[self.pixel_offset..self.pixel_offset + self.image_len];
+        for (y, row) in image.chunks_exact_mut(self.pitch).enumerate() {
+            // SAFETY: the checked offset addresses a caller-provided row. No
+            // slice spans a gap between rows or extends past the final pixel.
+            let src = unsafe {
+                std::slice::from_raw_parts(
+                    desc.lpSurface.cast::<u8>().add(y * src_pitch),
+                    row_bytes,
+                )
+            };
+            row[..row_bytes].copy_from_slice(src);
         }
-        unsafe {
-            dc.bitmap = CreateDIBSection(
-                Some(dc.handle),
-                (&raw const info).cast::<BITMAPINFO>(),
-                DIB_RGB_COLORS,
-                &mut dc.bits,
-                None,
-                0,
-            )
-            .map_err(|_| DDERR_CANTCREATEDC)?;
-            dc.previous = SelectObject(dc.handle, dc.bitmap.into());
-            if dc.bits.is_null() || dc.previous.is_invalid() {
-                return Err(DDERR_CANTCREATEDC.into());
-            }
-        }
-        Ok(dc)
-    }
-
-    fn bits_slice(&self, len: usize) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.bits.cast::<u8>(), len) }
-    }
-
-    fn bits_slice_mut(&mut self, len: usize) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.bits.cast::<u8>(), len) }
-    }
-
-    fn sync_palette(&self, entries: &[PALETTEENTRY; 256]) {
-        let mut quads = [RGBQUAD::default(); 256];
-        for (q, e) in quads.iter_mut().zip(entries.iter()) {
-            q.rgbBlue = e.peBlue;
-            q.rgbGreen = e.peGreen;
-            q.rgbRed = e.peRed;
-        }
-        unsafe {
-            let _ = SetDIBColorTable(self.handle, 0, &quads);
-        }
+        Ok(())
     }
 }
 
-impl Drop for SurfaceDc {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.previous.is_invalid() {
-                let _ = SelectObject(self.handle, self.previous);
-            }
-            if !self.handle.is_invalid() {
-                let _ = DeleteDC(self.handle);
-            }
-            if !self.bitmap.is_invalid() {
-                let _ = DeleteObject(self.bitmap.into());
-            }
-        }
+fn supplied_pitch(desc: &DDSURFACEDESC) -> Option<i32> {
+    if desc.dwFlags & DDSD_PITCH as u32 != 0 {
+        // DDSD_PITCH selects the signed pitch member of this DWORD union.
+        Some(unsafe { desc.Anonymous1.lPitch })
+    } else {
+        None
     }
 }
 
@@ -539,12 +469,9 @@ pub struct SurfaceData {
     pub width: u32,
     pub height: u32,
     access: Access,
-    pitch: usize,
-    pixel_offset: usize,
-    image_len: usize,
     format: Format,
     caps: u32,
-    pixels: Vec<u8>,
+    storage: PixelStorage,
     cached_dc: Option<SurfaceDc>,
     palette: Option<IDirectDrawPalette>,
     clipper: Option<IDirectDrawClipper>,
@@ -562,30 +489,22 @@ pub struct SurfaceData {
 
 impl SurfaceData {
     fn new(width: u32, height: u32, format: Format, caps: u32) -> Result<Self> {
-        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
-            return Err(E_INVALIDARG.into());
-        }
-        let pitch = (width as usize)
-            .checked_mul(format.bytes())
-            .and_then(|v| v.checked_add(3))
-            .map(|v| v & !3)
-            .filter(|v| *v <= i32::MAX as usize)
-            .ok_or(E_OUTOFMEMORY)?;
-        let image_len = pitch.checked_mul(height as usize).ok_or(E_OUTOFMEMORY)?;
-        let (top_guard, bottom_guard) = guard_padding(pitch);
-        let alloc_len = top_guard
-            .checked_add(image_len)
-            .and_then(|v| v.checked_add(bottom_guard))
-            .ok_or(E_OUTOFMEMORY)?;
+        Self::with_pitch(width, height, format, caps, None)
+    }
+
+    fn with_pitch(
+        width: u32,
+        height: u32,
+        format: Format,
+        caps: u32,
+        pitch: Option<i32>,
+    ) -> Result<Self> {
         Ok(Self {
             width,
             height,
-            pitch,
-            pixel_offset: top_guard,
-            image_len,
             format,
             caps,
-            pixels: zeros(alloc_len)?,
+            storage: PixelStorage::new(width, height, format, pitch)?,
             cached_dc: None,
             palette: None,
             clipper: None,
@@ -604,7 +523,8 @@ impl SurfaceData {
     }
 
     pub fn pixel_slice(&self) -> &[u8] {
-        &self.pixels[self.pixel_offset..self.pixel_offset + self.image_len]
+        &self.storage.pixels
+            [self.storage.pixel_offset..self.storage.pixel_offset + self.storage.image_len]
     }
 
     pub fn pixel_format(&self) -> PixelFormat {
@@ -612,20 +532,26 @@ impl SurfaceData {
     }
 
     pub fn pitch(&self) -> u32 {
-        self.pitch as u32
+        self.storage.pitch as u32
     }
 
     fn pixel_slice_mut(&mut self) -> &mut [u8] {
-        let start = self.pixel_offset;
-        &mut self.pixels[start..start + self.image_len]
+        let start = self.storage.pixel_offset;
+        &mut self.storage.pixels[start..start + self.storage.image_len]
     }
 
     fn surface_ptr(&mut self) -> *mut u8 {
-        self.pixels.as_mut_ptr().wrapping_add(self.pixel_offset)
+        self.storage
+            .pixels
+            .as_mut_ptr()
+            .wrapping_add(self.storage.pixel_offset)
     }
 
     fn surface_ptr_const(&self) -> *const u8 {
-        self.pixels.as_ptr().wrapping_add(self.pixel_offset)
+        self.storage
+            .pixels
+            .as_ptr()
+            .wrapping_add(self.storage.pixel_offset)
     }
 
     fn ensure_cached_dc(&mut self) -> Result<()> {
@@ -636,7 +562,14 @@ impl SurfaceData {
     }
 
     pub fn byte_len(&self) -> usize {
-        self.image_len
+        self.storage.image_len
+    }
+
+    fn has_same_layout(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.storage.pitch == other.storage.pitch
+            && self.format == other.format
     }
 
     pub fn has_dc(&self, hdc: HDC) -> bool {
@@ -655,13 +588,17 @@ impl SurfaceData {
         self.uniqueness = self.uniqueness.wrapping_add(1);
     }
 
-    fn clamp_rect(&self, rect: *const RECT) -> Option<RECT> {
-        let r = unsafe { rect.as_ref() }.copied().unwrap_or(RECT {
+    fn full_rect(&self) -> RECT {
+        RECT {
             left: 0,
             top: 0,
             right: self.width as i32,
             bottom: self.height as i32,
-        });
+        }
+    }
+
+    fn clamp_rect(&self, rect: Option<RECT>) -> Option<RECT> {
+        let r = rect.unwrap_or_else(|| self.full_rect());
         let left = r.left.clamp(0, self.width as i32);
         let top = r.top.clamp(0, self.height as i32);
         let right = r.right.clamp(0, self.width as i32);
@@ -678,13 +615,8 @@ impl SurfaceData {
         }
     }
 
-    fn bounds(&self, rect: *const RECT) -> Result<RECT> {
-        let r = unsafe { rect.as_ref() }.copied().unwrap_or(RECT {
-            left: 0,
-            top: 0,
-            right: self.width as i32,
-            bottom: self.height as i32,
-        });
+    fn bounds(&self, rect: Option<RECT>) -> Result<RECT> {
+        let r = rect.unwrap_or_else(|| self.full_rect());
         if r.left < 0
             || r.top < 0
             || r.right <= r.left
@@ -708,7 +640,7 @@ impl SurfaceData {
             ddpfPixelFormat: self.format.description(),
             ..Default::default()
         };
-        desc.Anonymous1.lPitch = self.pitch as i32;
+        desc.Anonymous1.lPitch = self.storage.pitch as i32;
         if backbuffer_count > 0 {
             desc.dwFlags |= DDSD_BACKBUFFERCOUNT as u32;
             desc.dwBackBufferCount = backbuffer_count;
@@ -736,10 +668,10 @@ impl SurfaceData {
         !matches!(self.access, Access::Ready)
     }
 
-    fn lock_owner_tid(&self) -> u32 {
+    fn lock_owner_tid(&self) -> Option<ThreadId> {
         match self.access {
-            Access::Ready => 0,
-            Access::Locked { owner_tid, .. } | Access::Gdi { owner_tid, .. } => owner_tid,
+            Access::Ready => None,
+            Access::Locked { owner_tid, .. } | Access::Gdi { owner_tid, .. } => Some(owner_tid),
         }
     }
 
@@ -756,15 +688,12 @@ impl SurfaceData {
     }
 
     fn palette_entries(&self) -> Result<[PALETTEENTRY; 256]> {
-        let mut entries = [PALETTEENTRY::default(); 256];
         if self.format == Format::Indexed {
             if let Some(palette) = &self.palette {
-                unsafe {
-                    palette.GetEntries(0, 0, 256, entries.as_mut_ptr())?;
-                }
+                return crate::palette::snapshot(palette);
             }
         }
-        Ok(entries)
+        Ok([PALETTEENTRY::default(); 256])
     }
 
     /// Builds the 256-entry RGBA lookup table uploaded to the WGSL presentation shader.
@@ -840,7 +769,7 @@ pub fn frame_rgba(data: &SurfaceData, rgba: &mut Vec<u8>) -> Result<()> {
         .map_err(|_| E_OUTOFMEMORY)?;
     rgba.resize(size, 0);
     let gamma = data.gamma.as_ref();
-    let src_rows = data.pixel_slice().chunks_exact(data.pitch);
+    let src_rows = data.pixel_slice().chunks_exact(data.storage.pitch);
     let dst_rows = rgba.chunks_exact_mut(width * 4);
 
     match data.format {
@@ -990,15 +919,11 @@ struct Surface {
     data: Arc<SurfaceSlot>,
     is_primary: bool,
     attached: Mutex<Vec<IDirectDrawSurface>>,
-    self_raw: AtomicPtr<c_void>,
 }
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        let raw = self.self_raw.swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !raw.is_null() {
-            self.display.unregister_surface(raw);
-        }
+        self.display.unregister_surface(&self.data);
     }
 }
 
@@ -1013,19 +938,16 @@ fn register_surface_object(
         data: data.clone(),
         is_primary,
         attached: Mutex::new(attached),
-        self_raw: AtomicPtr::new(std::ptr::null_mut()),
     }
     .into();
-    let raw = iface.as_raw();
-    iface
-        .cast_object_ref::<Surface>()?
-        .self_raw
-        .store(raw, Ordering::Release);
-    display.register_surface(raw, Arc::downgrade(&data));
+    display.register_surface(iface.downgrade()?, Arc::downgrade(&data), is_primary);
     Ok(iface)
 }
 
-pub fn create_surface(
+/// # Safety
+/// When DDSD_LPSURFACE supplies an image, its pointer must be readable for
+/// every row described by the source pitch, pixel format, and dimensions.
+pub unsafe fn create_surface(
     display: Arc<DisplayShared>,
     desc: &DDSURFACEDESC,
 ) -> Result<IDirectDrawSurface> {
@@ -1124,28 +1046,10 @@ pub fn create_surface(
     if desc.dwFlags & DDSD_CKDESTOVERLAY as u32 != 0 {
         data.dest_overlay_key = Some(desc.ddckCKDestOverlay);
     }
-    if desc.dwFlags & DDSD_LPSURFACE as u32 != 0 && !desc.lpSurface.is_null() {
-        let src_pitch = if desc.dwFlags & DDSD_PITCH as u32 != 0 {
-            let p = unsafe { desc.Anonymous1.lPitch };
-            if p <= 0 || (p as usize) < width as usize * format.bytes() {
-                return Err(E_INVALIDARG.into());
-            }
-            p as usize
-        } else {
-            data.pitch
-        };
-        let row_bytes = width as usize * format.bytes();
-        let dst_ptr = data.surface_ptr();
-        for y in 0..height as usize {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    desc.lpSurface.cast::<u8>().add(y * src_pitch),
-                    dst_ptr.add(y * data.pitch),
-                    row_bytes,
-                );
-            }
-        }
-    }
+    unsafe {
+        data.storage
+            .import_pixels(desc, width as usize * format.bytes())?
+    };
 
     let mut attached = Vec::new();
     if count > 0 {
@@ -1175,11 +1079,11 @@ pub fn create_surface(
     }
 
     let data = Arc::new(SurfaceSlot::new(data));
+    let surface = register_surface_object(display, data, primary, attached)?;
     if primary {
-        display.lock().primary = Arc::downgrade(&data);
         crate::window::set_mode(width, height, (format.bytes() * 8) as u32, true);
     }
-    register_surface_object(display, data, primary, attached)
+    Ok(surface)
 }
 
 pub fn duplicate_surface(
@@ -1195,7 +1099,13 @@ pub fn duplicate_surface(
     {
         return Err(DDERR_CANTDUPLICATE.into());
     }
-    let mut copy = SurfaceData::new(src.width, src.height, src.format, src.caps)?;
+    let mut copy = SurfaceData::with_pitch(
+        src.width,
+        src.height,
+        src.format,
+        src.caps,
+        Some(src.storage.pitch as i32),
+    )?;
     copy.pixel_slice_mut().copy_from_slice(src.pixel_slice());
     copy.palette = src.palette.clone();
     copy.clipper = src.clipper.clone();
@@ -1231,12 +1141,7 @@ pub fn matches_desc(surface: &IDirectDrawSurface, filter: &DDSURFACEDESC) -> Res
         let a = &filter.ddpfPixelFormat;
         let b = &desc.ddpfPixelFormat;
         if a.dwFlags != b.dwFlags
-            || unsafe {
-                a.Anonymous1.dwRGBBitCount != b.Anonymous1.dwRGBBitCount
-                    || a.Anonymous2.dwRBitMask != b.Anonymous2.dwRBitMask
-                    || a.Anonymous3.dwGBitMask != b.Anonymous3.dwGBitMask
-                    || a.Anonymous4.dwBBitMask != b.Anonymous4.dwBBitMask
-            }
+            || crate::descriptor::rgb_layout(a) != crate::descriptor::rgb_layout(b)
         {
             return Ok(false);
         }
@@ -1364,8 +1269,8 @@ impl Surface {
 
     fn copy(
         &self,
-        source: &Surface_Impl,
-        src_rect: *const RECT,
+        source: &Surface,
+        src_rect: Option<RECT>,
         dest_rect: RECT,
         opts: BltOptions,
         wait: bool,
@@ -1373,6 +1278,7 @@ impl Surface {
         // Snapshot overlapping self-blits before mutably writing the destination.
         if Arc::ptr_eq(&source.data, &self.data) {
             let mut dst = self.data.lock_ready(wait)?;
+            dst.bounds(Some(dest_rect))?;
             let Some(src_rect) = dst.clamp_rect(src_rect) else {
                 return Ok(());
             };
@@ -1386,7 +1292,7 @@ impl Surface {
             let mut snapshot = zeros(row_bytes * (src_rect.bottom - src_rect.top) as usize)?;
             let src_pixels = dst.pixel_slice();
             for (y, row) in snapshot.chunks_exact_mut(row_bytes).enumerate() {
-                let start = (src_rect.top as usize + y) * dst.pitch
+                let start = (src_rect.top as usize + y) * dst.storage.pitch
                     + src_rect.left as usize * src_format.bytes();
                 row.copy_from_slice(&src_pixels[start..start + row_bytes]);
             }
@@ -1409,6 +1315,7 @@ impl Surface {
             dst.bump_uniqueness();
         } else {
             let (src, mut dst) = lock_pair_ready(&source.data, &self.data, wait)?;
+            dst.bounds(Some(dest_rect))?;
             let Some(src_rect) = src.clamp_rect(src_rect) else {
                 return Ok(());
             };
@@ -1422,7 +1329,7 @@ impl Surface {
                 &mut dst,
                 dest_rect,
                 src.pixel_slice(),
-                src.pitch,
+                src.storage.pitch,
                 src_format,
                 src_palette.as_ref(),
                 src_rect,
@@ -1441,8 +1348,9 @@ impl Surface {
         wait: bool,
     ) -> Result<()> {
         let mut dst = self.data.lock_ready(wait)?;
+        dst.bounds(Some(rect))?;
         let bytes = dst.format.bytes();
-        let pitch = dst.pitch;
+        let pitch = dst.storage.pitch;
         let width = (rect.right - rect.left) as usize;
         let height = (rect.bottom - rect.top) as usize;
         let dk = dst_key.map(|k| KeyRange {
@@ -1487,7 +1395,7 @@ impl Surface {
         if flags & !supported != 0 {
             return unsupported();
         }
-        let fx_ref = unsafe { fx.as_ref() };
+        let (dest, fx_ref) = unsafe { (dest.as_ref().copied(), fx.as_ref()) };
         if let Some(fx_val) = fx_ref {
             let needs_fx = flags
                 & ((DDBLT_COLORFILL
@@ -1561,6 +1469,7 @@ impl Surface {
         }
 
         let source_obj = source.ok()?.cast_object_ref::<Surface>()?;
+        let src = unsafe { src.as_ref() }.copied();
         let src_key = if flags & DDBLT_KEYSRCOVERRIDE as u32 != 0 {
             Some(fx_ref.ok_or(E_INVALIDARG)?.ddckSrcColorkey)
         } else if flags & DDBLT_KEYSRC as u32 != 0 {
@@ -1619,7 +1528,7 @@ impl Surface {
                             right: s_right,
                             bottom: s_bottom,
                         };
-                        self.copy(source_obj, &sub_src, sub, opts, wait)?;
+                        self.copy(source_obj, Some(sub_src), sub, opts, wait)?;
                     }
                 }
             }
@@ -1646,7 +1555,9 @@ impl Surface {
             return unsupported();
         }
         let source_obj = source.ok()?.cast_object_ref::<Surface>()?;
-        let s = source_obj.read()?.bounds(src_rect)?;
+        let s = source_obj
+            .read()?
+            .bounds(unsafe { src_rect.as_ref() }.copied())?;
         let left = i32::try_from(x).map_err(|_| DDERR_INVALIDRECT)?;
         let top = i32::try_from(y).map_err(|_| DDERR_INVALIDRECT)?;
         let rect = RECT {
@@ -1657,7 +1568,7 @@ impl Surface {
                 .ok_or(DDERR_INVALIDRECT)?,
             bottom: top.checked_add(s.bottom - s.top).ok_or(DDERR_INVALIDRECT)?,
         };
-        self.read()?.bounds(&rect)?;
+        self.read()?.bounds(Some(rect))?;
         let src_key = if flags & DDBLTFAST_SRCCOLORKEY != 0 {
             Some(source_obj.read()?.source_key.ok_or(DDERR_NOCOLORKEY)?)
         } else {
@@ -1671,7 +1582,7 @@ impl Surface {
         let wait = flags & DDBLTFAST_DONOTWAIT == 0;
         self.copy(
             source_obj,
-            &s,
+            Some(s),
             rect,
             BltOptions {
                 src_key,
@@ -1729,9 +1640,10 @@ impl Surface {
             }
             {
                 let (mut front, mut back_data) = lock_pair_ready(&self.data, &t_obj.data, wait)?;
-                std::mem::swap(&mut front.pixels, &mut back_data.pixels);
-                std::mem::swap(&mut front.pixel_offset, &mut back_data.pixel_offset);
-                std::mem::swap(&mut front.image_len, &mut back_data.image_len);
+                if !front.has_same_layout(&back_data) {
+                    return Err(DDERR_NOTFLIPPABLE.into());
+                }
+                std::mem::swap(&mut front.storage, &mut back_data.storage);
                 std::mem::swap(&mut front.cached_dc, &mut back_data.cached_dc);
                 front.bump_uniqueness();
                 back_data.bump_uniqueness();
@@ -1747,22 +1659,19 @@ impl Surface {
         }
         {
             let mut guards = lock_chain_ready(&slot_refs, wait)?;
-            let mut carried_pixels = std::mem::take(&mut guards[0].pixels);
-            let mut carried_offset = guards[0].pixel_offset;
-            let mut carried_len = guards[0].image_len;
-            let mut carried_dc = guards[0].cached_dc.take();
-            for data in guards[1..].iter_mut().rev() {
-                std::mem::swap(&mut data.pixels, &mut carried_pixels);
-                std::mem::swap(&mut data.pixel_offset, &mut carried_offset);
-                std::mem::swap(&mut data.image_len, &mut carried_len);
-                std::mem::swap(&mut data.cached_dc, &mut carried_dc);
-                data.bump_uniqueness();
+            if guards[1..]
+                .iter()
+                .any(|back| !guards[0].has_same_layout(back))
+            {
+                return Err(DDERR_NOTFLIPPABLE.into());
             }
-            guards[0].pixels = carried_pixels;
-            guards[0].pixel_offset = carried_offset;
-            guards[0].image_len = carried_len;
-            guards[0].cached_dc = carried_dc;
-            guards[0].bump_uniqueness();
+            let (front, backs) = guards.split_first_mut().expect("flip chain has a front");
+            for back in backs.iter_mut().rev() {
+                std::mem::swap(&mut front.storage, &mut back.storage);
+                std::mem::swap(&mut front.cached_dc, &mut back.cached_dc);
+                back.bump_uniqueness();
+            }
+            front.bump_uniqueness();
         }
         self.present_now()
     }
@@ -1810,14 +1719,14 @@ impl Surface {
         let wait = flags & DDLOCK_DONOTWAIT as u32 == 0;
         let count = self.backbuffer_chain_len();
         let mut data = self.data.lock_ready(wait)?;
-        let r = data.bounds(rect)?;
+        let r = data.bounds(unsafe { rect.as_ref() }.copied())?;
         let mut desc = data.desc(count);
-        let offset = r.top as usize * data.pitch + r.left as usize * data.format.bytes();
+        let offset = r.top as usize * data.storage.pitch + r.left as usize * data.format.bytes();
         desc.lpSurface = data.surface_ptr().wrapping_add(offset).cast();
         desc.dwFlags |= DDSD_LPSURFACE as u32;
         data.access = Access::Locked {
             rect: r,
-            owner_tid: current_tid(),
+            owner_tid: thread::current().id(),
         };
         Ok(desc)
     }
@@ -1829,7 +1738,7 @@ impl Surface {
         };
         if !address.is_null() {
             let base = data.surface_ptr() as usize;
-            let end = base.saturating_add(data.image_len);
+            let end = base.saturating_add(data.storage.image_len);
             let ptr = address as usize;
             if ptr < base || ptr >= end {
                 return Err(E_INVALIDARG.into());
@@ -1872,70 +1781,44 @@ impl Surface {
     }
 
     fn get_dd_interface_impl(&self, out: *mut *mut c_void) -> Result<()> {
-        if out.is_null() {
-            return Err(E_POINTER.into());
-        }
-        unsafe { out.write(std::ptr::null_mut()) };
+        // The caller supplies an output slot which may be uninitialized.
+        let out = unsafe { out.cast::<MaybeUninit<*mut c_void>>().as_mut() }.ok_or(E_POINTER)?;
+        out.write(std::ptr::null_mut());
         let parent = self.display.clone_owner_draw().ok_or(E_INVALIDARG)?;
-        unsafe { out.write(parent.into_raw()) };
+        out.write(parent.into_raw());
         Ok(())
     }
 
-    fn set_surface_desc_impl(&self, desc: &DDSURFACEDESC, flags: u32) -> Result<()> {
+    /// # Safety
+    /// A supplied DDSD_LPSURFACE image must contain each requested row of pixels.
+    unsafe fn set_surface_desc_impl(&self, desc: &DDSURFACEDESC, flags: u32) -> Result<()> {
         if flags != 0 {
             return Err(E_INVALIDARG.into());
         }
         let mut data = self.data.lock_ready(true)?;
-        if desc.dwFlags & DDSD_PIXELFORMAT as u32 != 0 {
-            data.format = Format::from_dd(&desc.ddpfPixelFormat)?;
-        }
-        if desc.dwFlags & DDSD_WIDTH as u32 != 0 {
-            if desc.dwWidth == 0 || desc.dwWidth > i32::MAX as u32 {
-                return Err(E_INVALIDARG.into());
-            }
-            data.width = desc.dwWidth;
-        }
-        if desc.dwFlags & DDSD_HEIGHT as u32 != 0 {
-            if desc.dwHeight == 0 || desc.dwHeight > i32::MAX as u32 {
-                return Err(E_INVALIDARG.into());
-            }
-            data.height = desc.dwHeight;
-        }
-        let min_pitch = (data.width as usize)
-            .checked_mul(data.format.bytes())
-            .ok_or(E_OUTOFMEMORY)?;
-        let pitch = if desc.dwFlags & DDSD_PITCH as u32 != 0 {
-            let p = unsafe { desc.Anonymous1.lPitch };
-            if p <= 0 || (p as usize) < min_pitch {
-                return Err(E_INVALIDARG.into());
-            }
-            p as usize
+        let format = if desc.dwFlags & DDSD_PIXELFORMAT as u32 != 0 {
+            Format::from_dd(&desc.ddpfPixelFormat)?
         } else {
-            min_pitch
-                .checked_add(3)
-                .map(|v| v & !3)
-                .filter(|v| *v <= i32::MAX as usize)
-                .ok_or(E_OUTOFMEMORY)?
+            data.format
         };
-        let image_len = pitch
-            .checked_mul(data.height as usize)
-            .ok_or(E_OUTOFMEMORY)?;
-        let (top_guard, bottom_guard) = guard_padding(pitch);
-        let alloc_len = top_guard
-            .checked_add(image_len)
-            .and_then(|v| v.checked_add(bottom_guard))
-            .ok_or(E_OUTOFMEMORY)?;
-        data.pitch = pitch;
-        data.pixel_offset = top_guard;
-        data.image_len = image_len;
-        data.pixels = zeros(alloc_len)?;
+        let width = if desc.dwFlags & DDSD_WIDTH as u32 != 0 {
+            desc.dwWidth
+        } else {
+            data.width
+        };
+        let height = if desc.dwFlags & DDSD_HEIGHT as u32 != 0 {
+            desc.dwHeight
+        } else {
+            data.height
+        };
+        let mut storage = PixelStorage::new(width, height, format, supplied_pitch(desc))?;
+        // The input can point to the old surface. Keep it alive until all rows have been copied.
+        unsafe { storage.import_pixels(desc, width as usize * format.bytes())? };
+        data.width = width;
+        data.height = height;
+        data.format = format;
+        data.storage = storage;
         data.cached_dc = None;
-        if desc.dwFlags & DDSD_LPSURFACE as u32 != 0 && !desc.lpSurface.is_null() {
-            let dst_ptr = data.surface_ptr();
-            unsafe {
-                std::ptr::copy_nonoverlapping(desc.lpSurface.cast::<u8>(), dst_ptr, image_len);
-            }
-        }
         data.bump_uniqueness();
         Ok(())
     }
@@ -2016,7 +1899,9 @@ impl Surface {
     }
 
     fn get_uniqueness_value_impl(&self, out: *mut u32) -> Result<()> {
-        *unsafe { out.as_mut() }.ok_or(E_INVALIDARG)? = self.read()?.uniqueness;
+        unsafe { out.cast::<MaybeUninit<u32>>().as_mut() }
+            .ok_or(E_INVALIDARG)?
+            .write(self.read()?.uniqueness);
         Ok(())
     }
 
@@ -2031,7 +1916,9 @@ impl Surface {
     }
 
     fn get_priority_impl(&self, out: *mut u32) -> Result<()> {
-        *unsafe { out.as_mut() }.ok_or(E_INVALIDARG)? = self.read()?.priority;
+        unsafe { out.cast::<MaybeUninit<u32>>().as_mut() }
+            .ok_or(E_INVALIDARG)?
+            .write(self.read()?.priority);
         Ok(())
     }
 
@@ -2041,7 +1928,9 @@ impl Surface {
     }
 
     fn get_lod_impl(&self, out: *mut u32) -> Result<()> {
-        *unsafe { out.as_mut() }.ok_or(E_INVALIDARG)? = self.read()?.lod;
+        unsafe { out.cast::<MaybeUninit<u32>>().as_mut() }
+            .ok_or(E_INVALIDARG)?
+            .write(self.read()?.lod);
         Ok(())
     }
 
@@ -2054,11 +1943,15 @@ impl Surface {
 
     fn get_overlay_position_impl(&self, x: *mut i32, y: *mut i32) -> Result<()> {
         self.ensure_overlay()?;
-        let x = unsafe { x.as_mut() }.ok_or(E_INVALIDARG)?;
-        let y = unsafe { y.as_mut() }.ok_or(E_INVALIDARG)?;
+        if x.is_null() || y.is_null() {
+            return Err(E_INVALIDARG.into());
+        }
         let data = self.read()?;
-        *x = data.overlay.x;
-        *y = data.overlay.y;
+        // Output slots may be uninitialized or coincide.
+        unsafe {
+            x.write(data.overlay.x);
+            y.write(data.overlay.y);
+        }
         Ok(())
     }
 
@@ -2080,8 +1973,8 @@ impl Surface {
     ) -> Result<()> {
         self.ensure_overlay()?;
         let dest_obj = dest.ok()?.cast_object_ref::<Surface>()?;
+        let (dest_rect, fx_ref) = unsafe { (dest_rect.as_ref().copied(), fx.as_ref()) };
         let d_rect = dest_obj.read()?.bounds(dest_rect)?;
-        let fx_ref = unsafe { fx.as_ref() };
         let src_key = if flags & DDOVER_KEYSRCOVERRIDE as u32 != 0 {
             Some(fx_ref.ok_or(E_INVALIDARG)?.dckSrcColorkey)
         } else if flags & DDOVER_KEYSRC as u32 != 0 {
@@ -2107,12 +2000,9 @@ impl Surface {
             }
         }
         if flags & DDOVER_HIDE as u32 == 0 && self.read()?.overlay.visible {
-            let raw = self.self_raw.load(Ordering::Acquire);
-            let me = unsafe { IDirectDrawSurface::from_raw_borrowed(&raw) }.ok_or(E_INVALIDARG)?;
-            let me_obj = me.cast_object_ref::<Surface>()?;
             dest_obj.copy(
-                me_obj,
-                src_rect,
+                self,
+                unsafe { src_rect.as_ref() }.copied(),
                 d_rect,
                 BltOptions {
                     src_key,
@@ -2128,201 +2018,14 @@ impl Surface {
     }
 }
 
-fn pixel_in_key(pixel: &[u8], range: DDCOLORKEY) -> bool {
-    let mut word = [0u8; 4];
-    word[..pixel.len()].copy_from_slice(pixel);
-    (range.dwColorSpaceLowValue..=range.dwColorSpaceHighValue).contains(&u32::from_le_bytes(word))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn blit(
-    dst: &mut SurfaceData,
-    dest: RECT,
-    source: &[u8],
-    pitch: usize,
-    src_format: Format,
-    src_palette: Option<&[PALETTEENTRY; 256]>,
-    src: RECT,
-    opts: BltOptions,
-) {
-    let dst_bytes = dst.format.bytes();
-    let src_bytes = src_format.bytes();
-    let same_format = dst.format == src_format;
-    let (dw, dh) = (
-        (dest.right - dest.left) as usize,
-        (dest.bottom - dest.top) as usize,
-    );
-    let (sw, sh) = (
-        (src.right - src.left) as usize,
-        (src.bottom - src.top) as usize,
-    );
-    if same_format && dw == sw && !opts.mirror_lr {
-        let sk = opts.src_key.map(|k| KeyRange {
-            lo: k.dwColorSpaceLowValue,
-            hi: k.dwColorSpaceHighValue,
-        });
-        let dk = opts.dst_key.map(|k| KeyRange {
-            lo: k.dwColorSpaceLowValue,
-            hi: k.dwColorSpaceHighValue,
-        });
-        let dst_pitch = dst.pitch;
-        let dst_pixels = dst.pixel_slice_mut();
-        simd_blit::blit_rect_same_format(
-            dst_pixels,
-            dst_pitch,
-            dest.left as usize,
-            dest.top as usize,
-            source,
-            pitch,
-            src.left as usize,
-            src.top as usize,
-            dw,
-            dh,
-            sh,
-            opts.mirror_ud,
-            dst_bytes,
-            sk,
-            dk,
-        );
-        return;
-    }
-    // Fast 16.16 fixed-point DDA stretch blit for same-format non-keyed copies, with row reuse.
-    if same_format && opts.src_key.is_none() && opts.dst_key.is_none() && !opts.mirror_lr {
-        let dst_pitch = dst.pitch;
-        let dst_pixels = dst.pixel_slice_mut();
-        let x_step = ((sw as u64) << 16) / (dw as u64);
-        let y_step = if dh == sh {
-            0u64
-        } else {
-            ((sh as u64) << 16) / (dh as u64)
-        };
-        let row_bytes = dw * dst_bytes;
-        let mut y_acc = 0u64;
-        let mut prev_sy = usize::MAX;
-        for y in 0..dh {
-            let src_y_rel = if dh == sh {
-                y
-            } else {
-                let r = (y_acc >> 16) as usize;
-                y_acc += y_step;
-                r
-            };
-            let sy = if opts.mirror_ud {
-                src.top as usize + (sh - 1 - src_y_rel)
-            } else {
-                src.top as usize + src_y_rel
-            };
-            let dst_start = (dest.top as usize + y) * dst_pitch + dest.left as usize * dst_bytes;
-            if y > 0 && sy == prev_sy {
-                let prev_start = dst_start - dst_pitch;
-                dst_pixels.copy_within(prev_start..prev_start + row_bytes, dst_start);
-                continue;
-            }
-            prev_sy = sy;
-            let src_start = sy * pitch + src.left as usize * src_bytes;
-            let s_row = &source[src_start..src_start + sw * src_bytes];
-            let d_row = &mut dst_pixels[dst_start..dst_start + row_bytes];
-            let step32 = x_step as u32;
-            let max_src_idx = (((dw - 1) as u64 * x_step) >> 16) as usize;
-            let mut acc = 0u32;
-            match dst_bytes {
-                1 => {
-                    assert!(max_src_idx < s_row.len());
-                    for out_px in d_row.iter_mut() {
-                        // SAFETY: max_src_idx < s_row.len() and acc is monotonically bounded by (dw - 1) * x_step.
-                        *out_px = unsafe { *s_row.get_unchecked((acc >> 16) as usize) };
-                        acc = acc.wrapping_add(step32);
-                    }
-                }
-                2 => {
-                    let s_u16 = s_row.as_chunks::<2>().0;
-                    assert!(max_src_idx < s_u16.len());
-                    for out_px in d_row.as_chunks_mut::<2>().0.iter_mut() {
-                        // SAFETY: max_src_idx < s_u16.len() and acc is monotonically bounded by (dw - 1) * x_step.
-                        *out_px = unsafe { *s_u16.get_unchecked((acc >> 16) as usize) };
-                        acc = acc.wrapping_add(step32);
-                    }
-                }
-                _ => {
-                    let s_u32 = s_row.as_chunks::<4>().0;
-                    assert!(max_src_idx < s_u32.len());
-                    for out_px in d_row.as_chunks_mut::<4>().0.iter_mut() {
-                        // SAFETY: max_src_idx < s_u32.len() and acc is monotonically bounded by (dw - 1) * x_step.
-                        *out_px = unsafe { *s_u32.get_unchecked((acc >> 16) as usize) };
-                        acc = acc.wrapping_add(step32);
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    let default_pal = [PALETTEENTRY::default(); 256];
-    let pal = src_palette.unwrap_or(&default_pal);
-    let dst_format = dst.format;
-    let dst_pitch = dst.pitch;
-    let dst_pixels = dst.pixel_slice_mut();
-    let x_step = ((sw as u64) << 16) / (dw as u64);
-    let y_step = if dh == sh {
-        0u64
-    } else {
-        ((sh as u64) << 16) / (dh as u64)
-    };
-    let mut y_acc = 0u64;
-    for y in 0..dh {
-        let src_y_rel = if dh == sh {
-            y
-        } else {
-            let r = (y_acc >> 16) as usize;
-            y_acc += y_step;
-            r
-        };
-        let sy = if opts.mirror_ud {
-            src.top as usize + (sh - 1 - src_y_rel)
-        } else {
-            src.top as usize + src_y_rel
-        };
-        let start = sy * pitch + src.left as usize * src_bytes;
-        let row = &source[start..start + sw * src_bytes];
-        let d_start = (dest.top as usize + y) * dst_pitch + dest.left as usize * dst_bytes;
-        let out = &mut dst_pixels[d_start..d_start + dw * dst_bytes];
-        let mut x_acc = 0u64;
-        for target in out.chunks_exact_mut(dst_bytes) {
-            let src_x_rel = (x_acc >> 16) as usize;
-            x_acc += x_step;
-            let sx = if opts.mirror_lr {
-                (sw - 1 - src_x_rel) * src_bytes
-            } else {
-                src_x_rel * src_bytes
-            };
-            let pixel = &row[sx..sx + src_bytes];
-            if let Some(range) = opts.src_key {
-                if pixel_in_key(pixel, range) {
-                    continue;
-                }
-            }
-            if let Some(range) = opts.dst_key {
-                if !pixel_in_key(target, range) {
-                    continue;
-                }
-            }
-            if same_format {
-                target.copy_from_slice(pixel);
-            } else {
-                let rgb = src_format.decode_rgb(pixel, pal);
-                dst_format.encode_rgb(rgb, target);
-            }
-        }
-    }
-}
-
 impl IDirectDrawGammaControl_Impl for Surface_Impl {
     fn GetGammaRamp(&self, flags: u32, ramp: *mut DDGAMMARAMP) -> Result<()> {
         if flags != 0 {
             return Err(E_INVALIDARG.into());
         }
-        let out = unsafe { ramp.as_mut() }.ok_or(E_INVALIDARG)?;
-        *out = self.read()?.gamma.unwrap_or_else(identity_gamma_ramp);
+        let out =
+            unsafe { ramp.cast::<MaybeUninit<DDGAMMARAMP>>().as_mut() }.ok_or(E_INVALIDARG)?;
+        out.write(self.read()?.gamma.unwrap_or_else(identity_gamma_ramp));
         Ok(())
     }
 
@@ -2392,7 +2095,10 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
     }
 
     fn GetCaps(&self, caps: *mut DDSCAPS) -> Result<()> {
-        unsafe { caps.as_mut() }.ok_or(E_INVALIDARG)?.dwCaps = self.read()?.caps;
+        let out = unsafe { caps.cast::<MaybeUninit<DDSCAPS>>().as_mut() }.ok_or(E_INVALIDARG)?;
+        out.write(DDSCAPS {
+            dwCaps: self.read()?.caps,
+        });
         Ok(())
     }
 
@@ -2416,7 +2122,7 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
     }
 
     fn GetColorKey(&self, flags: u32, key: *mut DDCOLORKEY) -> Result<()> {
-        let out = unsafe { key.as_mut() }.ok_or(E_INVALIDARG)?;
+        let out = unsafe { key.cast::<MaybeUninit<DDCOLORKEY>>().as_mut() }.ok_or(E_INVALIDARG)?;
         let data = self.read()?;
         let stored = match flags as i32 {
             DDCKEY_SRCBLT => data.source_key,
@@ -2425,7 +2131,7 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
             DDCKEY_DESTOVERLAY => data.dest_overlay_key,
             _ => return unsupported(),
         };
-        *out = stored.ok_or(DDERR_NOCOLORKEY)?;
+        out.write(stored.ok_or(DDERR_NOCOLORKEY)?);
         Ok(())
     }
 
@@ -2455,30 +2161,19 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
     }
 
     fn GetPixelFormat(&self, out: *mut DDPIXELFORMAT) -> Result<()> {
-        let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
-        if out.dwSize as usize != size_of::<DDPIXELFORMAT>() {
-            return Err(E_INVALIDARG.into());
-        }
-        *out = self.read()?.format.description();
+        unsafe { crate::descriptor::output(out)? }.write(self.read()?.format.description());
         Ok(())
     }
 
     fn GetSurfaceDesc(&self, out: *mut DDSURFACEDESC) -> Result<()> {
-        let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
-        if out.dwSize as usize != size_of::<DDSURFACEDESC>() {
-            return Err(E_INVALIDARG.into());
-        }
+        let out = unsafe { crate::descriptor::output(out)? };
         let count = self.backbuffer_chain_len();
-        *out = self.read()?.desc(count);
+        out.write(self.read()?.desc(count));
         Ok(())
     }
 
     fn Lock(&self, rect: *mut RECT, out: *mut DDSURFACEDESC, flags: u32, _: HANDLE) -> Result<()> {
-        let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
-        if out.dwSize as usize != size_of::<DDSURFACEDESC>() {
-            return Err(E_INVALIDARG.into());
-        }
-        *out = self.lock_desc(rect, flags)?;
+        unsafe { crate::descriptor::output(out)? }.write(self.lock_desc(rect, flags)?);
         Ok(())
     }
 
@@ -2533,7 +2228,7 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
     }
     fn AddOverlayDirtyRect(&self, rect: *mut RECT) -> Result<()> {
         self.ensure_overlay()?;
-        self.read()?.bounds(rect)?;
+        self.read()?.bounds(unsafe { rect.as_ref() }.copied())?;
         Ok(())
     }
     fn BltBatch(&self, batch: *mut DDBLTBATCH, count: u32, flags: u32) -> Result<()> {
@@ -2553,13 +2248,9 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
         Ok(())
     }
     fn GetDC(&self, out: *mut HDC) -> Result<()> {
-        if out.is_null() {
-            return Err(E_INVALIDARG.into());
-        }
-        unsafe {
-            out.write(HDC::default());
-        }
-        let tid = current_tid();
+        let out = unsafe { out.cast::<MaybeUninit<HDC>>().as_mut() }.ok_or(E_INVALIDARG)?;
+        out.write(HDC::default());
+        let tid = thread::current().id();
         {
             let data = self.data.lock();
             if matches!(data.access, Access::Gdi { owner_tid, .. } if owner_tid == tid) {
@@ -2574,27 +2265,24 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
         };
         let own_dc = data.caps & DDSCAPS_OWNDC as u32 != 0;
         let uniqueness = data.uniqueness;
-        let len = data.image_len;
+        let len = data.storage.image_len;
+        let pitch = data.storage.pitch;
         data.ensure_cached_dc()?;
-        let src_start = data.pixel_offset;
+        let src_start = data.storage.pixel_offset;
         let SurfaceData {
-            ref pixels,
+            ref storage,
             ref mut cached_dc,
             ..
         } = *data;
         let dc = cached_dc.as_mut().expect("cached_dc initialized");
-        if dc.synced_uniqueness != uniqueness {
-            simd_blit::copy_bytes(&pixels[src_start..src_start + len], dc.bits_slice_mut(len));
-            dc.synced_uniqueness = uniqueness;
-        }
-        if let Some(ref entries) = entries {
-            dc.sync_palette(entries);
-        }
-        let handle = dc.handle;
-        let saved_state = if own_dc { 0 } else { unsafe { SaveDC(handle) } };
-        unsafe {
-            out.write(handle);
-        }
+        let (handle, saved_state) = dc.begin_drawing(
+            &storage.pixels[src_start..src_start + len],
+            pitch,
+            uniqueness,
+            entries.as_ref(),
+            own_dc,
+        );
+        out.write(handle);
         data.access = Access::Gdi {
             handle,
             saved_state,
@@ -2616,25 +2304,23 @@ impl IDirectDrawSurface_Impl for Surface_Impl {
         if handle != dc_handle {
             return Err(E_INVALIDARG.into());
         }
-        unsafe {
-            // GDI queues draws on the calling thread; flush before copying back to stable surface RAM.
-            let _ = GdiFlush();
-            if saved_state != 0 {
-                let _ = RestoreDC(dc_handle, saved_state);
-            }
-        }
-        let len = data.image_len;
-        let dst_start = data.pixel_offset;
+        let len = data.storage.image_len;
+        let pitch = data.storage.pitch;
+        let dst_start = data.storage.pixel_offset;
         data.bump_uniqueness();
         let new_uniqueness = data.uniqueness;
         let SurfaceData {
-            ref mut pixels,
+            ref mut storage,
             ref mut cached_dc,
             ..
         } = *data;
         if let Some(dc) = cached_dc.as_mut() {
-            simd_blit::copy_bytes(dc.bits_slice(len), &mut pixels[dst_start..dst_start + len]);
-            dc.synced_uniqueness = new_uniqueness;
+            dc.finish_drawing(
+                &mut storage.pixels[dst_start..dst_start + len],
+                pitch,
+                new_uniqueness,
+                saved_state,
+            );
         }
         data.access = Access::Ready;
         drop(data);
@@ -2956,11 +2642,8 @@ impl IDirectDrawSurface3_Impl for Surface_Impl {
         Ok(())
     }
     fn SetSurfaceDesc(&self, desc: *mut DDSURFACEDESC, flags: u32) -> Result<()> {
-        let desc = unsafe { desc.as_ref() }.ok_or(E_INVALIDARG)?;
-        if desc.dwSize as usize != size_of::<DDSURFACEDESC>() {
-            return Err(E_INVALIDARG.into());
-        }
-        self.set_surface_desc_impl(desc, flags)
+        // The caller supplies the descriptor and any backing image requested by DDSD_LPSURFACE.
+        unsafe { self.set_surface_desc_impl(&crate::descriptor::read(desc)?, flags) }
     }
 }
 
@@ -3043,11 +2726,11 @@ impl IDirectDrawSurface4_Impl for Surface_Impl {
         IDirectDrawSurface_Impl::GetBltStatus(self, flags)
     }
     fn GetCaps(&self, caps: *mut DDSCAPS2) -> Result<()> {
-        let out = unsafe { caps.as_mut() }.ok_or(E_INVALIDARG)?;
-        *out = DDSCAPS2 {
+        let out = unsafe { caps.cast::<MaybeUninit<DDSCAPS2>>().as_mut() }.ok_or(E_INVALIDARG)?;
+        out.write(DDSCAPS2 {
             dwCaps: self.read()?.caps,
             ..Default::default()
-        };
+        });
         Ok(())
     }
     fn GetClipper(&self) -> Result<IDirectDrawClipper> {
@@ -3072,12 +2755,9 @@ impl IDirectDrawSurface4_Impl for Surface_Impl {
         IDirectDrawSurface_Impl::GetPixelFormat(self, out)
     }
     fn GetSurfaceDesc(&self, out: *mut DDSURFACEDESC2) -> Result<()> {
-        let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
-        if out.dwSize as usize != size_of::<DDSURFACEDESC2>() {
-            return Err(E_INVALIDARG.into());
-        }
+        let out = unsafe { crate::descriptor::output(out)? };
         let count = self.backbuffer_chain_len();
-        *out = desc_to_desc2(&self.read()?.desc(count));
+        out.write(desc_to_desc2(&self.read()?.desc(count)));
         Ok(())
     }
     fn Initialize(&self, _: Ref<IDirectDraw>, _: *mut DDSURFACEDESC2) -> Result<()> {
@@ -3087,11 +2767,8 @@ impl IDirectDrawSurface4_Impl for Surface_Impl {
         IDirectDrawSurface_Impl::IsLost(self)
     }
     fn Lock(&self, rect: *mut RECT, out: *mut DDSURFACEDESC2, flags: u32, _: HANDLE) -> Result<()> {
-        let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
-        if out.dwSize as usize != size_of::<DDSURFACEDESC2>() {
-            return Err(E_INVALIDARG.into());
-        }
-        *out = desc_to_desc2(&self.lock_desc(rect, flags)?);
+        unsafe { crate::descriptor::output(out)? }
+            .write(desc_to_desc2(&self.lock_desc(rect, flags)?));
         Ok(())
     }
     fn ReleaseDC(&self, handle: HDC) -> Result<()> {
@@ -3141,9 +2818,8 @@ impl IDirectDrawSurface4_Impl for Surface_Impl {
         Ok(())
     }
     fn SetSurfaceDesc(&self, desc: *mut DDSURFACEDESC2, flags: u32) -> Result<()> {
-        let d2 = unsafe { desc.as_ref() }.ok_or(E_INVALIDARG)?;
-        let d = desc2_to_desc(d2)?;
-        self.set_surface_desc_impl(&d, flags)
+        // The caller supplies the descriptor and any backing image requested by DDSD_LPSURFACE.
+        unsafe { self.set_surface_desc_impl(&crate::descriptor::read(desc)?, flags) }
     }
     fn SetPrivateData(
         &self,
@@ -3383,7 +3059,7 @@ mod tests {
             (Format::Rgb565, 0x0200u16, 64, 0xf800u16),
         ] {
             let mut surface = SurfaceData::new(1, 3, format, 0).unwrap();
-            assert_eq!(surface.pitch, 4);
+            assert_eq!(surface.storage.pitch, 4);
             for (row, color) in surface
                 .pixel_slice_mut()
                 .as_chunks_mut::<4>()
@@ -3445,7 +3121,7 @@ mod tests {
             &mut dst,
             rect,
             src.pixel_slice(),
-            src.pitch,
+            src.storage.pitch,
             Format::Rgb565,
             None,
             rect,
@@ -3462,26 +3138,107 @@ mod tests {
     #[test]
     fn surface_allocates_top_and_bottom_guard_padding() {
         let surface = SurfaceData::new(640, 480, Format::Rgb565, 0).unwrap();
-        assert_eq!(surface.pitch, 1280);
-        assert_eq!(surface.image_len, 1280 * 480);
-        assert!(surface.pixel_offset >= 1280 * 64);
-        assert!(surface.pixels.len() - (surface.pixel_offset + surface.image_len) >= 1280 * 200);
+        assert_eq!(surface.storage.pitch, 1280);
+        assert_eq!(surface.storage.image_len, 1280 * 480);
+        assert!(surface.storage.pixel_offset >= 1280 * 64);
+        assert!(
+            surface.storage.pixels.len()
+                - (surface.storage.pixel_offset + surface.storage.image_len)
+                >= 1280 * 200
+        );
     }
 
     #[test]
     fn get_dc_preserves_stable_surface_pointer_and_guard_padding() {
         let mut surface = SurfaceData::new(1024, 768, Format::Rgb565, 0).unwrap();
         let ptr_before = surface.surface_ptr();
-        let offset_before = surface.pixel_offset;
+        let offset_before = surface.storage.pixel_offset;
         surface.ensure_cached_dc().unwrap();
         assert_eq!(surface.surface_ptr(), ptr_before);
-        assert_eq!(surface.pixel_offset, offset_before);
-        assert!(surface.pixel_offset >= surface.pitch * 64);
+        assert_eq!(surface.storage.pixel_offset, offset_before);
+        assert!(surface.storage.pixel_offset >= surface.storage.pitch * 64);
+    }
+
+    #[test]
+    fn custom_surface_pitch_round_trips_through_gdi_and_rejects_partial_resize() {
+        use windows::Win32::Foundation::COLORREF;
+        use windows::Win32::Graphics::Gdi::{GetPixel, SetPixelV};
+
+        let display = DisplayShared::new(2, 2, 32);
+        let mut desc = DDSURFACEDESC {
+            dwSize: size_of::<DDSURFACEDESC>() as u32,
+            dwFlags: (DDSD_WIDTH | DDSD_HEIGHT | DDSD_CAPS) as u32,
+            dwWidth: 2,
+            dwHeight: 2,
+            ddsCaps: DDSCAPS {
+                dwCaps: DDSCAPS_OFFSCREENPLAIN as u32,
+            },
+            ..Default::default()
+        };
+        // Two visible eight-byte rows at pitch 12. There is no final padding.
+        let mut pixels = [0xadu8; 20];
+        pixels[12..16].copy_from_slice(&[1, 2, 3, 0]);
+        desc.dwFlags |= (DDSD_PITCH | DDSD_LPSURFACE) as u32;
+        desc.Anonymous1.lPitch = 12;
+        desc.lpSurface = pixels.as_mut_ptr().cast();
+        // All COM input/output buffers live through the calls.
+        unsafe {
+            let surface: IDirectDrawSurface3 = create_surface(display.clone(), &desc)
+                .unwrap()
+                .cast()
+                .unwrap();
+            let obj = surface.cast_object_ref::<Surface>().unwrap();
+            {
+                let data = obj.read().unwrap();
+                assert_eq!(data.pitch(), 8);
+                assert_eq!(&data.pixel_slice()[8..12], &[1, 2, 3, 0]);
+            }
+            surface.SetSurfaceDesc(&mut desc, 0).unwrap();
+            {
+                let mut data = obj.write().unwrap();
+                // Import skipped the external 0xad padding. External code
+                // may subsequently use padding in the surface it has locked.
+                assert_eq!(&data.pixel_slice()[8..12], &[0; 4]);
+                assert_eq!(&data.pixel_slice()[20..24], &[0; 4]);
+                data.pixel_slice_mut()[20..24].fill(0x57);
+            }
+            desc.dwFlags = (DDSD_WIDTH | DDSD_PITCH) as u32;
+            desc.dwWidth = 4;
+            assert_eq!(
+                surface.SetSurfaceDesc(&mut desc, 0).unwrap_err().code(),
+                E_INVALIDARG
+            );
+            let mut dc = HDC::default();
+            surface.GetDC(&mut dc).unwrap();
+            assert_eq!(GetPixel(dc, 0, 1), COLORREF(0x010203));
+            assert!(SetPixelV(dc, 1, 1, COLORREF(0x080706)).as_bool());
+            surface.ReleaseDC(dc).unwrap();
+            surface.GetSurfaceDesc(&mut desc).unwrap();
+            assert_eq!(
+                (desc.dwWidth, desc.dwHeight, desc.Anonymous1.lPitch),
+                (2, 2, 12)
+            );
+            let duplicate = duplicate_surface(display, &surface.cast().unwrap()).unwrap();
+            let data = surface
+                .cast_object_ref::<Surface>()
+                .unwrap()
+                .read()
+                .unwrap();
+            assert_eq!(&data.pixel_slice()[16..19], &[8, 7, 6]);
+            assert_eq!(&data.pixel_slice()[20..24], &[0x57; 4]);
+            let copy = duplicate
+                .cast_object_ref::<Surface>()
+                .unwrap()
+                .read()
+                .unwrap();
+            assert_eq!(copy.pitch(), 12);
+            assert_eq!(copy.pixel_slice(), data.pixel_slice());
+        }
     }
 
     #[test]
     fn cross_thread_primary_lock_and_blt_never_fail_with_null_surface() {
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Barrier;
 
         let display = crate::draw::DisplayShared::new(1024, 768, 16);
@@ -3503,8 +3260,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let primary = create_surface(display.clone(), &prim_desc).unwrap();
-        let back = create_surface(display.clone(), &back_desc).unwrap();
+        // Both descriptors request owned surface memory.
+        let primary = unsafe { create_surface(display.clone(), &prim_desc) }.unwrap();
+        let back = unsafe { create_surface(display.clone(), &back_desc) }.unwrap();
 
         // Same-thread Lock while GetDC is held must still fail immediately (no self-deadlock).
         let mut dc = HDC::default();
@@ -3535,10 +3293,10 @@ mod tests {
         };
         unsafe { primary.Lock(std::ptr::null_mut(), &mut main_lock, 0, HANDLE::default()) }
             .unwrap();
-        let raw_primary_addr = primary.as_raw() as usize;
+        let weak_primary = primary.downgrade().unwrap();
+        let worker_surface = weak_primary.clone();
         let dnw_code = std::thread::spawn(move || unsafe {
-            let raw = raw_primary_addr as *mut c_void;
-            let s = IDirectDrawSurface::from_raw_borrowed(&raw).unwrap();
+            let s = worker_surface.upgrade().unwrap();
             let mut d = DDSURFACEDESC {
                 dwSize: size_of::<DDSURFACEDESC>() as u32,
                 ..Default::default()
@@ -3564,8 +3322,7 @@ mod tests {
         let done_worker = Arc::clone(&done);
         let start_worker = Arc::clone(&start);
         let worker = std::thread::spawn(move || unsafe {
-            let raw = raw_primary_addr as *mut c_void;
-            let s = IDirectDrawSurface::from_raw_borrowed(&raw).unwrap();
+            let s = weak_primary.upgrade().unwrap();
             start_worker.wait();
             let mut cursor_buf = [0u16; 37 * 28];
             let mut locks = 0u32;
@@ -3601,7 +3358,7 @@ mod tests {
             locks
         });
 
-        let primary_slot = display.lock().primary.upgrade().unwrap();
+        let primary_slot = display.primary_slot().unwrap();
         let mut rect = RECT {
             left: 0,
             top: 0,

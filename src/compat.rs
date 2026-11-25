@@ -9,21 +9,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::core::{s, w, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HMODULE};
+use windows::core::{s, w, Owned};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
-use windows::Win32::System::LibraryLoader::{
-    GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW, GetProcAddress,
-    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, OpenThread, SetThreadAffinityMask,
+    GetCurrentProcessId, GetCurrentThread, OpenThread, SetThreadAffinityMask,
     THREAD_QUERY_INFORMATION, THREAD_SET_INFORMATION,
 };
 
 use crate::config;
+use crate::win32::{current_thread_id, module_path_at};
 
 const THREAD_QUERY_SET_WIN32_START_ADDRESS: u32 = 9;
 
@@ -35,19 +32,11 @@ static GAME_DIR_LOWER: OnceLock<Option<String>> = OnceLock::new();
 static NT_QUERY_THREAD: OnceLock<Option<NtQueryInformationThreadFn>> = OnceLock::new();
 static LOG_FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
 
-fn module_path(module: Option<HMODULE>) -> Option<PathBuf> {
-    let mut buf = [0u16; 1024];
-    let len = unsafe { GetModuleFileNameW(module, &mut buf) } as usize;
-    if len == 0 || len >= buf.len() {
-        return None;
-    }
-    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
-}
-
 fn game_dir_lower() -> Option<&'static str> {
     GAME_DIR_LOWER
         .get_or_init(|| {
-            module_path(None)
+            std::env::current_exe()
+                .ok()
                 .and_then(|p| p.parent().map(Path::to_path_buf))
                 .map(|p| p.to_string_lossy().to_ascii_lowercase())
         })
@@ -85,19 +74,7 @@ fn should_pin_thread_handle(thread: windows::Win32::Foundation::HANDLE) -> bool 
     if status != 0 || start.is_null() {
         return false;
     }
-    let mut module = HMODULE::default();
-    let ok = unsafe {
-        GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            PCWSTR(start.cast()),
-            &mut module,
-        )
-    }
-    .is_ok();
-    if !ok {
-        return false;
-    }
-    let Some(mod_dir) = module_path(Some(module))
+    let Some(mod_dir) = module_path_at(start)
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .map(|p| p.to_string_lossy().to_ascii_lowercase())
     else {
@@ -107,22 +84,21 @@ fn should_pin_thread_handle(thread: windows::Win32::Foundation::HANDLE) -> bool 
 }
 
 fn pin_thread_by_id(tid: u32) {
+    // SAFETY: A successful OpenThread transfers a fresh handle to Owned.
     let Ok(thread) = (unsafe {
         OpenThread(
             THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION,
             false,
             tid,
         )
+        .map(|handle| Owned::new(handle))
     }) else {
         return;
     };
-    if should_pin_thread_handle(thread) {
+    if should_pin_thread_handle(*thread) {
         unsafe {
-            let _ = SetThreadAffinityMask(thread, 1);
+            let _ = SetThreadAffinityMask(*thread, 1);
         }
-    }
-    unsafe {
-        let _ = CloseHandle(thread);
     }
 }
 
@@ -144,25 +120,25 @@ pub fn apply_single_cpu_affinity() {
     let _ = nt_query_information_thread();
 
     let pid = unsafe { GetCurrentProcessId() };
-    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else {
+    // SAFETY: This snapshot is owned by this invocation.
+    let Ok(snap) =
+        (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map(|h| Owned::new(h)) })
+    else {
         return;
     };
     let mut entry = THREADENTRY32 {
         dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
         ..Default::default()
     };
-    if unsafe { Thread32First(snap, &mut entry) }.is_ok() {
+    if unsafe { Thread32First(*snap, &mut entry) }.is_ok() {
         loop {
             if entry.th32OwnerProcessID == pid {
                 pin_thread_by_id(entry.th32ThreadID);
             }
-            if unsafe { Thread32Next(snap, &mut entry) }.is_err() {
+            if unsafe { Thread32Next(*snap, &mut entry) }.is_err() {
                 break;
             }
         }
-    }
-    unsafe {
-        let _ = CloseHandle(snap);
     }
     log_msg("singlecpu affinity enabled for game threads");
 }
@@ -172,7 +148,7 @@ pub fn on_thread_attach() {
     if !SINGLECPU_ACTIVE.load(Ordering::Relaxed) {
         return;
     }
-    pin_thread_by_id(unsafe { GetCurrentThreadId() });
+    pin_thread_by_id(current_thread_id());
 }
 
 fn open_log_file() -> Option<Mutex<std::fs::File>> {
@@ -202,7 +178,7 @@ pub fn log_msg(msg: &str) {
         return;
     };
     if let Ok(mut file) = file_mutex.lock() {
-        let tid = unsafe { GetCurrentThreadId() };
+        let tid = current_thread_id();
         let _ = writeln!(file, "[tid={tid}] {msg}");
         let _ = file.flush();
     }

@@ -1,12 +1,13 @@
 use std::ffi::c_void;
-use std::mem::{size_of, ManuallyDrop};
+use std::mem::{size_of, ManuallyDrop, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use windows::core::{
-    implement, s, w, Error, IUnknown, Interface, OutRef, Ref, Result, BOOL, GUID, HRESULT, PCWSTR,
+    implement, s, w, Error, IUnknown, Interface, OutRef, Ref, Result, Weak as ComWeak, BOOL, GUID,
+    HRESULT, PCWSTR,
 };
 use windows::Win32::Foundation::{
     CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_POINTER, HANDLE, HWND,
@@ -17,10 +18,9 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, DEVMODEW, ENUM_CURRENT_SETTINGS, HDC,
     HMONITOR, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, PALETTEENTRY,
 };
-use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
 use crate::{
-    clipper, compat, config, palette,
+    clipper, compat, config, descriptor, palette,
     renderer::{PresentError, PresentOutcome, Renderer},
     surface::{self, SurfaceSlot},
     window::{self, HostWindow, PresentationMode},
@@ -56,7 +56,7 @@ pub fn flush_pending_present(from_timer: bool) {
         return;
     };
     let min_ms = config::get().min_frame_interval_ms();
-    let Some(mut d) = display.try_lock() else {
+    let Some(d) = display.try_lock() else {
         window::arm_flush_timer(min_ms as u32);
         return;
     };
@@ -71,7 +71,7 @@ pub fn flush_pending_present(from_timer: bool) {
         window::arm_flush_timer(min_ms as u32);
         return;
     }
-    let _ = d.present_now(&display);
+    let _ = display.present_locked(d);
 }
 
 pub fn toggle_fullscreen_hotkey() {
@@ -83,7 +83,7 @@ pub fn toggle_fullscreen_hotkey() {
     };
     let (lw, lh) = (d.width, d.height);
     let cfg = config::get();
-    if let Some(host) = d.host.as_mut() {
+    if let Some(host) = d.presentation.host.as_mut() {
         let was_fs = host.is_fullscreen();
         if let Ok(new_mode) = host.toggle_mode(lw, lh, cfg) {
             let now_fs = new_mode == PresentationMode::BorderlessFullscreen;
@@ -92,10 +92,10 @@ pub fn toggle_fullscreen_hotkey() {
             } else if was_fs && !now_fs {
                 FULLSCREEN_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
-            if let Some(renderer) = d.renderer.as_mut() {
+            if let Some(renderer) = d.presentation.renderer.as_mut() {
                 renderer.sync_overlay();
             }
-            let _ = d.present_now(&display);
+            let _ = display.present_locked(d);
         }
     }
 }
@@ -107,15 +107,22 @@ pub fn on_host_window_changed() {
     let Some(mut d) = display.try_lock() else {
         return;
     };
-    if let Some(renderer) = d.renderer.as_mut() {
+    if let Some(renderer) = d.presentation.renderer.as_mut() {
         renderer.sync_overlay();
     }
-    if d.primary.upgrade().is_some() {
-        let _ = d.refresh(&display);
-    }
+    let _ = display.refresh_locked(d);
+}
+
+type RegisteredSurface = (ComWeak<IDirectDrawSurface>, Weak<SurfaceSlot>);
+
+#[derive(Default)]
+struct SurfaceRegistry {
+    primary: Weak<SurfaceSlot>,
+    entries: Vec<RegisteredSurface>,
 }
 
 pub struct DisplayShared {
+    registry: Mutex<SurfaceRegistry>,
     inner: Mutex<Display>,
     dirty: AtomicBool,
     flush_scheduled: AtomicBool,
@@ -124,24 +131,16 @@ pub struct DisplayShared {
     bpp: AtomicU32,
 }
 
-// All mutable Display state is guarded by `inner`, and `Renderer`/`HostWindow` are only driven
-// on the bound UI thread (or when unbound in tests).
-unsafe impl Send for DisplayShared {}
-unsafe impl Sync for DisplayShared {}
-
 impl DisplayShared {
     pub fn new(width: u32, height: u32, bpp: u32) -> Arc<Self> {
         Arc::new(Self {
+            registry: Mutex::new(SurfaceRegistry::default()),
             inner: Mutex::new(Display {
                 width,
                 height,
                 bpp,
-                bound_hwnd: HWND::default(),
-                owner_draw: ptr::null_mut(),
-                renderer: None,
-                host: None,
-                primary: Weak::new(),
-                surfaces: Vec::new(),
+                presentation: Presentation::default(),
+                owner_draw: ComWeak::new(),
                 last_present: None,
                 consecutive_present_failures: 0,
             }),
@@ -153,22 +152,9 @@ impl DisplayShared {
         })
     }
 
-    pub fn set_owner_draw(&self, raw: *mut c_void) {
-        self.lock().owner_draw = raw;
-    }
-
-    pub fn clear_owner_draw(&self) {
-        self.lock().owner_draw = ptr::null_mut();
-    }
-
-    /// Borrows the owning `IDirectDraw` without surfaces holding a strong COM reference on it,
-    /// so `IDirectDraw::Release()` returns `0` when the app releases its own DirectDraw handle.
+    /// Upgrade only while the owning DirectDraw object still has a strong reference.
     pub fn clone_owner_draw(&self) -> Option<IDirectDraw> {
-        let d = self.lock();
-        if d.owner_draw.is_null() {
-            return None;
-        }
-        unsafe { IDirectDraw::from_raw_borrowed(&d.owner_draw) }.cloned()
+        self.lock().owner_draw.upgrade()
     }
 
     pub fn lock(&self) -> MutexGuard<'_, Display> {
@@ -197,12 +183,103 @@ impl DisplayShared {
         self.height.load(Ordering::Relaxed).max(1)
     }
 
-    pub fn register_surface(&self, raw: *mut c_void, data: Weak<SurfaceSlot>) {
-        self.lock().register_surface(raw, data);
+    fn registry(&self) -> MutexGuard<'_, SurfaceRegistry> {
+        self.registry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn unregister_surface(&self, raw: *mut c_void) {
-        self.lock().unregister_surface(raw);
+    // A final SurfaceData drop may release user-supplied COM private data.
+    // Inspect and release upgraded references only after unlocking the registry.
+    fn registry_snapshot(&self) -> Vec<RegisteredSurface> {
+        self.registry().entries.clone()
+    }
+
+    // Presenters keep this reference alive until their display guard is dropped.
+    // A final pixel-slot drop can call into application COM code.
+    pub fn primary_slot(&self) -> Option<Arc<SurfaceSlot>> {
+        self.registry().primary.upgrade()
+    }
+
+    pub fn register_surface(
+        &self,
+        interface: ComWeak<IDirectDrawSurface>,
+        data: Weak<SurfaceSlot>,
+        primary: bool,
+    ) {
+        let mut registry = self.registry();
+        if primary {
+            registry.primary = data.clone();
+        }
+        registry.entries.push((interface, data));
+    }
+
+    pub fn unregister_surface(&self, slot: &Arc<SurfaceSlot>) {
+        let slot = Arc::downgrade(slot);
+        let mut registry = self.registry();
+        if registry.primary.ptr_eq(&slot) {
+            registry.primary = Weak::new();
+        }
+        let removed = registry
+            .entries
+            .iter()
+            .position(|(_, data)| data.ptr_eq(&slot))
+            .map(|i| registry.entries.remove(i));
+        drop(registry);
+        drop(removed);
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        self.registry_snapshot()
+            .into_iter()
+            .filter_map(|(_, w)| w.upgrade())
+            .map(|d| d.lock().byte_len())
+            .sum()
+    }
+
+    pub fn live_surfaces(&self) -> Vec<IDirectDrawSurface> {
+        self.registry_snapshot()
+            .into_iter()
+            .filter_map(|(interface, _)| interface.upgrade())
+            .collect()
+    }
+
+    pub fn primary_surface(&self) -> Option<IDirectDrawSurface> {
+        self.find_surface(|data| data.is_primary())
+    }
+
+    pub fn find_surface_by_dc(&self, hdc: HDC) -> Option<IDirectDrawSurface> {
+        if hdc.is_invalid() {
+            return None;
+        }
+        self.find_surface(|data| data.has_dc(hdc))
+    }
+
+    fn find_surface(
+        &self,
+        matches: impl Fn(&surface::SurfaceData) -> bool,
+    ) -> Option<IDirectDrawSurface> {
+        self.registry_snapshot()
+            .into_iter()
+            .find_map(|(interface, data)| {
+                if matches(&data.upgrade()?.lock()) {
+                    interface.upgrade()
+                } else {
+                    None
+                }
+            })
+    }
+
+    // The guard is consumed here. Release it before the primary slot, whose
+    // destructor may release application COM objects and re-enter DirectDraw.
+    fn present_locked(&self, guard: MutexGuard<'_, Display>) -> Result<()> {
+        let primary = self.primary_slot();
+        let mut display = guard;
+        display.present_now(self, primary.as_deref())
+    }
+
+    fn refresh_locked(&self, guard: MutexGuard<'_, Display>) -> Result<()> {
+        let primary = self.primary_slot();
+        let mut display = guard;
+        display.refresh(self, primary.as_deref())
     }
 
     fn mark_dirty_and_schedule_flush(&self) {
@@ -219,8 +296,7 @@ impl DisplayShared {
             self.mark_dirty_and_schedule_flush();
             return Ok(());
         }
-        let mut d = self.lock();
-        d.refresh(self)
+        self.refresh_locked(self.lock())
     }
 
     /// Requests an immediate presentation on the UI thread, or schedules one when called off-UI.
@@ -229,12 +305,11 @@ impl DisplayShared {
             self.mark_dirty_and_schedule_flush();
             return Ok(());
         }
-        let mut d = self.lock();
-        d.present_now(self)
+        self.present_locked(self.lock())
     }
 
     pub fn refresh_if_primary_uses_palette(&self, palette: &IDirectDrawPalette) -> Result<()> {
-        let primary = self.lock().primary.upgrade();
+        let primary = self.primary_slot();
         let Some(primary) = primary else {
             return Ok(());
         };
@@ -250,76 +325,33 @@ pub struct Display {
     pub width: u32,
     pub height: u32,
     pub bpp: u32,
-    bound_hwnd: HWND,
-    owner_draw: *mut c_void,
-    renderer: Option<Renderer>,
-    host: Option<HostWindow>,
-    pub primary: Weak<SurfaceSlot>,
-    surfaces: Vec<(*mut c_void, Weak<SurfaceSlot>)>,
+    presentation: Presentation,
+    owner_draw: ComWeak<IDirectDraw>,
     last_present: Option<Instant>,
     consecutive_present_failures: u32,
 }
 
+#[derive(Default)]
+struct Presentation {
+    bound_hwnd: HWND,
+    renderer: Option<Renderer>,
+    host: Option<HostWindow>,
+}
+
+// SAFETY: The native pointers in HostWindow and OverlayWindow are opaque Win32
+// handles, never Rust references. Display's mutex serializes their use and the
+// owned wgpu resources. Worker surface updates post presentation to the UI thread.
+unsafe impl Send for Presentation {}
+
 impl Display {
-    pub fn register_surface(&mut self, raw: *mut c_void, data: Weak<SurfaceSlot>) {
-        self.surfaces.retain(|(_, w)| w.upgrade().is_some());
-        self.surfaces.push((raw, data));
-    }
-
-    pub fn unregister_surface(&mut self, raw: *mut c_void) {
-        self.surfaces.retain(|(p, _)| *p != raw);
-    }
-
-    pub fn allocated_bytes(&self) -> usize {
-        self.surfaces
-            .iter()
-            .filter_map(|(_, w)| w.upgrade())
-            .map(|d| d.lock().byte_len())
-            .sum()
-    }
-
-    pub fn live_surfaces(&self) -> Vec<IDirectDrawSurface> {
-        self.surfaces
-            .iter()
-            .filter_map(|(raw, weak)| {
-                weak.upgrade()?;
-                unsafe { IDirectDrawSurface::from_raw_borrowed(raw) }.cloned()
-            })
-            .collect()
-    }
-
-    pub fn primary_surface(&self) -> Option<IDirectDrawSurface> {
-        for (raw, weak) in &self.surfaces {
-            let Some(data) = weak.upgrade() else {
-                continue;
-            };
-            if data.lock().is_primary() {
-                return unsafe { IDirectDrawSurface::from_raw_borrowed(raw) }.cloned();
-            }
-        }
-        None
-    }
-
-    pub fn find_surface_by_dc(&self, hdc: HDC) -> Option<IDirectDrawSurface> {
-        if hdc.is_invalid() {
-            return None;
-        }
-        for (raw, weak) in &self.surfaces {
-            let Some(data) = weak.upgrade() else {
-                continue;
-            };
-            let matches = data.lock().has_dc(hdc);
-            if matches {
-                return unsafe { IDirectDrawSurface::from_raw_borrowed(raw) }.cloned();
-            }
-        }
-        None
-    }
-
     fn set_host(&mut self, next: Option<HostWindow>) -> Option<HostWindow> {
-        let prev = std::mem::replace(&mut self.host, next);
+        let prev = std::mem::replace(&mut self.presentation.host, next);
         let was_fs = prev.as_ref().is_some_and(HostWindow::is_fullscreen);
-        let now_fs = self.host.as_ref().is_some_and(HostWindow::is_fullscreen);
+        let now_fs = self
+            .presentation
+            .host
+            .as_ref()
+            .is_some_and(HostWindow::is_fullscreen);
         if !was_fs && now_fs {
             FULLSCREEN_COUNT.fetch_add(1, Ordering::Relaxed);
         } else if was_fs && !now_fs {
@@ -328,22 +360,21 @@ impl Display {
         prev
     }
 
-    pub fn present_now(&mut self, shared: &DisplayShared) -> Result<()> {
-        let Some(primary) = self.primary.upgrade() else {
+    fn present_now(&mut self, shared: &DisplayShared, primary: Option<&SurfaceSlot>) -> Result<()> {
+        let Some(primary) = primary else {
             shared.dirty.store(false, Ordering::Release);
             shared.flush_scheduled.store(false, Ordering::Release);
             return Ok(());
         };
-        if self.renderer.is_none() {
-            if self.bound_hwnd.is_invalid() || !unsafe { IsWindow(Some(self.bound_hwnd)) }.as_bool()
-            {
+        if self.presentation.renderer.is_none() {
+            if !window::is_window(self.presentation.bound_hwnd) {
                 shared.dirty.store(false, Ordering::Release);
                 shared.flush_scheduled.store(false, Ordering::Release);
                 return Ok(());
             }
-            match Renderer::new(self.bound_hwnd.0 as isize) {
+            match Renderer::new(self.presentation.bound_hwnd.0 as isize) {
                 Ok(renderer) => {
-                    self.renderer = Some(renderer);
+                    self.presentation.renderer = Some(renderer);
                     self.consecutive_present_failures = 0;
                     compat::log_msg("recreated wgpu renderer after device/surface loss");
                 }
@@ -357,10 +388,11 @@ impl Display {
         }
 
         let result = self
+            .presentation
             .renderer
             .as_mut()
             .expect("renderer checked above")
-            .present_surface(&primary, || {
+            .present_surface(primary, || {
                 // Clear dirty while still holding the primary surface mutex so any worker-thread
                 // write that happens after upload sets dirty=true without being clobbered.
                 shared.dirty.store(false, Ordering::Release);
@@ -396,7 +428,7 @@ impl Display {
                 ));
                 if self.consecutive_present_failures >= 3 {
                     // Drop and recreate the swapchain/device on the next tick.
-                    self.renderer = None;
+                    self.presentation.renderer = None;
                 }
                 shared.dirty.store(true, Ordering::Release);
                 shared.flush_scheduled.store(false, Ordering::Release);
@@ -405,7 +437,7 @@ impl Display {
             }
             Err(PresentError::DeviceLost(msg)) => {
                 compat::log_msg(&format!("device lost during present, rebuilding: {msg}"));
-                self.renderer = None;
+                self.presentation.renderer = None;
                 shared.dirty.store(true, Ordering::Release);
                 shared.flush_scheduled.store(false, Ordering::Release);
                 window::arm_flush_timer(50);
@@ -415,9 +447,9 @@ impl Display {
         }
     }
 
-    pub fn refresh(&mut self, shared: &DisplayShared) -> Result<()> {
-        if (self.renderer.is_none() && self.bound_hwnd.is_invalid())
-            || self.primary.upgrade().is_none()
+    fn refresh(&mut self, shared: &DisplayShared, primary: Option<&SurfaceSlot>) -> Result<()> {
+        if (self.presentation.renderer.is_none() && self.presentation.bound_hwnd.is_invalid())
+            || primary.is_none()
         {
             return Ok(());
         }
@@ -428,11 +460,11 @@ impl Display {
                 .is_some_and(|t| t.elapsed() >= FLUSH_MAX_DEFER)
             || !window::can_schedule_flush();
         if force_now {
-            return self.present_now(shared);
+            return self.present_now(shared, primary);
         }
         if !shared.flush_scheduled.swap(true, Ordering::AcqRel) && !window::schedule_flush() {
             shared.flush_scheduled.store(false, Ordering::Release);
-            return self.present_now(shared);
+            return self.present_now(shared, primary);
         }
         Ok(())
     }
@@ -483,12 +515,12 @@ impl Draw {
         }
     }
 
-    fn create_interface(initialized: bool) -> IDirectDraw {
-        let dd: IDirectDraw = Self::new_with_init(initialized).into();
-        if let Ok(obj) = dd.cast_object_ref::<Draw>() {
-            obj.display.set_owner_draw(dd.as_raw());
-        }
-        dd
+    fn create_interface(initialized: bool) -> Result<IDirectDraw> {
+        let draw = Self::new_with_init(initialized);
+        let display = draw.display.clone();
+        let dd: IDirectDraw = draw.into();
+        display.lock().owner_draw = dd.downgrade()?;
+        Ok(dd)
     }
 
     fn current_hwnd(&self) -> HWND {
@@ -496,13 +528,12 @@ impl Draw {
     }
 }
 
-pub fn create_uninitialized_draw() -> IDirectDraw {
+pub fn create_uninitialized_draw() -> Result<IDirectDraw> {
     Draw::create_interface(false)
 }
 
 impl Drop for Draw {
     fn drop(&mut self) {
-        self.display.clear_owner_draw();
         let id = self.bind_id.load(Ordering::Acquire);
         let owns_hooks = window::is_active_owner(id);
         {
@@ -531,20 +562,6 @@ fn mode_description(width: u32, height: u32, bpp: u32) -> Result<DDSURFACEDESC> 
         ddpfPixelFormat: surface::pixel_format(bpp)?,
         ..Default::default()
     })
-}
-
-fn check_desc(desc: *const DDSURFACEDESC) -> Result<()> {
-    if desc.is_null() || unsafe { (*desc).dwSize } != size_of::<DDSURFACEDESC>() as u32 {
-        return Err(E_INVALIDARG.into());
-    }
-    Ok(())
-}
-
-fn check_desc2(desc: *const DDSURFACEDESC2) -> Result<()> {
-    if desc.is_null() || unsafe { (*desc).dwSize } != size_of::<DDSURFACEDESC2>() as u32 {
-        return Err(E_INVALIDARG.into());
-    }
-    Ok(())
 }
 
 fn put_interface<T>(out: OutRef<T>, make: impl FnOnce() -> Result<T>) -> Result<()>
@@ -622,20 +639,8 @@ impl Draw_Impl {
         (phase_us, active_end_us, frame_us, height)
     }
 
-    fn create_surface_v1(
-        &self,
-        desc: *mut DDSURFACEDESC,
-        out: OutRef<IDirectDrawSurface>,
-        outer: Ref<IUnknown>,
-    ) -> Result<()> {
-        put_interface(out, || {
-            no_aggregation(outer)?;
-            check_desc(desc)?;
-            surface::create_surface(self.display.clone(), unsafe { &*desc })
-        })
-    }
-
-    fn create_surface_v2<S>(
+    /// The caller provides a sized descriptor and any initial DDSD_LPSURFACE pixels.
+    unsafe fn create_surface_v2<S>(
         &self,
         desc: *mut DDSURFACEDESC2,
         out: OutRef<S>,
@@ -646,9 +651,9 @@ impl Draw_Impl {
     {
         put_interface(out, || {
             no_aggregation(outer)?;
-            check_desc2(desc)?;
-            let d1 = surface::desc2_to_desc(unsafe { &*desc })?;
-            let surf = surface::create_surface(self.display.clone(), &d1)?;
+            let desc = unsafe { descriptor::read(desc)? };
+            // DDSD_LPSURFACE, when set, addresses the caller's initial image.
+            let surf = unsafe { surface::create_surface(self.display.clone(), &desc)? };
             surf.cast::<S>()
         })
     }
@@ -689,7 +694,7 @@ impl Draw_Impl {
         if can_create {
             return Ok(());
         }
-        let snapshot = self.display.lock().live_surfaces();
+        let snapshot = self.display.live_surfaces();
         for surf in snapshot {
             let keep = if all {
                 true
@@ -767,26 +772,10 @@ impl Draw_Impl {
                 if filter.dwFlags & DDSD_PIXELFORMAT as u32 != 0 {
                     let requested = &filter.ddpfPixelFormat;
                     let format = &mode.ddpfPixelFormat;
-                    let masks_requested = unsafe {
-                        requested.Anonymous2.dwRBitMask
-                            | requested.Anonymous3.dwGBitMask
-                            | requested.Anonymous4.dwBBitMask
-                    } != 0;
+                    let (requested_bpp, masks) = descriptor::rgb_layout(requested);
                     if (requested.dwFlags != 0 && requested.dwFlags != format.dwFlags)
-                        || unsafe {
-                            (requested.Anonymous1.dwRGBBitCount != 0
-                                && requested.Anonymous1.dwRGBBitCount != bpp)
-                                || (masks_requested
-                                    && (
-                                        requested.Anonymous2.dwRBitMask,
-                                        requested.Anonymous3.dwGBitMask,
-                                        requested.Anonymous4.dwBBitMask,
-                                    ) != (
-                                        format.Anonymous2.dwRBitMask,
-                                        format.Anonymous3.dwGBitMask,
-                                        format.Anonymous4.dwBBitMask,
-                                    ))
-                        }
+                        || (requested_bpp != 0 && requested_bpp != bpp)
+                        || (masks != [0; 3] && masks != descriptor::rgb_layout(format).1)
                     {
                         continue;
                     }
@@ -799,30 +788,29 @@ impl Draw_Impl {
         Ok(())
     }
 
-    fn get_available_vid_mem_impl(&self, total: *mut u32, free: *mut u32) -> Result<()> {
+    /// Each non-null output must be writable for one DWORD.
+    unsafe fn get_available_vid_mem_impl(&self, total: *mut u32, free: *mut u32) -> Result<()> {
         if total.is_null() && free.is_null() {
             return Err(E_INVALIDARG.into());
         }
         let used = self
             .display
-            .lock()
             .allocated_bytes()
             .min(VIRTUAL_VIDMEM_BYTES as usize) as u32;
-        if let Some(total) = unsafe { total.as_mut() } {
-            *total = VIRTUAL_VIDMEM_BYTES;
-        }
-        if let Some(free) = unsafe { free.as_mut() } {
-            *free = VIRTUAL_VIDMEM_BYTES.saturating_sub(used);
+        // Write sequentially so that clients can use the same output for both.
+        for (ptr, value) in [
+            (total, VIRTUAL_VIDMEM_BYTES),
+            (free, VIRTUAL_VIDMEM_BYTES - used),
+        ] {
+            if !ptr.is_null() {
+                unsafe { ptr.write(value) };
+            }
         }
         Ok(())
     }
 
     fn get_surface_from_dc_impl<S: Interface>(&self, hdc: HDC) -> Result<S> {
-        let surface = self
-            .display
-            .lock()
-            .find_surface_by_dc(hdc)
-            .ok_or(DDERR_NOTFOUND)?;
+        let surface = self.display.find_surface_by_dc(hdc).ok_or(DDERR_NOTFOUND)?;
         surface.cast::<S>()
     }
 }
@@ -853,7 +841,8 @@ impl IDirectDraw_Impl for Draw_Impl {
     ) -> Result<()> {
         put_interface(out, || {
             no_aggregation(outer)?;
-            palette::create_palette(flags, entries, self.display.clone())
+            // An 8-bit DirectDraw palette supplies 256 initial entries.
+            unsafe { palette::create_palette(flags, entries, self.display.clone()) }
         })
     }
     fn CreateSurface(
@@ -862,7 +851,11 @@ impl IDirectDraw_Impl for Draw_Impl {
         out: OutRef<IDirectDrawSurface>,
         outer: Ref<IUnknown>,
     ) -> Result<()> {
-        self.create_surface_v1(desc, out, outer)
+        put_interface(out, || {
+            no_aggregation(outer)?;
+            // The caller supplies the descriptor and any initial DDSD_LPSURFACE pixels.
+            unsafe { surface::create_surface(self.display.clone(), &descriptor::read(desc)?) }
+        })
     }
     fn DuplicateSurface(&self, src: Ref<IDirectDrawSurface>) -> Result<IDirectDrawSurface> {
         self.duplicate_surface_impl(src)
@@ -879,8 +872,7 @@ impl IDirectDraw_Impl for Draw_Impl {
         let filter = if filter.is_null() {
             DDSURFACEDESC::default()
         } else {
-            check_desc(filter)?;
-            unsafe { *filter }
+            unsafe { descriptor::read(filter)? }
         };
         self.enum_display_modes_impl(flags, filter, |mode| unsafe { callback(mode, context).0 })
     }
@@ -896,8 +888,7 @@ impl IDirectDraw_Impl for Draw_Impl {
         let filter = if desc.is_null() {
             None
         } else {
-            check_desc(desc)?;
-            Some(unsafe { *desc })
+            Some(unsafe { descriptor::read(desc)? })
         };
         self.enum_surfaces_impl::<IDirectDrawSurface>(flags, filter, |surf, d| {
             let owned = ManuallyDrop::new(surf);
@@ -912,8 +903,12 @@ impl IDirectDraw_Impl for Draw_Impl {
         if driver.is_null() && software.is_null() {
             return Err(E_INVALIDARG.into());
         }
-        for output in [driver, software].into_iter().filter(|p| !p.is_null()) {
-            let size = unsafe { (*output).dwSize } as usize;
+        // Snapshot both size headers while they still contain the caller's input.
+        let buffer = |output: *mut DDCAPS_DX7| -> Result<_> {
+            if output.is_null() {
+                return Ok(None);
+            }
+            let size = unsafe { output.cast::<u32>().read() };
             if ![
                 size_of::<DDCAPS_DX1>(),
                 size_of::<DDCAPS_DX3>(),
@@ -921,16 +916,13 @@ impl IDirectDraw_Impl for Draw_Impl {
                 size_of::<DDCAPS_DX6>(),
                 size_of::<DDCAPS_DX7>(),
             ]
-            .contains(&size)
+            .contains(&(size as usize))
             {
                 return Err(E_INVALIDARG.into());
             }
-        }
-        for output in [driver, software] {
-            if output.is_null() {
-                continue;
-            }
-            let size = unsafe { (*output).dwSize };
+            Ok(Some((output, size)))
+        };
+        for (output, size) in [buffer(driver)?, buffer(software)?].into_iter().flatten() {
             let mut caps = DDCAPS_DX7 {
                 dwSize: size,
                 dwCaps: (DDCAPS_BLT
@@ -980,9 +972,9 @@ impl IDirectDraw_Impl for Draw_Impl {
         Ok(())
     }
     fn GetDisplayMode(&self, desc: *mut DDSURFACEDESC) -> Result<()> {
-        check_desc(desc)?;
+        let out = unsafe { descriptor::output(desc)? };
         let (width, height, bpp) = self.display.mode();
-        unsafe { desc.write(mode_description(width, height, bpp)?) };
+        out.write(mode_description(width, height, bpp)?);
         Ok(())
     }
     fn GetFourCCCodes(&self, count: *mut u32, _: *mut u32) -> Result<()> {
@@ -994,7 +986,6 @@ impl IDirectDraw_Impl for Draw_Impl {
     }
     fn GetGDISurface(&self) -> Result<IDirectDrawSurface> {
         self.display
-            .lock()
             .primary_surface()
             .ok_or_else(|| Error::from(DDERR_NOTFOUND))
     }
@@ -1030,19 +1021,19 @@ impl IDirectDraw_Impl for Draw_Impl {
         Ok(())
     }
     fn GetScanLine(&self, line: *mut u32) -> Result<()> {
-        let out = unsafe { line.as_mut() }.ok_or(E_INVALIDARG)?;
+        let out = unsafe { line.cast::<MaybeUninit<u32>>().as_mut() }.ok_or(E_INVALIDARG)?;
         let (phase_us, active_end_us, _, height) = self.frame_timing();
         if phase_us >= active_end_us {
-            *out = 0;
+            out.write(0);
             return Err(DDERR_VERTICALBLANKINPROGRESS.into());
         }
-        *out = ((phase_us * height as u64) / active_end_us.max(1)) as u32;
+        out.write(((phase_us * height as u64) / active_end_us.max(1)) as u32);
         Ok(())
     }
     fn GetVerticalBlankStatus(&self, status: *mut BOOL) -> Result<()> {
-        let out = unsafe { status.as_mut() }.ok_or(E_INVALIDARG)?;
+        let out = unsafe { status.cast::<MaybeUninit<BOOL>>().as_mut() }.ok_or(E_INVALIDARG)?;
         let (phase_us, active_end_us, _, _) = self.frame_timing();
-        *out = BOOL::from(phase_us >= active_end_us);
+        out.write(BOOL::from(phase_us >= active_end_us));
         Ok(())
     }
     fn Initialize(&self, device: *mut GUID) -> Result<()> {
@@ -1062,12 +1053,12 @@ impl IDirectDraw_Impl for Draw_Impl {
         if let Some(saved) = display.set_host(None) {
             let _ = saved.restore();
         }
-        if display.primary.upgrade().is_none() {
+        if self.display.registry().primary.strong_count() == 0 {
             (display.width, display.height, display.bpp) = DEFAULT_MODE;
             self.display
                 .store_mode(DEFAULT_MODE.0, DEFAULT_MODE.1, DEFAULT_MODE.2);
         }
-        let _ = display.present_now(&self.display);
+        let _ = self.display.present_locked(display);
         Ok(())
     }
 
@@ -1100,9 +1091,7 @@ impl IDirectDraw_Impl for Draw_Impl {
         {
             return Err(E_INVALIDARG.into());
         }
-        if (hwnd.is_invalid() && exclusive)
-            || (!hwnd.is_invalid() && !unsafe { IsWindow(Some(hwnd)) }.as_bool())
-        {
+        if (hwnd.is_invalid() && exclusive) || (!hwnd.is_invalid() && !window::is_window(hwnd)) {
             return Err(E_INVALIDARG.into());
         }
         // SetWindowPos synchronously calls the game's WndProc, which may re-enter us.
@@ -1112,7 +1101,7 @@ impl IDirectDraw_Impl for Draw_Impl {
         {
             let display = self.display.lock();
             if !change_hwnd
-                && display.host.is_some() == manage_window
+                && display.presentation.host.is_some() == manage_window
                 && self.exclusive.load(Ordering::Acquire) == exclusive
             {
                 return Ok(());
@@ -1140,8 +1129,8 @@ impl IDirectDraw_Impl for Draw_Impl {
         self.exclusive.store(exclusive, Ordering::Release);
         self.manage_window.store(manage_window, Ordering::Release);
         if change_hwnd {
-            display.bound_hwnd = hwnd;
-            display.renderer = replacement;
+            display.presentation.bound_hwnd = hwnd;
+            display.presentation.renderer = replacement;
             display.consecutive_present_failures = 0;
             self.hwnd.store(hwnd.0 as isize, Ordering::Release);
             self.cached_hz.store(0, Ordering::Relaxed);
@@ -1159,7 +1148,7 @@ impl IDirectDraw_Impl for Draw_Impl {
         } else {
             window::set_scaling_active(self.bind_id.load(Ordering::Acquire), exclusive);
         }
-        let _ = display.present_now(&self.display);
+        let _ = self.display.present_locked(display);
         Ok(())
     }
     fn SetDisplayMode(&self, width: u32, height: u32, bpp: u32) -> Result<()> {
@@ -1174,7 +1163,7 @@ impl IDirectDraw_Impl for Draw_Impl {
         let _transition = WindowTransitionGuard::acquire(&self.changing_window)?;
         let mut display = self.display.lock();
         if self.exclusive.load(Ordering::Acquire) && !hwnd.is_invalid() {
-            if self.manage_window.load(Ordering::Acquire) && display.host.is_none() {
+            if self.manage_window.load(Ordering::Acquire) && display.presentation.host.is_none() {
                 let mode = if cfg.windowed {
                     PresentationMode::Windowed
                 } else {
@@ -1182,7 +1171,7 @@ impl IDirectDraw_Impl for Draw_Impl {
                 };
                 let host = HostWindow::enter(hwnd, mode, width, height, cfg)?;
                 display.set_host(Some(host));
-            } else if let Some(host) = display.host.as_mut() {
+            } else if let Some(host) = display.presentation.host.as_mut() {
                 host.on_logical_mode_changed(width, height, cfg);
             }
             window::set_scaling_active(self.bind_id.load(Ordering::Acquire), true);
@@ -1190,7 +1179,7 @@ impl IDirectDraw_Impl for Draw_Impl {
         (display.width, display.height, display.bpp) = (width, height, bpp);
         self.display.store_mode(width, height, bpp);
         window::set_mode(width, height, bpp, true);
-        if let Some(renderer) = display.renderer.as_mut() {
+        if let Some(renderer) = display.presentation.renderer.as_mut() {
             renderer.sync_overlay();
         }
         Ok(())
@@ -1200,8 +1189,8 @@ impl IDirectDraw_Impl for Draw_Impl {
             return Err(E_NOTIMPL.into());
         }
         if window::is_ui_thread_or_unbound() && self.display.dirty.load(Ordering::Acquire) {
-            if let Some(mut display) = self.display.try_lock() {
-                let _ = display.present_now(&self.display);
+            if let Some(display) = self.display.try_lock() {
+                let _ = self.display.present_locked(display);
             }
         }
         let (phase_us, active_end_us, frame_us, _) = self.frame_timing();
@@ -1252,7 +1241,7 @@ impl IDirectDraw2_Impl for Draw_Impl {
         out: OutRef<IDirectDrawSurface>,
         outer: Ref<IUnknown>,
     ) -> Result<()> {
-        self.create_surface_v1(desc, out, outer)
+        IDirectDraw_Impl::CreateSurface(self, desc, out, outer)
     }
     fn DuplicateSurface(&self, src: Ref<IDirectDrawSurface>) -> Result<IDirectDrawSurface> {
         self.duplicate_surface_impl(src)
@@ -1330,7 +1319,7 @@ impl IDirectDraw2_Impl for Draw_Impl {
         if caps.is_null() {
             return Err(E_INVALIDARG.into());
         }
-        self.get_available_vid_mem_impl(total, free)
+        unsafe { self.get_available_vid_mem_impl(total, free) }
     }
 }
 
@@ -1362,7 +1351,7 @@ impl IDirectDraw4_Impl for Draw_Impl {
         out: OutRef<IDirectDrawSurface4>,
         outer: Ref<IUnknown>,
     ) -> Result<()> {
-        self.create_surface_v2(desc, out, outer)
+        unsafe { self.create_surface_v2(desc, out, outer) }
     }
     fn DuplicateSurface(&self, src: Ref<IDirectDrawSurface4>) -> Result<IDirectDrawSurface4> {
         self.duplicate_surface_impl(src)
@@ -1378,8 +1367,7 @@ impl IDirectDraw4_Impl for Draw_Impl {
         let filter = if filter.is_null() {
             DDSURFACEDESC::default()
         } else {
-            check_desc2(filter)?;
-            surface::desc2_to_desc(unsafe { &*filter })?
+            unsafe { descriptor::read(filter)? }
         };
         self.enum_display_modes_impl(flags, filter, |mode| {
             let mut mode2 = surface::desc_to_desc2(mode);
@@ -1397,8 +1385,7 @@ impl IDirectDraw4_Impl for Draw_Impl {
         let filter = if desc.is_null() {
             None
         } else {
-            check_desc2(desc)?;
-            Some(surface::desc2_to_desc(unsafe { &*desc })?)
+            Some(unsafe { descriptor::read(desc)? })
         };
         self.enum_surfaces_impl::<IDirectDrawSurface4>(flags, filter, |surf, d| {
             let mut d2 = surface::desc_to_desc2(d);
@@ -1413,10 +1400,10 @@ impl IDirectDraw4_Impl for Draw_Impl {
         IDirectDraw_Impl::GetCaps(self, driver, software)
     }
     fn GetDisplayMode(&self, desc: *mut DDSURFACEDESC2) -> Result<()> {
-        check_desc2(desc)?;
+        let out = unsafe { descriptor::output(desc)? };
         let (width, height, bpp) = self.display.mode();
         let mode = mode_description(width, height, bpp)?;
-        unsafe { desc.write(surface::desc_to_desc2(&mode)) };
+        out.write(surface::desc_to_desc2(&mode));
         Ok(())
     }
     fn GetFourCCCodes(&self, count: *mut u32, codes: *mut u32) -> Result<()> {
@@ -1465,7 +1452,7 @@ impl IDirectDraw4_Impl for Draw_Impl {
         if caps.is_null() {
             return Err(E_INVALIDARG.into());
         }
-        self.get_available_vid_mem_impl(total, free)
+        unsafe { self.get_available_vid_mem_impl(total, free) }
     }
     fn GetSurfaceFromDC(&self, hdc: HDC) -> Result<IDirectDrawSurface4> {
         self.get_surface_from_dc_impl(hdc)
@@ -1480,8 +1467,8 @@ impl IDirectDraw4_Impl for Draw_Impl {
         if flags & !(DDGDI_GETHOSTIDENTIFIER as u32) != 0 {
             return Err(E_INVALIDARG.into());
         }
-        let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
-        *out = fill_device_identifier();
+        let out = ptr::NonNull::new(out).ok_or(E_INVALIDARG)?;
+        unsafe { out.write(fill_device_identifier()) };
         Ok(())
     }
 }
@@ -1514,7 +1501,7 @@ impl IDirectDraw7_Impl for Draw_Impl {
         out: OutRef<IDirectDrawSurface7>,
         outer: Ref<IUnknown>,
     ) -> Result<()> {
-        self.create_surface_v2(desc, out, outer)
+        unsafe { self.create_surface_v2(desc, out, outer) }
     }
     fn DuplicateSurface(&self, src: Ref<IDirectDrawSurface7>) -> Result<IDirectDrawSurface7> {
         self.duplicate_surface_impl(src)
@@ -1539,8 +1526,7 @@ impl IDirectDraw7_Impl for Draw_Impl {
         let filter = if desc.is_null() {
             None
         } else {
-            check_desc2(desc)?;
-            Some(surface::desc2_to_desc(unsafe { &*desc })?)
+            Some(unsafe { descriptor::read(desc)? })
         };
         self.enum_surfaces_impl::<IDirectDrawSurface7>(flags, filter, |surf, d| {
             let mut d2 = surface::desc_to_desc2(d);
@@ -1615,9 +1601,10 @@ impl IDirectDraw7_Impl for Draw_Impl {
         if flags & !(DDGDI_GETHOSTIDENTIFIER as u32) != 0 {
             return Err(E_INVALIDARG.into());
         }
-        let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
+        let out = unsafe { out.cast::<MaybeUninit<DDDEVICEIDENTIFIER2>>().as_mut() }
+            .ok_or(E_INVALIDARG)?;
         let base = fill_device_identifier();
-        *out = DDDEVICEIDENTIFIER2 {
+        out.write(DDDEVICEIDENTIFIER2 {
             szDriver: base.szDriver,
             szDescription: base.szDescription,
             liDriverVersion: base.liDriverVersion,
@@ -1627,7 +1614,7 @@ impl IDirectDraw7_Impl for Draw_Impl {
             dwRevision: base.dwRevision,
             guidDeviceIdentifier: base.guidDeviceIdentifier,
             dwWHQLLevel: 0,
-        };
+        });
         Ok(())
     }
     fn StartModeTest(&self, _: *mut SIZE, _: u32, _: u32) -> Result<()> {
@@ -1645,80 +1632,53 @@ fn valid_device_guid(device: *const GUID) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn DirectDrawCreate(
+pub extern "system" fn DirectDrawCreate(
     device: *const GUID,
-    out: *mut *mut c_void,
-    outer: *mut c_void,
+    out: OutRef<IDirectDraw>,
+    outer: Ref<IUnknown>,
 ) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
-    }
-    unsafe { out.write(ptr::null_mut()) };
-    if !outer.is_null() {
-        return CLASS_E_NOAGGREGATION;
-    }
-    if !valid_device_guid(device) {
-        return E_INVALIDARG;
-    }
-    let device: IDirectDraw = Draw::create_interface(true);
-    unsafe { out.write(device.into_raw()) };
-    S_OK
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn DirectDrawCreateEx(
-    device: *const GUID,
-    out: *mut *mut c_void,
-    iid: *const GUID,
-    outer: *mut c_void,
-) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
-    }
-    unsafe { out.write(ptr::null_mut()) };
-    if iid.is_null() {
-        return E_POINTER;
-    }
-    if !outer.is_null() {
-        return CLASS_E_NOAGGREGATION;
-    }
-    if !valid_device_guid(device) {
-        return E_INVALIDARG;
-    }
-    let requested = unsafe { *iid };
-    if requested != IDirectDraw7::IID {
-        return E_NOINTERFACE;
-    }
-    let dd1 = Draw::create_interface(true);
-    match dd1.cast::<IDirectDraw7>() {
-        Ok(dd) => {
-            unsafe { out.write(dd.into_raw()) };
-            S_OK
+    put_interface(out, || {
+        no_aggregation(outer)?;
+        if !valid_device_guid(device) {
+            return Err(E_INVALIDARG.into());
         }
-        Err(err) => err.code(),
-    }
+        Draw::create_interface(true)
+    })
+    .into()
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn DirectDrawCreateClipper(
+pub extern "system" fn DirectDrawCreateEx(
+    device: *const GUID,
+    out: OutRef<IDirectDraw7>,
+    iid: Option<&GUID>,
+    outer: Ref<IUnknown>,
+) -> HRESULT {
+    put_interface(out, || {
+        let iid = iid.ok_or(E_POINTER)?;
+        no_aggregation(outer)?;
+        if !valid_device_guid(device) {
+            return Err(E_INVALIDARG.into());
+        }
+        if *iid != IDirectDraw7::IID {
+            return Err(E_NOINTERFACE.into());
+        }
+        Draw::create_interface(true)?.cast()
+    })
+    .into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn DirectDrawCreateClipper(
     flags: u32,
-    out: *mut *mut c_void,
-    outer: *mut c_void,
+    out: OutRef<IDirectDrawClipper>,
+    outer: Ref<IUnknown>,
 ) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
-    }
-    unsafe { out.write(ptr::null_mut()) };
-    if !outer.is_null() {
-        return CLASS_E_NOAGGREGATION;
-    }
-    match clipper::create_clipper(flags, None) {
-        Ok(clipper) => {
-            unsafe { out.write(clipper.into_raw()) };
-            S_OK
-        }
-        Err(error) => error.code(),
-    }
+    put_interface(out, || {
+        no_aggregation(outer)?;
+        clipper::create_clipper(flags, None)
+    })
+    .into()
 }
 
 #[unsafe(no_mangle)]
@@ -1819,13 +1779,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_pixel_storage_does_not_keep_a_released_com_surface_alive() {
+        let display = DisplayShared::new(640, 480, 32);
+        let desc = DDSURFACEDESC {
+            dwSize: size_of::<DDSURFACEDESC>() as u32,
+            dwFlags: DDSD_CAPS as u32,
+            ddsCaps: DDSCAPS {
+                dwCaps: DDSCAPS_PRIMARYSURFACE as u32,
+            },
+            ..Default::default()
+        };
+        let primary = unsafe { surface::create_surface(display.clone(), &desc) }.unwrap();
+        let pixels = display.primary_slot().unwrap();
+        assert!(display.primary_surface().is_some());
+        // Final Release must unregister even while a presenter holds the display mutex.
+        std::thread::scope(|scope| {
+            let (locked, ready) = std::sync::mpsc::sync_channel(0);
+            let (released, wait) = std::sync::mpsc::sync_channel(0);
+            let display = &display;
+            scope.spawn(move || {
+                let _guard = display.lock();
+                locked.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(3)).unwrap();
+            });
+            ready.recv().unwrap();
+            drop(primary);
+            released.send(()).unwrap();
+        });
+        assert!(display.primary_slot().is_none());
+        assert!(display.registry().entries.is_empty());
+        assert_eq!(display.allocated_bytes(), 0);
+        assert!(display.primary_surface().is_none());
+        assert!(display.live_surfaces().is_empty());
+        drop(pixels);
+    }
+
+    #[test]
     fn draw_release_returns_zero_with_live_surfaces_and_mode_switch_succeeds() {
-        let mut raw_dd: *mut c_void = ptr::null_mut();
+        let mut dd = None;
         assert_eq!(
-            unsafe { DirectDrawCreate(ptr::null(), &mut raw_dd, ptr::null_mut()) },
+            DirectDrawCreate(ptr::null(), (&mut dd).into(), Ref::default()),
             S_OK
         );
-        let dd = unsafe { IDirectDraw::from_raw(raw_dd) };
+        let dd = dd.unwrap();
         unsafe { dd.SetDisplayMode(1024, 768, 16) }.unwrap();
 
         let mut prim_desc = DDSURFACEDESC {
@@ -1870,15 +1866,8 @@ mod tests {
 
         // Releasing IDirectDraw while surfaces are still alive must return refcount == 0
         // (RA2 Reset_Video_Mode checks `DirectDrawObject->Release() == 0`).
-        let dd_raw = dd.into_raw();
-        let refcount = unsafe {
-            let unk = IUnknown::from_raw_borrowed(&dd_raw).unwrap();
-            let vtbl = *(dd_raw as *const *const usize);
-            let release: unsafe extern "system" fn(*mut c_void) -> u32 =
-                std::mem::transmute(*vtbl.add(2));
-            let _ = unk;
-            release(dd_raw)
-        };
+        let release = dd.vtable().base__.Release;
+        let refcount = unsafe { release(dd.into_raw()) };
         assert_eq!(refcount, 0);
 
         // After IDirectDraw is released, GetDDInterface safely fails instead of dangling.

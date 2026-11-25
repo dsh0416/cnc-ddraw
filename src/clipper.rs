@@ -2,20 +2,20 @@
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
-use std::mem::size_of;
+use std::mem::{size_of, MaybeUninit};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use windows::core::{implement, Interface, Ref, Result, BOOL, HRESULT};
+use crate::window::{client_rect, is_window};
+use windows::core::{implement, Interface, Owned, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_POINTER, HWND, RECT};
 use windows::Win32::Graphics::DirectDraw::{
     IDirectDraw, IDirectDrawClipper, IDirectDrawClipper_Impl,
 };
 use windows::Win32::Graphics::Gdi::{
-    CombineRgn, CreateRectRgnIndirect, DeleteObject, GetRegionData, HRGN, RGNDATA, RGNDATAHEADER,
-    RGN_AND, RGN_ERROR, RGN_OR,
+    CombineRgn, CreateRectRgnIndirect, GetRegionData, HRGN, RGNDATA, RGNDATAHEADER, RGN_AND,
+    RGN_ERROR, RGN_OR,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsWindow};
 
 use crate::draw::DisplayShared;
 
@@ -29,10 +29,7 @@ const DDERR_NOCLIPLIST: HRESULT = dd_hresult(205);
 const DDERR_REGIONTOOSMALL: HRESULT = dd_hresult(566);
 const DDERR_CLIPPERISUSINGHWND: HRESULT = dd_hresult(567);
 
-struct OwnedRgn(HRGN);
-
-// Win32 GDI HRGN handles are process-global and synchronized via `Clipper::region` Mutex.
-unsafe impl Send for OwnedRgn {}
+struct OwnedRgn(Owned<HRGN>);
 
 impl OwnedRgn {
     fn from_rect(rect: &RECT) -> Option<Self> {
@@ -40,22 +37,105 @@ impl OwnedRgn {
         if rgn.is_invalid() {
             None
         } else {
-            Some(Self(rgn))
+            // SAFETY: CreateRectRgnIndirect returned a new region for this owner.
+            Some(Self(unsafe { Owned::new(rgn) }))
         }
     }
 
     fn handle(&self) -> HRGN {
-        self.0
+        *self.0
     }
-}
 
-impl Drop for OwnedRgn {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe {
-                let _ = DeleteObject(self.0.into());
+    fn intersect(&self, bounds: &RECT) -> Result<Self> {
+        let clipped = Self::from_rect(bounds).ok_or(E_INVALIDARG)?;
+        let kind = unsafe {
+            CombineRgn(
+                Some(clipped.handle()),
+                Some(self.handle()),
+                Some(clipped.handle()),
+                RGN_AND,
+            )
+        };
+        if kind == RGN_ERROR {
+            return Err(E_FAIL.into());
+        }
+        Ok(clipped)
+    }
+
+    fn data_size(&self) -> u32 {
+        unsafe { GetRegionData(self.handle(), 0, None) }
+    }
+
+    fn rectangles(&self) -> Vec<RECT> {
+        // GDI writes an RGNDATAHEADER followed by its canonical array of RECTs.
+        // Allocate in RECT units so both the header and the array are aligned.
+        const HEADER_RECTS: usize = size_of::<RGNDATAHEADER>() / size_of::<RECT>();
+        const {
+            assert!(size_of::<RGNDATAHEADER>().is_multiple_of(size_of::<RECT>()));
+            assert!(align_of::<RECT>() >= align_of::<RGNDATAHEADER>());
+        }
+        let size = self.data_size();
+        if (size as usize) < size_of::<RGNDATAHEADER>() {
+            return Vec::new();
+        }
+        let mut data = vec![RECT::default(); (size as usize).div_ceil(size_of::<RECT>())];
+        // SAFETY: The live region cannot change during this query. The buffer
+        // holds at least size bytes, and RECT accepts every integer bit pattern.
+        let written =
+            unsafe { GetRegionData(self.handle(), size, Some(data.as_mut_ptr().cast())) } as usize;
+        if written > size as usize || written < size_of::<RGNDATAHEADER>() {
+            return Vec::new();
+        }
+        data.truncate(written / size_of::<RECT>());
+        data.drain(..HEADER_RECTS);
+        data.retain(|r| r.right > r.left && r.bottom > r.top);
+        data
+    }
+
+    /// # Safety
+    /// The SDK caller supplies a readable header. For valid dimensions the
+    /// allocation must also contain nCount initialized RECTs at dwSize.
+    unsafe fn from_clip_list(list: *const RGNDATA) -> Result<Self> {
+        // The variable-length header may place rectangles at an unaligned offset.
+        #[repr(C, packed)]
+        struct PackedRect(RECT);
+
+        let header = list.cast::<RGNDATAHEADER>();
+        // Ignore unused header members, which legacy clients can leave uninitialized.
+        let (offset, count) = unsafe {
+            (
+                (&raw const (*header).dwSize).read_unaligned() as usize,
+                (&raw const (*header).nCount).read_unaligned() as usize,
+            )
+        };
+        if offset < size_of::<RGNDATAHEADER>()
+            || count == 0
+            || count > (isize::MAX as usize).saturating_sub(offset) / size_of::<RECT>()
+        {
+            return Err(DDERR_INVALIDCLIPLIST.into());
+        }
+        // SAFETY: The caller provides the payload and PackedRect has byte alignment.
+        let rects = unsafe {
+            std::slice::from_raw_parts(list.cast::<u8>().add(offset).cast::<PackedRect>(), count)
+        };
+        let first = rects[0].0;
+        let combined = Self::from_rect(&first).ok_or(DDERR_INVALIDCLIPLIST)?;
+        for packed in &rects[1..] {
+            let rect = packed.0;
+            let next = Self::from_rect(&rect).ok_or(DDERR_INVALIDCLIPLIST)?;
+            let kind = unsafe {
+                CombineRgn(
+                    Some(combined.handle()),
+                    Some(combined.handle()),
+                    Some(next.handle()),
+                    RGN_OR,
+                )
+            };
+            if kind == RGN_ERROR {
+                return Err(DDERR_INVALIDCLIPLIST.into());
             }
         }
+        Ok(combined)
     }
 }
 
@@ -103,8 +183,10 @@ impl Clipper {
         if hwnd.is_invalid() {
             return None;
         }
-        let mut rect = RECT::default();
-        if unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() && rect.right > 0 && rect.bottom > 0 {
+        if let Some(rect) = client_rect(hwnd)
+            .ok()
+            .filter(|r| r.right > 0 && r.bottom > 0)
+        {
             return OwnedRgn::from_rect(&rect);
         }
         if let Some(display) = self.display.as_ref().and_then(Weak::upgrade) {
@@ -132,49 +214,7 @@ impl Clipper {
         let Some(region) = region_ref.as_ref() else {
             return Ok(None);
         };
-        let intersected = OwnedRgn::from_rect(&bounds).ok_or(E_INVALIDARG)?;
-        let kind = unsafe {
-            CombineRgn(
-                Some(intersected.handle()),
-                Some(region.handle()),
-                Some(intersected.handle()),
-                RGN_AND,
-            )
-        };
-        if kind == RGN_ERROR {
-            return Err(E_FAIL.into());
-        }
-        let needed = unsafe { GetRegionData(intersected.handle(), 0, None) } as usize;
-        if needed < size_of::<RGNDATAHEADER>() {
-            return Ok(Some(Vec::new()));
-        }
-        let mut buf = vec![0u8; needed];
-        let written = unsafe {
-            GetRegionData(
-                intersected.handle(),
-                buf.len() as u32,
-                Some(buf.as_mut_ptr().cast::<RGNDATA>()),
-            )
-        } as usize;
-        if written < size_of::<RGNDATAHEADER>() {
-            return Ok(Some(Vec::new()));
-        }
-        let header = unsafe { &*buf.as_ptr().cast::<RGNDATAHEADER>() };
-        let count = header.nCount as usize;
-        let offset = header.dwSize as usize;
-        let rects_end = offset.saturating_add(count.saturating_mul(size_of::<RECT>()));
-        if rects_end > written {
-            return Ok(Some(Vec::new()));
-        }
-        let mut rects = Vec::with_capacity(count);
-        let ptr = unsafe { buf.as_ptr().add(offset).cast::<RECT>() };
-        for i in 0..count {
-            let r = unsafe { ptr.add(i).read_unaligned() };
-            if r.right > r.left && r.bottom > r.top {
-                rects.push(r);
-            }
-        }
-        Ok(Some(rects))
+        Ok(Some(region.intersect(&bounds)?.rectangles()))
     }
 }
 
@@ -187,7 +227,7 @@ pub fn clip_rects(clipper: &IDirectDrawClipper, bounds: RECT) -> Result<Option<V
 
 impl IDirectDrawClipper_Impl for Clipper_Impl {
     fn GetClipList(&self, rect: *mut RECT, clip_list: *mut RGNDATA, size: *mut u32) -> Result<()> {
-        let size = unsafe { size.as_mut() }.ok_or(E_INVALIDARG)?;
+        let size = unsafe { size.cast::<MaybeUninit<u32>>().as_mut() }.ok_or(E_INVALIDARG)?;
         let manual = self.region.lock().unwrap_or_else(|e| e.into_inner());
         let hwnd_rgn = if manual.is_none() {
             self.hwnd_region()
@@ -199,47 +239,37 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
             .or(hwnd_rgn.as_ref())
             .ok_or(DDERR_NOCLIPLIST)?;
 
-        let clipped = if let Some(bounds) = unsafe { rect.as_ref() } {
-            let temp = OwnedRgn::from_rect(bounds).ok_or(E_INVALIDARG)?;
-            let kind = unsafe {
-                CombineRgn(
-                    Some(temp.handle()),
-                    Some(base_rgn.handle()),
-                    Some(temp.handle()),
-                    RGN_AND,
-                )
-            };
-            if kind == RGN_ERROR {
-                return Err(E_FAIL.into());
-            }
-            Some(temp)
-        } else {
-            None
-        };
+        let clipped = unsafe { rect.as_ref() }
+            .map(|bounds| base_rgn.intersect(bounds))
+            .transpose()?;
         let effective = clipped.as_ref().unwrap_or(base_rgn);
 
         if clip_list.is_null() {
-            let needed = unsafe { GetRegionData(effective.handle(), 0, None) };
+            let needed = effective.data_size();
             if needed == 0 {
                 return Err(E_FAIL.into());
             }
-            *size = needed;
+            size.write(needed);
             return Ok(());
         }
 
-        let written = unsafe { GetRegionData(effective.handle(), *size, Some(clip_list)) };
+        // When a buffer is supplied, size is an initialized input capacity as well as an output.
+        let written =
+            unsafe { GetRegionData(effective.handle(), size.assume_init(), Some(clip_list)) };
         if written == 0 {
-            let needed = unsafe { GetRegionData(effective.handle(), 0, None) };
-            *size = needed;
+            let needed = effective.data_size();
+            size.write(needed);
             return Err(DDERR_REGIONTOOSMALL.into());
         }
-        *size = written;
+        size.write(written);
         Ok(())
     }
 
     fn GetHWnd(&self, out: *mut HWND) -> Result<()> {
-        let out = unsafe { out.as_mut() }.ok_or(E_INVALIDARG)?;
-        *out = self.current_hwnd();
+        if out.is_null() {
+            return Err(E_INVALIDARG.into());
+        }
+        unsafe { out.write(self.current_hwnd()) };
         Ok(())
     }
 
@@ -255,8 +285,10 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
     }
 
     fn IsClipListChanged(&self, out: *mut BOOL) -> Result<()> {
-        let out = unsafe { out.as_mut() }.ok_or(E_POINTER)?;
-        *out = BOOL(0);
+        if out.is_null() {
+            return Err(E_POINTER.into());
+        }
+        unsafe { out.write(BOOL(0)) };
         Ok(())
     }
 
@@ -271,33 +303,8 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
             *self.region.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return Ok(());
         }
-        let header = unsafe { &(*clip_list).rdh };
-        if (header.dwSize as usize) < size_of::<RGNDATAHEADER>() || header.nCount == 0 {
-            return Err(DDERR_INVALIDCLIPLIST.into());
-        }
-        let rects_ptr = unsafe {
-            clip_list
-                .cast::<u8>()
-                .add(header.dwSize as usize)
-                .cast::<RECT>()
-        };
-        let first = unsafe { rects_ptr.read_unaligned() };
-        let combined = OwnedRgn::from_rect(&first).ok_or(DDERR_INVALIDCLIPLIST)?;
-        for i in 1..header.nCount as usize {
-            let next_rect = unsafe { rects_ptr.add(i).read_unaligned() };
-            let next = OwnedRgn::from_rect(&next_rect).ok_or(DDERR_INVALIDCLIPLIST)?;
-            let kind = unsafe {
-                CombineRgn(
-                    Some(combined.handle()),
-                    Some(combined.handle()),
-                    Some(next.handle()),
-                    RGN_OR,
-                )
-            };
-            if kind == RGN_ERROR {
-                return Err(DDERR_INVALIDCLIPLIST.into());
-            }
-        }
+        // SAFETY: SetClipList receives the variable-length region from the COM caller.
+        let combined = unsafe { OwnedRgn::from_clip_list(clip_list)? };
         *self.region.lock().unwrap_or_else(|e| e.into_inner()) = Some(combined);
         Ok(())
     }
@@ -306,7 +313,7 @@ impl IDirectDrawClipper_Impl for Clipper_Impl {
         if flags != 0 {
             return Err(E_INVALIDARG.into());
         }
-        if !hwnd.is_invalid() && !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        if !hwnd.is_invalid() && !is_window(hwnd) {
             return Err(E_INVALIDARG.into());
         }
         self.hwnd.store(hwnd.0 as isize, Ordering::Release);
@@ -326,6 +333,57 @@ mod tests {
     struct TwoRectRgn {
         header: RGNDATAHEADER,
         rects: [RECT; 2],
+    }
+
+    #[test]
+    fn clip_list_handles_extended_headers_and_rejects_impossible_counts() {
+        #[repr(C, packed)]
+        struct ExtendedRegion {
+            header: RGNDATAHEADER,
+            extension: u8,
+            rect: RECT,
+        }
+        let bounds = RECT {
+            left: -8,
+            top: -3,
+            right: 7,
+            bottom: 12,
+        };
+        let mut data = ExtendedRegion {
+            header: RGNDATAHEADER {
+                dwSize: (size_of::<RGNDATAHEADER>() + 1) as u32,
+                iType: RDH_RECTANGLES,
+                nCount: 1,
+                ..Default::default()
+            },
+            extension: 0,
+            rect: bounds,
+        };
+        let clipper = create_clipper(0, None).unwrap();
+        unsafe {
+            clipper.SetClipList((&raw mut data).cast(), 0).unwrap();
+            let mut size = MaybeUninit::uninit();
+            clipper
+                .GetClipList(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    size.as_mut_ptr(),
+                )
+                .unwrap();
+            assert_eq!(
+                size.assume_init() as usize,
+                size_of::<RGNDATAHEADER>() + size_of::<RECT>()
+            );
+            data.header.nCount = u32::MAX;
+            assert_eq!(
+                clipper
+                    .SetClipList((&raw mut data).cast(), 0)
+                    .unwrap_err()
+                    .code(),
+                DDERR_INVALIDCLIPLIST
+            );
+        }
+        assert_eq!(clip_rects(&clipper, bounds).unwrap().unwrap(), vec![bounds]);
     }
 
     #[test]
