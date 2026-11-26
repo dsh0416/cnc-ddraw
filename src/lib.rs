@@ -14,6 +14,7 @@ mod exports;
 mod ffi;
 mod palette;
 mod renderer;
+mod shader;
 mod simd_blit;
 mod surface;
 mod win32;

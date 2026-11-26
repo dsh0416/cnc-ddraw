@@ -27,6 +27,7 @@ pub struct Config {
     pub vsync: bool,
     pub maxfps: i32,
     pub renderer: RendererBackend,
+    pub shader: Option<String>,
     pub toggle_fullscreen_vk: u32,
     pub singlecpu: bool,
     pub noactivateapp: bool,
@@ -47,6 +48,7 @@ impl Default for Config {
             vsync: false,
             maxfps: 0,
             renderer: RendererBackend::Auto,
+            shader: None,
             toggle_fullscreen_vk: VK_RETURN_CODE,
             singlecpu: true,
             noactivateapp: false,
@@ -108,13 +110,8 @@ impl Config {
                 continue;
             };
             let key = raw_key.trim().to_ascii_lowercase();
-            // Strip inline comments preceded by ';' or '#' unless empty.
-            let val = raw_val
-                .split([';', '#'])
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            // Strip inline comments preceded by ';' or '#' outside double quotes.
+            let val = strip_inline_comment(raw_val).trim().to_string();
             if key.is_empty() {
                 continue;
             }
@@ -199,6 +196,14 @@ impl Config {
                     _ => RendererBackend::Auto,
                 };
             }
+            "shader" => {
+                let cleaned = unquote(value).trim();
+                self.shader = if cleaned.is_empty() {
+                    None
+                } else {
+                    Some(cleaned.to_string())
+                };
+            }
             "keytogglefullscreen" => {
                 if let Some(vk) = parse_u32_radix(value) {
                     self.toggle_fullscreen_vk = vk;
@@ -221,6 +226,63 @@ impl Config {
             }
             _ => {}
         }
+    }
+    pub fn resolved_shader_path(&self) -> Option<PathBuf> {
+        let raw = if let Some(env_val) = std::env::var_os("CNC_DDRAW_SHADER") {
+            let s = env_val.to_string_lossy().trim().to_string();
+            if s.is_empty() {
+                return None;
+            }
+            s
+        } else {
+            self.shader.clone()?
+        };
+        let normalized = raw.replace('\\', "/");
+        let p = PathBuf::from(&normalized);
+        if p.is_absolute() {
+            return Some(p);
+        }
+        if let Some(dir) = dll_directory() {
+            let candidate = dir.join(&p);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        {
+            let candidate = dir.join(&p);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        Some(
+            dll_or_exe_directory()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(p),
+        )
+    }
+}
+
+fn strip_inline_comment(raw: &str) -> &str {
+    let mut in_quotes = false;
+    for (idx, ch) in raw.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ';' | '#' if !in_quotes => return &raw[..idx],
+            _ => {}
+        }
+    }
+    raw
+}
+
+fn unquote(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
     }
 }
 
@@ -310,12 +372,14 @@ mod tests {
             vsync = yes
             maxfps = 60
             renderer = vulkan
+            shader = "Shaders\crt\crt-easymode.glslp" ; RetroArch preset
             keytogglefullscreen = 0x0D
 
             [game]
             border = true
             renderer = dx12
             width = 1024
+            shader = Shaders\interpolation\xbrz-freescale.glsl
         "#;
         let cfg = Config::parse_ini(ini, Some("game"));
         assert!(cfg.windowed);
@@ -330,9 +394,19 @@ mod tests {
         assert_eq!(cfg.maxfps, 60);
         assert_eq!(cfg.min_frame_interval_ms(), 16);
         assert_eq!(cfg.renderer, RendererBackend::Dx12);
+        assert_eq!(
+            cfg.shader.as_deref(),
+            Some(r"Shaders\interpolation\xbrz-freescale.glsl")
+        );
         assert_eq!(cfg.toggle_fullscreen_vk, 0x0D);
         assert!(cfg.singlecpu);
         assert!(cfg.noactivateapp);
+
+        let global_only = Config::parse_ini(ini, Some("other"));
+        assert_eq!(
+            global_only.shader.as_deref(),
+            Some(r"Shaders\crt\crt-easymode.glslp")
+        );
     }
 
     #[test]

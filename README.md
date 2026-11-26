@@ -39,6 +39,7 @@ maintas=true             ; preserve aspect ratio (false = stretch to fill window
 vsync=false              ; true = Fifo vsync, false = low-latency Mailbox/Immediate
 maxfps=0                 ; 0 = coalesced ~250 Hz cap, >0 = explicit FPS cap
 renderer=auto            ; auto, dx12, or vulkan (overridden by WGPU_BACKEND env var)
+shader=                  ; optional RetroArch .glslp preset or standalone .glsl shader (or CNC_DDRAW_SHADER env var)
 keytogglefullscreen=0x0D ; Alt+key toggle between borderless fullscreen and windowed (0 = off)
 singlecpu=true           ; pin game-directory threads to CPU0 to prevent multi-core engine freezes
 noactivateapp=false      ; shield focus deactivation messages (auto-enabled for RA2/TS presets)
@@ -58,6 +59,7 @@ Press **Alt+Enter** at any time to toggle between borderless fullscreen and wind
 - `src/palette.rs` stores the 256-entry `IDirectDrawPalette`. Changing an attached palette refreshes the primary image even when the pixel indices stay the same.
 - `src/exports.rs`, `exports.def`, and `build.rs` provide standard DirectDraw export ordinals (`@1`..`@21`), reentrant `AcquireDDThreadLock`/`ReleaseDDThreadLock`, legacy stubs (`CompleteCreateSysmemSurface`, `D3DParseUnknownCommand`, `DDInternalLock`/`DDInternalUnlock`), helper exports (`DDIsWindowed`, `DDGetProcAddress`, `DDEnableZoom`), and `DllGetClassObject`/`IClassFactory` for `CLSID_DirectDraw`, `CLSID_DirectDraw7`, and `CLSID_DirectDrawClipper`.
 - `src/renderer.rs` and `src/present.wgsl` share one presentation pipeline across Vulkan and DX12. Raw primary surface bytes (`R8Uint` indexed, `R16Uint` RGB555/RGB565, `R32Uint` XRGB8888) are uploaded directly without CPU conversion and unpacked in WGSL with a 256-entry palette/gamma LUT texture into a centered, aspect-preserving (or stretched) viewport.
+- `src/shader/` adds pure-Rust RetroArch `.glslp` preset and standalone `.glsl` (including `.glsl.pass1`) filter support on top of `wgpu` + `naga`. When `shader=` is configured, Pass 0 unpacks the raw frame into an `Rgba8Unorm` `Original` target, and the shader chain translates legacy RetroArch GLSL (110–130 + `COMPAT_*` macros + `#pragma parameter` + LUT PNGs + multi-pass FBOs/aliases/frame history) into Vulkan GLSL 450 compiled through `naga` across both DX12 and Vulkan. Invalid shaders log diagnostics and fall back cleanly to the default presenter.
 - `src/simd_blit.rs` uses `fearless_simd` for runtime-dispatched (SSE2 / SSE4.2 / AVX2 / AVX-512) branchless CPU color-keyed blits and rectangular color fills on CPU-backed surfaces.
 
 `src/descriptor.rs` checks DirectDraw structure sizes at the COM boundary and reads the fields selected by the caller's flags. Output descriptors can arrive with only `dwSize` initialized. Set `DDPF_RGB` when supplying true-color depths and masks. `EnumDisplayModes` treats a pixel format with no flags as a wildcard. Surface creation and resizing copy the visible pixels from each input row. `src/surface/dc.rs` owns the GDI bitmap and accounts for its scanline stride separately from the game's pitch.

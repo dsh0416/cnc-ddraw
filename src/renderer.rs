@@ -9,6 +9,7 @@ use windows::Win32::Foundation::HWND;
 
 use crate::compat;
 use crate::config::{self, RendererBackend};
+use crate::shader::FilterChain;
 use crate::surface::{PixelFormat, SurfaceSlot};
 use crate::window::{self, compute_viewport, OverlayWindow};
 
@@ -175,6 +176,7 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     configured: bool,
     pipeline: wgpu::RenderPipeline,
+    filter_chain: Option<FilterChain>,
     frame: Option<UploadedFrame>,
     overlay: OverlayWindow,
 }
@@ -204,8 +206,16 @@ impl Renderer {
             ..Default::default()
         }))
         .map_err(|err| format!("selecting adapter: {err}"))?;
+        let mut required_features = wgpu::Features::empty();
+        if adapter
+            .features()
+            .contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER)
+        {
+            required_features |= wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("DirectDraw device"),
+            required_features,
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             ..Default::default()
         }))
@@ -234,6 +244,38 @@ impl Renderer {
         let caps = surface.get_capabilities(&adapter);
         surface_cfg.present_mode = pick_present_mode(&caps, config::get().vsync);
 
+        let shader_path = config::get().resolved_shader_path();
+        if shader_path.is_some() {
+            // RetroArch GLSL shaders output gamma-encoded colors; prefer a non-sRGB swapchain
+            // format when available so the final pass can write straight to the swapchain.
+            if let Some(&non_srgb) = caps.formats.iter().find(|f| !f.is_srgb()) {
+                surface_cfg.format = non_srgb;
+            }
+        }
+
+        let filter_chain = match shader_path {
+            Some(path) => match FilterChain::load(&device, &queue, &path, surface_cfg.format) {
+                Ok(chain) => {
+                    compat::log_msg(&format!("loaded RetroArch shader: {}", path.display()));
+                    Some(chain)
+                }
+                Err(err) => {
+                    compat::log_msg(&format!(
+                        "failed to load shader {} (falling back to default present): {err}",
+                        path.display()
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let unpack_target_format = if filter_chain.is_some() {
+            wgpu::TextureFormat::Rgba8Unorm
+        } else {
+            surface_cfg.format
+        };
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("DirectDraw GPU unpack and blit"),
             source: wgpu::ShaderSource::Wgsl(include_str!("present.wgsl").into()),
@@ -254,7 +296,7 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
-                targets: &[Some(surface_cfg.format.into())],
+                targets: &[Some(unpack_target_format.into())],
             }),
             multiview: None,
             cache: None,
@@ -270,6 +312,7 @@ impl Renderer {
             config: surface_cfg,
             configured: false,
             pipeline,
+            filter_chain,
             frame: None,
             overlay,
         })
@@ -301,11 +344,16 @@ impl Renderer {
         {
             self.frame = None;
         }
+        let unpack_format = if self.filter_chain.is_some() {
+            wgpu::TextureFormat::Rgba8Unorm
+        } else {
+            self.config.format
+        };
         let frame = self.frame.get_or_insert_with(|| {
             UploadedFrame::new(
                 &self.device,
                 &self.pipeline,
-                self.config.format,
+                unpack_format,
                 size,
                 raw_format,
             )
@@ -460,7 +508,29 @@ impl Renderer {
         let frame = self.frame.as_ref().expect("frame uploaded above");
         let view = output.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
+        let viewport = compute_viewport(width, height, target_w, target_h, config::get().maintas);
+        if let Some(chain) = self.filter_chain.as_mut() {
+            {
+                let orig_view = chain.prepare_original_target(&self.device, width, height);
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("DirectDraw unpack to Original"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: orig_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &frame.bindings, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            chain.render(&self.device, &self.queue, &mut encoder, &view, viewport);
+        } else {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("DirectDraw present"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -474,8 +544,7 @@ impl Renderer {
                 })],
                 ..Default::default()
             });
-            let (vx, vy, vw, vh) =
-                compute_viewport(width, height, target_w, target_h, config::get().maintas);
+            let (vx, vy, vw, vh) = viewport;
             pass.set_viewport(vx as f32, vy as f32, vw as f32, vh as f32, 0.0, 1.0);
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &frame.bindings, &[]);
