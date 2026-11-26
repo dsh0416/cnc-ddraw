@@ -22,9 +22,7 @@ pub fn load_png_rgba(path: &Path) -> Result<DecodedImage, String> {
 pub fn decode_png_rgba<R: std::io::Read>(reader: R) -> Result<DecodedImage, String> {
     let mut decoder = png::Decoder::new(reader);
     decoder.set_transformations(
-        png::Transformations::EXPAND
-            | png::Transformations::STRIP_16
-            | png::Transformations::ALPHA,
+        png::Transformations::EXPAND | png::Transformations::STRIP_16 | png::Transformations::ALPHA,
     );
     let mut reader = decoder
         .read_info()

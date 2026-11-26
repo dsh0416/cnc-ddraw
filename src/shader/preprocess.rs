@@ -82,14 +82,11 @@ impl Preprocessor {
         self.cond_stack.last().is_none_or(|f| f.this_active)
     }
 
-    fn process_source(
-        &mut self,
-        raw: &str,
-        base_dir: &Path,
-        depth: usize,
-    ) -> Result<(), String> {
+    fn process_source(&mut self, raw: &str, base_dir: &Path, depth: usize) -> Result<(), String> {
         if depth > MAX_INCLUDE_DEPTH {
-            return Err(format!("exceeded maximum #include depth ({MAX_INCLUDE_DEPTH})"));
+            return Err(format!(
+                "exceeded maximum #include depth ({MAX_INCLUDE_DEPTH})"
+            ));
         }
         let cleaned = strip_comments(&join_continuations(normalize_newlines(raw)));
         let mut active_chunk = String::new();
@@ -228,9 +225,8 @@ impl Preprocessor {
                     .ok_or_else(|| format!("malformed #include directive: '{trimmed}'"))?;
                 let normalized = rel.replace('\\', "/");
                 let inc_path = base_dir.join(normalized);
-                let inc_text = std::fs::read_to_string(&inc_path).map_err(|err| {
-                    format!("reading #include {}: {err}", inc_path.display())
-                })?;
+                let inc_text = std::fs::read_to_string(&inc_path)
+                    .map_err(|err| format!("reading #include {}: {err}", inc_path.display()))?;
                 let inc_dir = inc_path.parent().unwrap_or(base_dir);
                 self.process_source(&inc_text, inc_dir, depth + 1)?;
             }
@@ -261,8 +257,7 @@ impl Preprocessor {
             }
         }
         let body = after_name.trim().to_string();
-        self.macros
-            .insert(name.to_string(), MacroDef::Object(body));
+        self.macros.insert(name.to_string(), MacroDef::Object(body));
     }
 
     fn expand_line(&self, line: &str) -> String {
@@ -271,12 +266,7 @@ impl Preprocessor {
         self.expand_text(line, &mut hidden, &mut budget)
     }
 
-    fn expand_text(
-        &self,
-        input: &str,
-        hidden: &mut HashSet<String>,
-        budget: &mut usize,
-    ) -> String {
+    fn expand_text(&self, input: &str, hidden: &mut HashSet<String>, budget: &mut usize) -> String {
         let bytes = input.as_bytes();
         let mut out = String::with_capacity(input.len());
         let mut i = 0;

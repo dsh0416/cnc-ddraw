@@ -216,12 +216,13 @@ impl FilterChain {
         for (idx, pass_cfg) in preset.passes.into_iter().enumerate() {
             let is_last = idx + 1 == pass_count;
             let raw_src = std::fs::read_to_string(&pass_cfg.shader_path).map_err(|err| {
-                format!("reading shader pass {} ({}): {err}", idx, pass_cfg.shader_path.display())
+                format!(
+                    "reading shader pass {} ({}): {err}",
+                    idx,
+                    pass_cfg.shader_path.display()
+                )
             })?;
-            let pass_dir = pass_cfg
-                .shader_path
-                .parent()
-                .unwrap_or(&preset.base_dir);
+            let pass_dir = pass_cfg.shader_path.parent().unwrap_or(&preset.base_dir);
 
             let compiled = compile_retroarch_glsl(
                 &raw_src,
@@ -272,10 +273,7 @@ impl FilterChain {
             (None, None)
         };
 
-        let quad_bytes: Vec<u8> = QUAD_VERTICES
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let quad_bytes: Vec<u8> = QUAD_VERTICES.iter().flat_map(|f| f.to_le_bytes()).collect();
         let quad_vb = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("RetroArch fullscreen quad"),
             size: quad_bytes.len() as u64,
@@ -463,12 +461,8 @@ impl FilterChain {
             let pass_wrap = pass.config.wrap_mode;
 
             for tb in &pass.texture_bindings {
-                let (tex_view, smp_key) = self.resolve_texture_and_sampler(
-                    idx,
-                    &tb.semantic,
-                    pass_linear,
-                    pass_wrap,
-                );
+                let (tex_view, smp_key) =
+                    self.resolve_texture_and_sampler(idx, &tb.semantic, pass_linear, pass_wrap);
                 let sampler = self
                     .samplers
                     .get(&smp_key)
@@ -998,9 +992,11 @@ fn write_uniform_field(
         UniformSemantic::Parameter(_) => match field.ty {
             UniformType::Float => write_f32s(buf, off, &[field.default_param]),
             UniformType::Int => write_bytes(buf, off, &(field.default_param as i32).to_le_bytes()),
-            UniformType::Uint => {
-                write_bytes(buf, off, &(field.default_param.max(0.0) as u32).to_le_bytes())
-            }
+            UniformType::Uint => write_bytes(
+                buf,
+                off,
+                &(field.default_param.max(0.0) as u32).to_le_bytes(),
+            ),
             _ => {}
         },
         UniformSemantic::Unknown => {}
@@ -1067,11 +1063,7 @@ mod tests {
         .ok()
     }
 
-    fn readback_pixel(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        tex: &wgpu::Texture,
-    ) -> [u8; 4] {
+    fn readback_pixel(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture) -> [u8; 4] {
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: 256,
@@ -1116,10 +1108,7 @@ mod tests {
             return;
         };
 
-        let tmp = std::env::temp_dir().join(format!(
-            "cnc_ddraw_glslp_test_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("cnc_ddraw_glslp_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 

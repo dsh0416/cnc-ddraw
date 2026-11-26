@@ -157,8 +157,18 @@ pub fn compile_retroarch_glsl(
     let fs_body = pass_state.rewrite_stage(&fs_tokens, ShaderStage::Fragment)?;
 
     let (uniform_fields, uniform_size) = pass_state.finalize_uniforms();
-    let vs_450 = build_stage_source(&vs_body, &uniform_fields, &pass_state.textures, ShaderStage::Vertex);
-    let fs_450 = build_stage_source(&fs_body, &uniform_fields, &pass_state.textures, ShaderStage::Fragment);
+    let vs_450 = build_stage_source(
+        &vs_body,
+        &uniform_fields,
+        &pass_state.textures,
+        ShaderStage::Vertex,
+    );
+    let fs_450 = build_stage_source(
+        &fs_body,
+        &uniform_fields,
+        &pass_state.textures,
+        ShaderStage::Fragment,
+    );
 
     let vertex_module = parse_and_validate_glsl(&vs_450, naga::ShaderStage::Vertex)
         .map_err(|e| format!("vertex GLSL compile error: {e}"))?;
@@ -174,10 +184,7 @@ pub fn compile_retroarch_glsl(
     })
 }
 
-fn parse_and_validate_glsl(
-    source: &str,
-    stage: naga::ShaderStage,
-) -> Result<naga::Module, String> {
+fn parse_and_validate_glsl(source: &str, stage: naga::ShaderStage) -> Result<naga::Module, String> {
     let mut frontend = naga::front::glsl::Frontend::default();
     let options = naga::front::glsl::Options::from(stage);
     let module = frontend
@@ -865,9 +872,11 @@ struct TopItem {
 fn scan_top_item(tokens: &[Tok], start: usize) -> (usize, Option<(String, Vec<usize>)>) {
     // Check if this item starts a function header: `<ret_type> <name> ( ... ) { ... }` or `;`.
     let mut fn_info = None;
-    if let (Some(Tok::Ident(_ret)), Some(Tok::Ident(name)), Some(lp)) =
-        (tokens.get(start), tokens.get(start + 1), tokens.get(start + 2))
-    {
+    if let (Some(Tok::Ident(_ret)), Some(Tok::Ident(name)), Some(lp)) = (
+        tokens.get(start),
+        tokens.get(start + 1),
+        tokens.get(start + 2),
+    ) {
         if lp.is_punct("(") {
             if let Some(rp) = find_matching_paren(tokens, start + 2) {
                 let sampler_indices = find_sampler_param_indices(&tokens[start + 3..rp]);
@@ -1047,9 +1056,8 @@ fn rewrite_expr_slice(
 ) {
     let is_known_sampler =
         |name: &str| global_samplers.contains(name) || local_samplers.contains(name);
-    let is_shadowed = |scopes: &[HashSet<String>], name: &str| {
-        scopes.iter().any(|s| s.contains(name))
-    };
+    let is_shadowed =
+        |scopes: &[HashSet<String>], name: &str| scopes.iter().any(|s| s.contains(name));
 
     let mut i = 0usize;
     while i < tokens.len() {
@@ -1079,10 +1087,7 @@ fn rewrite_expr_slice(
                     if let Some(Tok::Ident(var_name)) = tokens.get(i + 1) {
                         let after_var = tokens.get(i + 2);
                         let is_decl = after_var.is_some_and(|t| {
-                            t.is_punct("=")
-                                || t.is_punct(";")
-                                || t.is_punct(",")
-                                || t.is_punct("[")
+                            t.is_punct("=") || t.is_punct(";") || t.is_punct(",") || t.is_punct("[")
                         });
                         if is_decl {
                             if let Some(scope) = shadowed_scopes.last_mut() {
@@ -1200,7 +1205,10 @@ fn rewrite_expr_slice(
 
                         if matches!(
                             id.as_str(),
-                            "texelFetch" | "texelFetchOffset" | "textureSize" | "textureQueryLevels"
+                            "texelFetch"
+                                | "texelFetchOffset"
+                                | "textureSize"
+                                | "textureQueryLevels"
                         ) {
                             let args = split_call_args(&tokens[i + 2..rp]);
                             out.push(Tok::Ident(id.clone()));
@@ -1506,17 +1514,26 @@ fn classify_uniform_semantic(
         _ => {}
     }
     if let Some(stem) = name.strip_suffix("TextureSize") {
-        if let Some(n) = stem.strip_prefix("PassPrev").and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(n) = stem
+            .strip_prefix("PassPrev")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             if n >= 1 {
                 return UniformSemantic::PassPrevTextureSize(n);
             }
         }
-        if let Some(n) = stem.strip_prefix("Pass").and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(n) = stem
+            .strip_prefix("Pass")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             if n >= 1 {
                 return UniformSemantic::PassTextureSize(n - 1);
             }
         }
-        if let Some(n) = stem.strip_prefix("Prev").and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(n) = stem
+            .strip_prefix("Prev")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             return UniformSemantic::PrevTextureSize(n);
         }
         if let Some(alias) = aliases.iter().find(|a| a.as_str() == stem) {
@@ -1524,17 +1541,26 @@ fn classify_uniform_semantic(
         }
     }
     if let Some(stem) = name.strip_suffix("InputSize") {
-        if let Some(n) = stem.strip_prefix("PassPrev").and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(n) = stem
+            .strip_prefix("PassPrev")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             if n >= 1 {
                 return UniformSemantic::PassPrevInputSize(n);
             }
         }
-        if let Some(n) = stem.strip_prefix("Pass").and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(n) = stem
+            .strip_prefix("Pass")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             if n >= 1 {
                 return UniformSemantic::PassInputSize(n - 1);
             }
         }
-        if let Some(n) = stem.strip_prefix("Prev").and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(n) = stem
+            .strip_prefix("Prev")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             return UniformSemantic::PrevInputSize(n);
         }
         if let Some(alias) = aliases.iter().find(|a| a.as_str() == stem) {
@@ -1596,18 +1622,19 @@ void main() {
 "#;
         let mut overrides = BTreeMap::new();
         overrides.insert("SCAN_STRENGTH".into(), 0.5);
-        let compiled = compile_retroarch_glsl(
-            src,
-            Path::new("."),
-            &[],
-            &["MaskLUT".into()],
-            &overrides,
-        )
-        .expect("should compile legacy GLSL 120 shader through naga");
+        let compiled =
+            compile_retroarch_glsl(src, Path::new("."), &[], &["MaskLUT".into()], &overrides)
+                .expect("should compile legacy GLSL 120 shader through naga");
 
         assert_eq!(compiled.texture_bindings.len(), 3);
-        assert_eq!(compiled.texture_bindings[0].semantic, TextureSemantic::Source);
-        assert_eq!(compiled.texture_bindings[1].semantic, TextureSemantic::Original);
+        assert_eq!(
+            compiled.texture_bindings[0].semantic,
+            TextureSemantic::Source
+        );
+        assert_eq!(
+            compiled.texture_bindings[1].semantic,
+            TextureSemantic::Original
+        );
         assert_eq!(
             compiled.texture_bindings[2].semantic,
             TextureSemantic::Lut("MaskLUT".into())
@@ -1617,7 +1644,10 @@ void main() {
             .iter()
             .find(|f| f.name == "SCAN_STRENGTH")
             .expect("SCAN_STRENGTH uniform present");
-        assert_eq!(param.semantic, UniformSemantic::Parameter("SCAN_STRENGTH".into()));
+        assert_eq!(
+            param.semantic,
+            UniformSemantic::Parameter("SCAN_STRENGTH".into())
+        );
         assert!((param.default_param - 0.5).abs() < 1e-6);
     }
 

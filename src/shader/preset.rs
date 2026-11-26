@@ -198,11 +198,7 @@ fn load_glslp_recursive(path: &Path, depth: usize) -> Result<ShaderPreset, Strin
     parse_glslp_str(&text, &base_dir, depth)
 }
 
-pub fn parse_glslp_str(
-    text: &str,
-    base_dir: &Path,
-    depth: usize,
-) -> Result<ShaderPreset, String> {
+pub fn parse_glslp_str(text: &str, base_dir: &Path, depth: usize) -> Result<ShaderPreset, String> {
     let mut reference: Option<PathBuf> = None;
     let mut raw_pairs: Vec<(String, String)> = Vec::new();
     let mut kv: BTreeMap<String, String> = BTreeMap::new();
@@ -557,12 +553,18 @@ mod tests {
         assert_eq!(p0.wrap_mode, WrapMode::ClampToEdge);
         assert_eq!(p0.framebuffer_format, FramebufferFormat::Rgba16Float);
         assert_eq!(p0.frame_count_mod, Some(60));
-        assert_eq!(p0.output_size(false, 320, 240, 1920, 1080, 8192), (640, 480));
+        assert_eq!(
+            p0.output_size(false, 320, 240, 1920, 1080, 8192),
+            (640, 480)
+        );
         assert!(!p0.renders_directly_to_viewport(false));
 
         let p1 = &preset.passes[1];
         assert_eq!(p1.filter_linear, Some(true));
-        assert_eq!(p1.output_size(true, 640, 480, 1440, 1080, 8192), (1440, 1080));
+        assert_eq!(
+            p1.output_size(true, 640, 480, 1440, 1080, 8192),
+            (1440, 1080)
+        );
         assert!(p1.renders_directly_to_viewport(true));
 
         assert_eq!(preset.luts.len(), 2);
