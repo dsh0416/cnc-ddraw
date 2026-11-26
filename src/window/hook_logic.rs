@@ -133,6 +133,23 @@ pub(super) fn virtual_window_rect(hwnd: HWND, include_dialogs: bool) -> Option<R
     None
 }
 
+/// Maps a `CB_GETDROPPEDCONTROLRECT` screen-space rectangle into `bound`'s virtual client space,
+/// matching `virtual_window_rect` so dialog scalers that subtract `GetWindowRect(parent)` from
+/// `SendMessage(combo, CB_GETDROPPEDCONTROLRECT, ...)` do not shift ComboBoxes by the host
+/// window's desktop position in windowed mode.
+pub(super) fn map_dropped_control_rect(hwnd: HWND, rect: &mut RECT) {
+    let Some((bound, _, _, _)) = logical_mode() else {
+        return;
+    };
+    map_dropped_control_rect_for_bound(bound, hwnd, rect);
+}
+
+pub(super) fn map_dropped_control_rect_for_bound(bound: HWND, hwnd: HWND, rect: &mut RECT) {
+    if hwnd == bound || is_related_dialog_window(bound, hwnd) {
+        *rect = map_rect(None, Some(bound), *rect);
+    }
+}
+
 pub(super) fn virtual_system_metrics(index: i32) -> Option<i32> {
     let (_, w, h, _) = logical_mode()?;
     if index == SM_CXSCREEN.0 {
