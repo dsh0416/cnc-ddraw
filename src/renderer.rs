@@ -400,6 +400,7 @@ impl Renderer {
     pub fn present_surface(
         &mut self,
         primary: &SurfaceSlot,
+        allow_current_thread_lock: bool,
         on_uploaded: impl FnOnce(),
     ) -> Result<PresentOutcome, PresentError> {
         if self.device_lost.load(Ordering::Relaxed) {
@@ -424,7 +425,12 @@ impl Renderer {
         // calling Primary->Lock() are never stalled across swapchain acquire/present.
         let (width, height) = {
             let guard = primary.lock();
-            if guard.locked() {
+            let busy = if allow_current_thread_lock {
+                guard.locked_by_other_thread()
+            } else {
+                guard.locked()
+            };
+            if busy {
                 return Ok(PresentOutcome::Busy);
             }
             let (width, height) = (guard.width, guard.height);

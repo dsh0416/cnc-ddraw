@@ -598,6 +598,10 @@ impl SurfaceData {
         !matches!(self.access, Access::Ready)
     }
 
+    pub fn locked_by_other_thread(&self) -> bool {
+        self.locked() && self.lock_owner_tid() != Some(thread::current().id())
+    }
+
     fn lock_owner_tid(&self) -> Option<ThreadId> {
         match self.access {
             Access::Ready => None,

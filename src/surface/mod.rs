@@ -898,25 +898,24 @@ impl Surface {
     }
 
     fn finish_unlock(&self, mut data: std::sync::MutexGuard<'_, SurfaceData>) -> Result<()> {
-        // Schedule any deferred presentation *before* releasing `Access::Ready` and waking
-        // waiting worker threads. Engines like Red Alert 2 decrement `DSurface.LockCount` to 0
-        // before calling `IDirectDrawSurface::Unlock` and clear `DSurface.BufferPtr = NULL` only
-        // after `Unlock` returns; blocking on a synchronous wgpu present or posting messages
-        // after `notify_ready` lets a background cursor thread re-lock the primary surface and
-        // then have its `BufferPtr` zeroed out underneath it.
-        let deferred = if self.is_primary {
-            self.display.request_deferred_refresh()
-        } else {
-            true
-        };
-        data.access = Access::Ready;
         data.bump_uniqueness();
         drop(data);
+        // Refresh *while* `Access::Locked` is still held by this thread. Engines like Red Alert 2
+        // decrement `DSurface.LockCount` to 0 before calling `IDirectDrawSurface::Unlock` and clear
+        // `DSurface.BufferPtr = NULL` only *after* `Unlock` returns; keeping `Access::Locked`
+        // across any synchronous wgpu present or `PostMessageW` prevents background cursor threads
+        // from re-locking the surface before `Unlock` returns, while still allowing tight
+        // non-message-pumping menu animation loops to present smoothly every 16 ms.
+        let refresh_res = if self.is_primary {
+            self.display.request_refresh_from_unlock()
+        } else {
+            Ok(())
+        };
+        let mut data = self.write()?;
+        data.access = Access::Ready;
+        drop(data);
         self.data.notify_ready();
-        if !deferred {
-            self.refresh()?;
-        }
-        Ok(())
+        refresh_res
     }
 
     fn unlock_ptr_impl(&self, address: *mut c_void) -> Result<()> {

@@ -128,7 +128,7 @@ pub fn on_host_window_changed() {
     if let Some(renderer) = d.presentation.renderer.as_mut() {
         renderer.sync_overlay();
     }
-    let _ = display.refresh_locked(d);
+    let _ = display.refresh_locked(d, false);
 }
 
 type RegisteredSurface = (ComWeak<IDirectDrawSurface>, Weak<SurfaceSlot>);
@@ -291,13 +291,17 @@ impl DisplayShared {
     pub(super) fn present_locked(&self, guard: MutexGuard<'_, Display>) -> Result<()> {
         let primary = self.primary_slot();
         let mut display = guard;
-        display.present_now(self, primary.as_deref())
+        display.present_now(self, primary.as_deref(), false)
     }
 
-    fn refresh_locked(&self, guard: MutexGuard<'_, Display>) -> Result<()> {
+    fn refresh_locked(
+        &self,
+        guard: MutexGuard<'_, Display>,
+        allow_current_thread_lock: bool,
+    ) -> Result<()> {
         let primary = self.primary_slot();
         let mut display = guard;
-        display.refresh(self, primary.as_deref())
+        display.refresh(self, primary.as_deref(), allow_current_thread_lock)
     }
 
     fn mark_dirty_and_schedule_flush(&self) {
@@ -307,17 +311,6 @@ impl DisplayShared {
         }
     }
 
-    /// Marks the primary surface dirty and schedules an asynchronous `WM_APP_FLUSH` without
-    /// ever blocking on `Display` or `wgpu` on the calling thread. Returns `false` when no
-    /// subclassed window message loop is attached so callers can fall back to `request_refresh`.
-    pub fn request_deferred_refresh(&self) -> bool {
-        if !window::can_schedule_flush() {
-            return false;
-        }
-        self.mark_dirty_and_schedule_flush();
-        true
-    }
-
     /// Requests a coalesced presentation. Safe to call from any thread: off-UI worker threads
     /// never block on `Display` or touch `Renderer`/`OverlayWindow`, instead posting `WM_APP_FLUSH`.
     pub fn request_refresh(&self) -> Result<()> {
@@ -325,7 +318,18 @@ impl DisplayShared {
             self.mark_dirty_and_schedule_flush();
             return Ok(());
         }
-        self.refresh_locked(self.lock())
+        self.refresh_locked(self.lock(), false)
+    }
+
+    /// Same as `request_refresh`, but called from `IDirectDrawSurface::Unlock` while the calling
+    /// thread still holds `Access::Locked` so background worker threads cannot re-lock the surface
+    /// before `Unlock` returns to the game.
+    pub fn request_refresh_from_unlock(&self) -> Result<()> {
+        if !window::is_ui_thread_or_unbound() {
+            self.mark_dirty_and_schedule_flush();
+            return Ok(());
+        }
+        self.refresh_locked(self.lock(), true)
     }
 
     /// Requests an immediate presentation on the UI thread, or schedules one when called off-UI.
@@ -384,7 +388,12 @@ impl Display {
         prev
     }
 
-    fn present_now(&mut self, shared: &DisplayShared, primary: Option<&SurfaceSlot>) -> Result<()> {
+    fn present_now(
+        &mut self,
+        shared: &DisplayShared,
+        primary: Option<&SurfaceSlot>,
+        allow_current_thread_lock: bool,
+    ) -> Result<()> {
         let Some(primary) = primary else {
             shared.dirty.store(false, Ordering::Release);
             shared.flush_scheduled.store(false, Ordering::Release);
@@ -417,7 +426,7 @@ impl Display {
             .renderer
             .as_mut()
             .expect("renderer checked above")
-            .present_surface(primary, || {
+            .present_surface(primary, allow_current_thread_lock, || {
                 // Clear dirty while still holding the primary surface mutex so any worker-thread
                 // write that happens after upload sets dirty=true without being clobbered.
                 shared.dirty.store(false, Ordering::Release);
@@ -472,7 +481,12 @@ impl Display {
         }
     }
 
-    fn refresh(&mut self, shared: &DisplayShared, primary: Option<&SurfaceSlot>) -> Result<()> {
+    fn refresh(
+        &mut self,
+        shared: &DisplayShared,
+        primary: Option<&SurfaceSlot>,
+        allow_current_thread_lock: bool,
+    ) -> Result<()> {
         if (self.presentation.renderer.is_none() && self.presentation.bound_hwnd.get().is_invalid())
             || primary.is_none()
         {
@@ -485,11 +499,11 @@ impl Display {
                 .is_some_and(|t| t.elapsed() >= FLUSH_MAX_DEFER)
             || !window::can_schedule_flush();
         if force_now {
-            return self.present_now(shared, primary);
+            return self.present_now(shared, primary, allow_current_thread_lock);
         }
         if !shared.flush_scheduled.swap(true, Ordering::AcqRel) && !window::schedule_flush() {
             shared.flush_scheduled.store(false, Ordering::Release);
-            return self.present_now(shared, primary);
+            return self.present_now(shared, primary, allow_current_thread_lock);
         }
         Ok(())
     }
