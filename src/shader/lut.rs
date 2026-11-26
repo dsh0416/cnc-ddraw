@@ -37,15 +37,15 @@ pub fn decode_png_rgba<R: std::io::Read>(reader: R) -> Result<DecodedImage, Stri
         png::ColorType::Rgba => bytes.to_vec(),
         png::ColorType::Rgb => {
             let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
-            for chunk in bytes.chunks_exact(3) {
-                out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            for &[r, g, b] in bytes.as_chunks::<3>().0 {
+                out.extend_from_slice(&[r, g, b, 255]);
             }
             out
         }
         png::ColorType::GrayscaleAlpha => {
             let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
-            for chunk in bytes.chunks_exact(2) {
-                out.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
+            for &[g, a] in bytes.as_chunks::<2>().0 {
+                out.extend_from_slice(&[g, g, g, a]);
             }
             out
         }
