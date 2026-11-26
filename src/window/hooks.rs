@@ -33,6 +33,7 @@ static SUBCLASSED_UNICODE: AtomicBool = AtomicBool::new(false);
 static GETMSG_HOOK: AtomicIsize = AtomicIsize::new(0);
 static ACTIVATE_PASSED: AtomicBool = AtomicBool::new(false);
 static ACTIVATEAPP_PASSED: AtomicBool = AtomicBool::new(false);
+static ALT_WAS_DOWN: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn subclassed_hwnd() -> Option<HWND> {
     SUBCLASSED_HWND.load()
@@ -150,6 +151,10 @@ unsafe extern "system" fn hook_SetWindowPos(
 
 unsafe extern "system" fn hook_BringWindowToTop(hwnd: HWND) -> BOOL {
     BOOL::from(hook_logic::handle_bring_window_to_top(hwnd))
+}
+
+unsafe extern "system" fn hook_SetForegroundWindow(hwnd: HWND) -> BOOL {
+    BOOL::from(hook_logic::handle_set_foreground_window(hwnd))
 }
 
 unsafe extern "system" fn hook_MoveWindow(
@@ -394,6 +399,7 @@ unsafe extern "system" fn subclass_wndproc(
         lparam,
         &ACTIVATE_PASSED,
         &ACTIVATEAPP_PASSED,
+        &ALT_WAS_DOWN,
     ) {
         SubclassAction::Return(res) => return res,
         SubclassAction::DefWindowProc => {
@@ -468,6 +474,8 @@ pub(crate) fn install_subclass(hwnd: HWND) {
         SUBCLASSED_HWND.store(Some(hwnd));
         ACTIVATE_PASSED.store(false, Ordering::Relaxed);
         ACTIVATEAPP_PASSED.store(false, Ordering::Relaxed);
+        ALT_WAS_DOWN.store(false, Ordering::Relaxed);
+        hook_logic::reset_tracking();
     }
 }
 
@@ -555,6 +563,11 @@ pub(crate) fn install_iat_hooks() {
             "user32.dll",
             "BringWindowToTop",
             hook_BringWindowToTop as *const () as usize,
+        ),
+        (
+            "user32.dll",
+            "SetForegroundWindow",
+            hook_SetForegroundWindow as *const () as usize,
         ),
         (
             "user32.dll",

@@ -1,14 +1,17 @@
 //! Pure Rust decision logic for Win32 API hooks, `WH_GETMESSAGE`, and host WndProc subclassing.
 #![forbid(unsafe_code)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BITSPIXEL, HORZRES, LOGPIXELSX, LOGPIXELSY, VERTRES};
 use windows::Win32::UI::WindowsAndMessaging::{
-    MSG, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, WM_ACTIVATE, WM_ACTIVATEAPP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEWHEEL, WM_MOVE, WM_NCACTIVATE, WM_RBUTTONDOWN, WM_SIZE,
-    WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WM_WINDOWPOSCHANGED,
+    HWND_TOP, HWND_TOPMOST, MSG, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CANCELMODE,
+    WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEWHEEL,
+    WM_MOVE, WM_MOVING, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN,
+    WM_NCLBUTTONUP, WM_NCPAINT, WM_RBUTTONDOWN, WM_SIZE, WM_SIZING, WM_SYSCHAR, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_WINDOWPOSCHANGED, WS_CHILD,
 };
 
 use crate::config;
@@ -17,18 +20,102 @@ use crate::win32::geometry::{
     set_cursor_pos, window_from_point, window_rect,
 };
 use crate::win32::hwnd::{
-    bring_window_to_top, desktop_window, kill_timer, move_window, set_window_pos,
+    bring_window_to_top, desktop_window, enum_thread_windows, foreground_window, is_child,
+    is_iconic, is_visible, kill_timer, move_window, post_message, set_foreground_window,
+    set_window_pos, style,
 };
 
 use super::input::{
     client_origin_in_bound, client_to_logical, hit_test_logical_child, is_mouse_message,
-    is_related_dialog_window, logical_to_client,
+    is_related_dialog_window, is_same_process_window, logical_to_client,
 };
 use super::overlay::ensure_present_on_top_if_active;
 use super::{
-    bound_hwnd, is_present_hwnd, is_scaling_active, logical_mode, present_hwnd, FLUSH_TIMER_ID,
-    WM_APP_FLUSH,
+    bound_hwnd, bound_thread_id, is_in_size_move, is_present_hwnd, is_scaling_active, logical_mode,
+    present_hwnd, set_in_size_move, FLUSH_TIMER_ID, WM_APP_FLUSH,
 };
+
+const VK_TAB_CODE: usize = 0x09;
+const VK_MENU_CODE: usize = 0x12;
+const VK_F4_CODE: usize = 0x73;
+
+static LAST_BOUND_ORIGIN_VALID: AtomicBool = AtomicBool::new(false);
+static LAST_BOUND_ORIGIN_X: AtomicI32 = AtomicI32::new(0);
+static LAST_BOUND_ORIGIN_Y: AtomicI32 = AtomicI32::new(0);
+
+pub(super) fn reset_tracking() {
+    LAST_BOUND_ORIGIN_VALID.store(false, Ordering::Relaxed);
+}
+
+fn is_game_foreground(bound: HWND) -> bool {
+    let fg = foreground_window();
+    !fg.is_invalid()
+        && (fg == bound || is_related_dialog_window(bound, fg) || is_same_process_window(fg))
+}
+
+fn is_non_client_or_frame_message(msg: u32) -> bool {
+    matches!(
+        msg,
+        WM_NCHITTEST | 0x00A0
+            ..=0x00AF | WM_SYSCOMMAND | WM_SIZING | WM_MOVING | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE
+    )
+}
+
+fn is_top_level_game_popup(bound: HWND, hwnd: HWND) -> bool {
+    !is_present_hwnd(hwnd)
+        && is_related_dialog_window(bound, hwnd)
+        && !is_child(bound, hwnd)
+        && (style(hwnd) as u32) & WS_CHILD.0 == 0
+}
+
+fn bound_client_origin(bound: HWND) -> Option<POINT> {
+    let mut pt = POINT { x: 0, y: 0 };
+    client_to_screen(bound, &mut pt).then_some(pt)
+}
+
+fn sync_popups_after_bound_move(bound: HWND) {
+    if is_iconic(bound) {
+        return;
+    }
+    let Some(origin) = bound_client_origin(bound) else {
+        return;
+    };
+    let had_prev = LAST_BOUND_ORIGIN_VALID.swap(true, Ordering::Relaxed);
+    let prev_x = LAST_BOUND_ORIGIN_X.swap(origin.x, Ordering::Relaxed);
+    let prev_y = LAST_BOUND_ORIGIN_Y.swap(origin.y, Ordering::Relaxed);
+    if !had_prev {
+        return;
+    }
+    let dx = origin.x - prev_x;
+    let dy = origin.y - prev_y;
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    let tid = bound_thread_id();
+    if tid == 0 {
+        return;
+    }
+    let mut popups = Vec::new();
+    enum_thread_windows(tid, |hwnd| {
+        if hwnd != bound && is_visible(hwnd) && is_top_level_game_popup(bound, hwnd) {
+            popups.push(hwnd);
+        }
+        true
+    });
+    for dlg in popups {
+        if let Ok(rc) = window_rect(dlg) {
+            let _ = set_window_pos(
+                dlg,
+                None,
+                rc.left + dx,
+                rc.top + dy,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
+    }
+}
 
 pub(super) fn virtual_window_rect(hwnd: HWND, include_dialogs: bool) -> Option<RECT> {
     let (bound, w, h, _) = logical_mode()?;
@@ -92,6 +179,11 @@ pub(super) fn virtual_cursor_pos() -> Option<POINT> {
 
 pub(super) fn set_virtual_cursor_pos(x: i32, y: i32) -> bool {
     if let Some((bound, w, h, _)) = logical_mode() {
+        // Never yank the user's cursor while another application is foreground or while
+        // the user is dragging/resizing the game window.
+        if !is_game_foreground(bound) || is_in_size_move() {
+            return true;
+        }
         let (cx, cy) = logical_to_client(bound, x, y, w, h);
         let mut pt = POINT { x: cx, y: cy };
         if client_to_screen(bound, &mut pt) {
@@ -103,6 +195,9 @@ pub(super) fn set_virtual_cursor_pos(x: i32, y: i32) -> bool {
 
 pub(super) fn clip_virtual_cursor(rect: Option<&RECT>) -> bool {
     if let (Some((bound, w, h, _)), Some(r)) = (logical_mode(), rect) {
+        if !is_game_foreground(bound) || is_in_size_move() {
+            return true;
+        }
         let (l, t) = logical_to_client(bound, r.left, r.top, w, h);
         let (ri, b) = logical_to_client(
             bound,
@@ -145,15 +240,28 @@ pub(super) fn virtual_window_from_point(point: POINT) -> HWND {
 
 pub(super) fn handle_set_window_pos(
     hwnd: HWND,
-    insert_after: HWND,
-    x: i32,
-    y: i32,
+    mut insert_after: HWND,
+    mut x: i32,
+    mut y: i32,
     cx: i32,
     cy: i32,
     flags: u32,
 ) -> bool {
     if is_scaling_active() && bound_hwnd() == Some(hwnd) {
         return true;
+    }
+    let mode = logical_mode();
+    if let Some((bound, _, _, _)) = mode {
+        if insert_after == HWND_TOPMOST && (hwnd == bound || is_related_dialog_window(bound, hwnd))
+        {
+            insert_after = HWND_TOP;
+        }
+        if flags & SWP_NOMOVE.0 == 0 && is_top_level_game_popup(bound, hwnd) {
+            if let Some(origin) = bound_client_origin(bound) {
+                x += origin.x;
+                y += origin.y;
+            }
+        }
     }
     let ok = set_window_pos(
         hwnd,
@@ -165,7 +273,7 @@ pub(super) fn handle_set_window_pos(
         SET_WINDOW_POS_FLAGS(flags),
     )
     .is_ok();
-    if let Some((bound, _, _, _)) = logical_mode() {
+    if let Some((bound, _, _, _)) = mode {
         if !is_present_hwnd(hwnd) && is_related_dialog_window(bound, hwnd) {
             ensure_present_on_top_if_active(bound);
         }
@@ -174,6 +282,11 @@ pub(super) fn handle_set_window_pos(
 }
 
 pub(super) fn handle_bring_window_to_top(hwnd: HWND) -> bool {
+    if let Some((bound, _, _, _)) = logical_mode() {
+        if !is_game_foreground(bound) && (hwnd == bound || is_related_dialog_window(bound, hwnd)) {
+            return true;
+        }
+    }
     let ok = bring_window_to_top(hwnd);
     if let Some((bound, _, _, _)) = logical_mode() {
         if !is_present_hwnd(hwnd) && (hwnd == bound || is_related_dialog_window(bound, hwnd)) {
@@ -183,16 +296,35 @@ pub(super) fn handle_bring_window_to_top(hwnd: HWND) -> bool {
     ok
 }
 
+pub(super) fn handle_set_foreground_window(hwnd: HWND) -> bool {
+    if let Some((bound, _, _, _)) = logical_mode() {
+        // When the user Alt+Tabs away, games shielded by `noactivateapp` still believe they own
+        // focus and may call `SetForegroundWindow` on menu transitions; never steal focus back.
+        if !is_game_foreground(bound) && (hwnd == bound || is_related_dialog_window(bound, hwnd)) {
+            return true;
+        }
+    }
+    set_foreground_window(hwnd)
+}
+
 pub(super) fn handle_move_window(
     hwnd: HWND,
-    x: i32,
-    y: i32,
+    mut x: i32,
+    mut y: i32,
     width: i32,
     height: i32,
     repaint: bool,
 ) -> bool {
     if is_scaling_active() && bound_hwnd() == Some(hwnd) {
         return true;
+    }
+    if let Some((bound, _, _, _)) = logical_mode() {
+        if is_top_level_game_popup(bound, hwnd) {
+            if let Some(origin) = bound_client_origin(bound) {
+                x += origin.x;
+                y += origin.y;
+            }
+        }
     }
     move_window(hwnd, x, y, width, height, repaint)
 }
@@ -215,6 +347,12 @@ pub(super) fn virtual_device_caps(index: i32) -> Option<i32> {
 }
 
 pub(super) fn rewrite_getmsg(msg: &mut MSG) {
+    // Never rewrite `msg.pt` or `msg.lParam` during Win32's modal move/resize loop or for
+    // non-client chrome messages; `DefWindowProc`'s SC_MOVE/SC_SIZE loop reads physical screen
+    // coordinates from `msg.pt`, and clobbering them makes dragged windows teleport wildly.
+    if is_in_size_move() || is_non_client_or_frame_message(msg.message) {
+        return;
+    }
     let Some((bound, w, h, _)) = logical_mode() else {
         return;
     };
@@ -263,6 +401,7 @@ pub(super) enum SubclassAction {
     Forward(LPARAM),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_subclass_message(
     hwnd: HWND,
     msg: u32,
@@ -270,6 +409,7 @@ pub(super) fn handle_subclass_message(
     mut lparam: LPARAM,
     activate_passed: &AtomicBool,
     activateapp_passed: &AtomicBool,
+    alt_was_down: &AtomicBool,
 ) -> SubclassAction {
     if msg == WM_APP_FLUSH {
         crate::draw::flush_pending_present(false);
@@ -280,17 +420,58 @@ pub(super) fn handle_subclass_message(
         crate::draw::flush_pending_present(true);
         return SubclassAction::Return(LRESULT(0));
     }
+    let is_bound = bound_hwnd() == Some(hwnd);
+    if is_scaling_active() && is_bound {
+        match msg {
+            WM_ENTERSIZEMOVE => {
+                set_in_size_move(true);
+                let _ = clip_cursor(None);
+                return SubclassAction::DefWindowProc;
+            }
+            WM_EXITSIZEMOVE => {
+                set_in_size_move(false);
+                sync_popups_after_bound_move(hwnd);
+                crate::draw::on_host_window_changed();
+                return SubclassAction::DefWindowProc;
+            }
+            WM_CANCELMODE => {
+                set_in_size_move(false);
+                return SubclassAction::DefWindowProc;
+            }
+            WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCPAINT | WM_NCCALCSIZE => {
+                return SubclassAction::DefWindowProc;
+            }
+            _ => {}
+        }
+    }
     let toggle_vk = config::get().toggle_fullscreen_vk;
-    if toggle_vk != 0 {
+    if msg == WM_SYSKEYDOWN {
         let alt_down = (lparam.0 as u32) & (1 << 29) != 0;
         let was_down = (lparam.0 as u32) & (1 << 30) != 0;
-        if msg == WM_SYSKEYDOWN && wparam.0 as u32 == toggle_vk && alt_down {
+        if wparam.0 == VK_MENU_CODE || alt_down {
+            alt_was_down.store(true, Ordering::Relaxed);
+        }
+        if wparam.0 == VK_F4_CODE {
+            return SubclassAction::DefWindowProc;
+        }
+        if toggle_vk != 0 && wparam.0 as u32 == toggle_vk && alt_down {
             if !was_down {
                 crate::draw::toggle_fullscreen_hotkey();
             }
             return SubclassAction::Return(LRESULT(0));
         }
-        if msg == WM_SYSCHAR && wparam.0 as u32 == toggle_vk && alt_down {
+    }
+    if msg == WM_SYSKEYUP {
+        if wparam.0 == VK_MENU_CODE {
+            alt_was_down.store(false, Ordering::Relaxed);
+        }
+        if wparam.0 == VK_TAB_CODE || (toggle_vk != 0 && wparam.0 as u32 == toggle_vk) {
+            return SubclassAction::DefWindowProc;
+        }
+    }
+    if msg == WM_SYSCHAR && toggle_vk != 0 {
+        let alt_down = (lparam.0 as u32) & (1 << 29) != 0;
+        if wparam.0 as u32 == toggle_vk && alt_down {
             // Suppress default Windows Alt+Enter system beep.
             return SubclassAction::Return(LRESULT(0));
         }
@@ -305,29 +486,34 @@ pub(super) fn handle_subclass_message(
         if !activate_passed.swap(true, Ordering::Relaxed) && active {
             // Allow the initial activation through once so the game initializes its focus flag.
         } else {
-            return SubclassAction::Return(LRESULT(0));
+            return SubclassAction::DefWindowProc;
         }
     }
     if msg == WM_ACTIVATEAPP {
         if wparam.0 == 0 {
+            set_in_size_move(false);
             let _ = clip_cursor(None);
         } else {
             crate::draw::on_host_window_changed();
+            if shield_focus && alt_was_down.swap(false, Ordering::Relaxed) {
+                let _ = post_message(hwnd, WM_SYSKEYUP, WPARAM(VK_MENU_CODE), LPARAM(0));
+            }
         }
         if shield_focus {
             if !activateapp_passed.swap(true, Ordering::Relaxed) && wparam.0 != 0 {
                 // Allow initial activation once.
             } else {
-                return SubclassAction::Return(LRESULT(0));
+                return SubclassAction::DefWindowProc;
             }
         }
     }
-    if matches!(msg, WM_MOVE | WM_SIZE | WM_WINDOWPOSCHANGED) && bound_hwnd() == Some(hwnd) {
+    if matches!(msg, WM_MOVE | WM_SIZE | WM_WINDOWPOSCHANGED) && is_bound {
+        sync_popups_after_bound_move(hwnd);
         crate::draw::on_host_window_changed();
     }
     // Only remap physical coordinates on `bound` when no owned presentation overlay exists;
     // when `PRESENT_HWND` is active, `present_wndproc` and `getmsg_hook` deliver logical coords.
-    if is_mouse_message(msg) && present_hwnd().is_none() {
+    if is_mouse_message(msg) && !is_in_size_move() && present_hwnd().is_none() {
         if let Some((bound, w, h, _)) = logical_mode() {
             if hwnd == bound {
                 let raw = lparam.0 as u32;
@@ -346,4 +532,38 @@ pub(super) fn handle_subclass_message(
         }
     }
     SubclassAction::Forward(lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+    use windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+
+    #[test]
+    fn non_client_and_size_move_messages_preserve_screen_coordinates() {
+        let mut nc_msg = MSG {
+            hwnd: HWND(0x1234 as *mut c_void),
+            message: WM_NCLBUTTONDOWN,
+            pt: POINT { x: 1800, y: 420 },
+            lParam: LPARAM((420 << 16) | 1800),
+            ..Default::default()
+        };
+        rewrite_getmsg(&mut nc_msg);
+        assert_eq!(nc_msg.pt, POINT { x: 1800, y: 420 });
+        assert_eq!(nc_msg.lParam, LPARAM((420 << 16) | 1800));
+
+        set_in_size_move(true);
+        let mut drag_msg = MSG {
+            hwnd: HWND(0x1234 as *mut c_void),
+            message: WM_MOUSEMOVE,
+            pt: POINT { x: 2100, y: 640 },
+            lParam: LPARAM((640 << 16) | 2100),
+            ..Default::default()
+        };
+        rewrite_getmsg(&mut drag_msg);
+        set_in_size_move(false);
+        assert_eq!(drag_msg.pt, POINT { x: 2100, y: 640 });
+        assert_eq!(drag_msg.lParam, LPARAM((640 << 16) | 2100));
+    }
 }

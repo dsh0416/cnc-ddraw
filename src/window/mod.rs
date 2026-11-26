@@ -34,6 +34,7 @@ static LOGICAL_HEIGHT: AtomicU32 = AtomicU32::new(0);
 static LOGICAL_BPP: AtomicU32 = AtomicU32::new(0);
 static MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static LOGICAL_SCALING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static IN_SIZE_MOVE: AtomicBool = AtomicBool::new(false);
 
 pub fn enable_dpi_awareness() {
     crate::win32::enable_dpi_awareness();
@@ -92,6 +93,14 @@ pub(crate) fn is_scaling_active() -> bool {
     LOGICAL_SCALING_ACTIVE.load(Ordering::Relaxed)
 }
 
+pub(crate) fn is_in_size_move() -> bool {
+    IN_SIZE_MOVE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_in_size_move(active: bool) {
+    IN_SIZE_MOVE.store(active, Ordering::Relaxed);
+}
+
 pub fn set_present_hwnd(hwnd: HWND) {
     PRESENT_HWND.store(Some(hwnd));
 }
@@ -115,6 +124,7 @@ pub fn bind_window(hwnd: HWND, scaling_active: bool) -> usize {
     BOUND_THREAD.store(tid, Ordering::Relaxed);
     LOGICAL_SCALING_ACTIVE.store(scaling_active, Ordering::Relaxed);
     MODE_ACTIVE.store(false, Ordering::Relaxed);
+    IN_SIZE_MOVE.store(false, Ordering::Relaxed);
     hooks::install_iat_hooks();
     hooks::install_subclass(hwnd);
     hooks::install_getmsg_hook(tid);
@@ -163,6 +173,7 @@ pub fn unbind_window(bind_id: usize) {
     }
     MODE_ACTIVE.store(false, Ordering::Relaxed);
     LOGICAL_SCALING_ACTIVE.store(false, Ordering::Relaxed);
+    IN_SIZE_MOVE.store(false, Ordering::Relaxed);
     BOUND_HWND.store(None);
     BOUND_THREAD.store(0, Ordering::Relaxed);
     hooks::uninstall_getmsg_hook();

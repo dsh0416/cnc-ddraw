@@ -52,6 +52,10 @@ impl OverlayWindow {
         )
         .map_err(|err| format!("creating presentation overlay window: {err}"))?;
         set_present_hwnd(hwnd);
+        // Ensure neither the owner nor the owned overlay sits in the Topmost band so normal
+        // windows can cleanly cover the game after Alt+Tab.
+        strip_topmost(owner);
+        strip_topmost(hwnd);
         let hinst_nz = NonZeroIsize::new(module.0 as isize)
             .ok_or_else(|| "invalid module handle".to_string())?;
         Ok(Self {
@@ -138,6 +142,20 @@ pub fn client_screen_rect(hwnd: HWND) -> Result<(i32, i32, u32, u32), String> {
     ))
 }
 
+fn strip_topmost(hwnd: HWND) {
+    if !hwnd.is_invalid() && ex_style(hwnd) as u32 & WS_EX_TOPMOST.0 != 0 {
+        let _ = set_window_pos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+        );
+    }
+}
+
 /// Checks if any visible game window/dialog/dropdown/scrollbar is currently above `present`
 /// in Z-order while the game owns foreground focus, strips `WS_EX_TOPMOST` if needed, and raises
 /// `present` above it.
@@ -145,6 +163,8 @@ pub fn keep_present_on_top(owner: HWND, present: HWND) {
     if present.is_invalid() || owner.is_invalid() {
         return;
     }
+    strip_topmost(owner);
+    strip_topmost(present);
     let fg = foreground_window();
     if fg != owner && !is_related_dialog_window(owner, fg) && !is_same_process_window(fg) {
         return;
@@ -157,17 +177,7 @@ pub fn keep_present_on_top(owner: HWND, present: HWND) {
                 || is_related_dialog_window(owner, prev)
                 || is_same_process_window(prev))
         {
-            if ex_style(prev) as u32 & WS_EX_TOPMOST.0 != 0 {
-                let _ = set_window_pos(
-                    prev,
-                    Some(HWND_NOTOPMOST),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-                );
-            }
+            strip_topmost(prev);
             need_raise = true;
         }
     }

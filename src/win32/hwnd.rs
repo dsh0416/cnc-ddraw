@@ -11,9 +11,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumThreadWindows, GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetParent, GetWindow,
     GetWindowLongW, GetWindowPlacement, GetWindowThreadProcessId, IsChild, IsIconic,
     IsWindowUnicode, IsWindowVisible, KillTimer, MoveWindow, PostMessageA, PostMessageW,
-    RegisterClassW, SendMessageW, SetTimer, SetWindowLongW, SetWindowPlacement, SetWindowPos,
-    GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, SET_WINDOW_POS_FLAGS,
-    WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WNDCLASSW,
+    RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongW,
+    SetWindowPlacement, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, GW_HWNDPREV,
+    GW_OWNER, SET_WINDOW_POS_FLAGS, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX,
+    WINDOW_STYLE, WNDCLASSW,
 };
 
 pub(crate) type SafeWndProc = fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
@@ -213,6 +214,11 @@ pub(crate) fn set_window_pos(
 pub(crate) fn bring_window_to_top(hwnd: HWND) -> bool {
     // SAFETY: BringWindowToTop validates the HWND internally.
     unsafe { BringWindowToTop(hwnd).is_ok() }
+}
+
+pub(crate) fn set_foreground_window(hwnd: HWND) -> bool {
+    // SAFETY: SetForegroundWindow validates the HWND internally.
+    unsafe { SetForegroundWindow(hwnd).as_bool() }
 }
 
 pub(crate) fn move_window(

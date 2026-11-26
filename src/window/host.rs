@@ -5,10 +5,10 @@
 use windows::core::Result;
 use windows::Win32::Foundation::{E_INVALIDARG, HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE, WS_EX_TOPMOST, WS_EX_WINDOWEDGE,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
 use crate::config::Config;
@@ -114,8 +114,11 @@ impl HostWindow {
         let hwnd = self.hwnd.get();
         let info = monitor_info(hwnd)?;
         let rect = info.rcMonitor;
-        let edge_styles =
-            WS_EX_CLIENTEDGE.0 | WS_EX_WINDOWEDGE.0 | WS_EX_DLGMODALFRAME.0 | WS_EX_STATICEDGE.0;
+        let stripped_ex = WS_EX_CLIENTEDGE.0
+            | WS_EX_WINDOWEDGE.0
+            | WS_EX_DLGMODALFRAME.0
+            | WS_EX_STATICEDGE.0
+            | WS_EX_TOPMOST.0;
         set_window_long(
             hwnd,
             GWL_STYLE,
@@ -124,16 +127,18 @@ impl HostWindow {
         set_window_long(
             hwnd,
             GWL_EXSTYLE,
-            (self.orig_ex_style as u32 & !edge_styles) as i32,
+            (self.orig_ex_style as u32 & !stripped_ex) as i32,
         )?;
+        // Explicitly demote out of the Topmost band (legacy games like RA2 create their
+        // main HWND with WS_EX_TOPMOST) so Alt+Tab lets other windows rise cleanly above us.
         set_window_pos(
             hwnd,
-            None,
+            Some(HWND_NOTOPMOST),
             rect.left,
             rect.top,
             rect.right - rect.left,
             rect.bottom - rect.top,
-            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE,
         )
     }
 
@@ -150,7 +155,7 @@ impl HostWindow {
         } else {
             next_style |= WS_POPUP.0;
         }
-        let next_ex_style = self.orig_ex_style as u32;
+        let next_ex_style = (self.orig_ex_style as u32) & !WS_EX_TOPMOST.0;
         set_window_long(hwnd, GWL_STYLE, next_style as i32)?;
         set_window_long(hwnd, GWL_EXSTYLE, next_ex_style as i32)?;
 
@@ -190,12 +195,12 @@ impl HostWindow {
 
         set_window_pos(
             hwnd,
-            None,
+            Some(HWND_NOTOPMOST),
             x,
             y,
             win_w,
             win_h,
-            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE,
         )
     }
 
@@ -229,7 +234,7 @@ mod tests {
     #[test]
     fn host_window_enters_toggles_and_restores_original_style_and_rect() {
         let hwnd = create_window_ex_w(
-            Default::default(),
+            WS_EX_TOPMOST,
             w!("STATIC"),
             w!("cnc-ddraw-host-test"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -243,6 +248,7 @@ mod tests {
         .unwrap();
         let orig_style = style(hwnd);
         let orig_rect = window_rect(hwnd).unwrap();
+        assert!(ex_style(hwnd) as u32 & WS_EX_TOPMOST.0 != 0);
 
         let cfg = Config {
             width: 800,
@@ -255,6 +261,7 @@ mod tests {
             HostWindow::enter(hwnd, PresentationMode::BorderlessFullscreen, 800, 600, &cfg)
                 .unwrap();
         assert!(host.is_fullscreen());
+        assert_eq!(ex_style(hwnd) as u32 & WS_EX_TOPMOST.0, 0);
 
         let next = host.toggle_mode(800, 600, &cfg).unwrap();
         assert_eq!(next, PresentationMode::Windowed);
@@ -262,6 +269,7 @@ mod tests {
         let win_style = style(hwnd) as u32;
         assert!(win_style & WS_CAPTION.0 != 0);
         assert!(win_style & WS_THICKFRAME.0 != 0);
+        assert_eq!(ex_style(hwnd) as u32 & WS_EX_TOPMOST.0, 0);
 
         let back = host.toggle_mode(800, 600, &cfg).unwrap();
         assert_eq!(back, PresentationMode::BorderlessFullscreen);
