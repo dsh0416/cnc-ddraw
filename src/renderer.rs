@@ -3,6 +3,7 @@
 use std::num::NonZeroIsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use raw_window_handle::{Win32WindowHandle, WindowsDisplayHandle};
 use windows::Win32::Foundation::HWND;
@@ -12,6 +13,9 @@ use crate::config::{self, RendererBackend};
 use crate::surface::{PixelFormat, SurfaceSlot};
 use crate::window::{self, compute_viewport, OverlayWindow};
 use shader_glslp::FilterChain;
+
+const SLOW_FRAME_THRESHOLD: Duration = Duration::from_millis(30);
+const SLOW_FRAME_LOG_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentOutcome {
@@ -137,19 +141,18 @@ impl UploadedFrame {
 }
 
 fn instance_descriptor() -> wgpu::InstanceDescriptor {
-    // Allow WGPU_BACKEND env var to take precedence for testing/debugging.
-    if std::env::var_os("WGPU_BACKEND").is_some() {
-        return wgpu::InstanceDescriptor::from_env_or_default();
-    }
     let backends = match config::get().renderer {
         RendererBackend::Dx12 => wgpu::Backends::DX12,
         RendererBackend::Vulkan => wgpu::Backends::VULKAN,
         RendererBackend::Auto => wgpu::Backends::PRIMARY,
     };
+    // Always apply WGPU_* env overrides (WGPU_BACKEND, WGPU_DX12_*, WGPU_VALIDATION, etc.)
+    // so diagnostic flags work even when `renderer=dx12` is set via `ddraw.ini`.
     wgpu::InstanceDescriptor {
         backends,
         ..Default::default()
     }
+    .with_env()
 }
 
 fn pick_present_mode(caps: &wgpu::SurfaceCapabilities, vsync: bool) -> wgpu::PresentMode {
@@ -178,6 +181,8 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     filter_chain: Option<FilterChain>,
     frame: Option<UploadedFrame>,
+    last_slow_log: Option<Instant>,
+    slow_frames_since_log: u32,
     overlay: OverlayWindow,
 }
 
@@ -201,9 +206,12 @@ impl Renderer {
         }
         .map_err(|err| format!("creating window surface: {err}"))?;
 
+        let power_preference =
+            wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference,
             compatible_surface: Some(&surface),
-            ..Default::default()
+            force_fallback_adapter: false,
         }))
         .map_err(|err| format!("selecting adapter: {err}"))?;
         let mut required_features = wgpu::Features::empty();
@@ -217,6 +225,7 @@ impl Renderer {
             label: Some("DirectDraw device"),
             required_features,
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         }))
         .map_err(|err| format!("creating GPU device: {err}"))?;
@@ -304,6 +313,28 @@ impl Renderer {
         if device_lost.load(Ordering::Relaxed) {
             return Err("GPU device lost during initialization".into());
         }
+        if compat::log_enabled() {
+            let info = adapter.get_info();
+            compat::log_msg(&format!(
+                "wgpu initialized: backend={:?} adapter={:?} type={:?} pci={:04x}:{:04x} driver={:?} ({:?}) present_mode={:?} format={:?} latency={} available_modes={:?}",
+                info.backend,
+                info.name,
+                info.device_type,
+                info.vendor,
+                info.device,
+                info.driver,
+                info.driver_info,
+                surface_cfg.present_mode,
+                surface_cfg.format,
+                surface_cfg.desired_maximum_frame_latency,
+                caps.present_modes,
+            ));
+            if info.device_type == wgpu::DeviceType::Cpu {
+                compat::log_msg(
+                    "WARNING: wgpu selected a CPU software adapter (WARP); hardware GPU may have failed initialization",
+                );
+            }
+        }
         Ok(Self {
             surface,
             device,
@@ -314,6 +345,8 @@ impl Renderer {
             pipeline,
             filter_chain,
             frame: None,
+            last_slow_log: None,
+            slow_frames_since_log: 0,
             overlay,
         })
     }
@@ -406,6 +439,8 @@ impl Renderer {
         if self.device_lost.load(Ordering::Relaxed) {
             return Err(PresentError::DeviceLost("GPU device lost".into()));
         }
+        let trace = compat::log_enabled();
+        let t_start = trace.then(Instant::now);
         let limit = self.device.limits().max_texture_dimension_2d;
         let Some((target_w, target_h)) = self
             .overlay
@@ -414,6 +449,7 @@ impl Renderer {
         else {
             return Ok(PresentOutcome::Hidden);
         };
+        let t_after_overlay = trace.then(Instant::now);
         if target_w > limit || target_h > limit {
             return Err(PresentError::Fatal(format!(
                 "window exceeds the adapter's texture limit of {limit}"
@@ -460,6 +496,7 @@ impl Renderer {
             on_uploaded();
             (width, height)
         };
+        let t_after_upload = trace.then(Instant::now);
 
         if !self.configured || (target_w, target_h) != (self.config.width, self.config.height) {
             self.config.width = target_w;
@@ -472,6 +509,7 @@ impl Renderer {
             }
             self.configured = true;
         }
+        let t_after_cfg = trace.then(Instant::now);
 
         let mut acquired = self.surface.get_current_texture();
         if matches!(
@@ -490,6 +528,7 @@ impl Renderer {
             self.configured = true;
             acquired = self.surface.get_current_texture();
         }
+        let t_after_acquire = trace.then(Instant::now);
         let output = match acquired {
             Ok(output) => output,
             Err(wgpu::SurfaceError::Timeout) => {
@@ -557,7 +596,46 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
+        let t_after_submit = trace.then(Instant::now);
         output.present();
+        if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4), Some(t5)) = (
+            t_start,
+            t_after_overlay,
+            t_after_upload,
+            t_after_cfg,
+            t_after_acquire,
+            t_after_submit,
+        ) {
+            let t6 = Instant::now();
+            let total = t6.saturating_duration_since(t0);
+            if total >= SLOW_FRAME_THRESHOLD {
+                self.slow_frames_since_log = self.slow_frames_since_log.saturating_add(1);
+                if self.last_slow_log.is_none_or(|last| {
+                    t6.saturating_duration_since(last) >= SLOW_FRAME_LOG_INTERVAL
+                }) {
+                    let ms = |a: Instant, b: Instant| {
+                        b.saturating_duration_since(a).as_secs_f64() * 1000.0
+                    };
+                    compat::log_msg(&format!(
+                        "slow present ({:.2}ms, slow_frames={}, {}x{}->{}x{}): overlay={:.2}ms upload={:.2}ms cfg={:.2}ms acquire={:.2}ms submit={:.2}ms present={:.2}ms",
+                        total.as_secs_f64() * 1000.0,
+                        self.slow_frames_since_log,
+                        width,
+                        height,
+                        target_w,
+                        target_h,
+                        ms(t0, t1),
+                        ms(t1, t2),
+                        ms(t2, t3),
+                        ms(t3, t4),
+                        ms(t4, t5),
+                        ms(t5, t6),
+                    ));
+                    self.slow_frames_since_log = 0;
+                    self.last_slow_log = Some(t6);
+                }
+            }
+        }
         if self.device_lost.load(Ordering::Relaxed) {
             return Err(PresentError::DeviceLost(
                 "GPU device lost after present".into(),
