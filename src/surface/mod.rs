@@ -897,6 +897,28 @@ impl Surface {
         Ok(desc)
     }
 
+    fn finish_unlock(&self, mut data: std::sync::MutexGuard<'_, SurfaceData>) -> Result<()> {
+        // Schedule any deferred presentation *before* releasing `Access::Ready` and waking
+        // waiting worker threads. Engines like Red Alert 2 decrement `DSurface.LockCount` to 0
+        // before calling `IDirectDrawSurface::Unlock` and clear `DSurface.BufferPtr = NULL` only
+        // after `Unlock` returns; blocking on a synchronous wgpu present or posting messages
+        // after `notify_ready` lets a background cursor thread re-lock the primary surface and
+        // then have its `BufferPtr` zeroed out underneath it.
+        let deferred = if self.is_primary {
+            self.display.request_deferred_refresh()
+        } else {
+            true
+        };
+        data.access = Access::Ready;
+        data.bump_uniqueness();
+        drop(data);
+        self.data.notify_ready();
+        if !deferred {
+            self.refresh()?;
+        }
+        Ok(())
+    }
+
     fn unlock_ptr_impl(&self, address: *mut c_void) -> Result<()> {
         let mut data = self.write()?;
         let Access::Locked { .. } = data.access else {
@@ -910,15 +932,11 @@ impl Surface {
                 return Err(E_INVALIDARG.into());
             }
         }
-        data.access = Access::Ready;
-        data.bump_uniqueness();
-        drop(data);
-        self.data.notify_ready();
-        self.refresh()
+        self.finish_unlock(data)
     }
 
     fn unlock_rect_impl(&self, rect: *mut RECT) -> Result<()> {
-        let mut data = self.write()?;
+        let data = self.write()?;
         let Access::Locked { rect: locked, .. } = data.access else {
             return Err(DDERR_NOTLOCKED.into());
         };
@@ -928,11 +946,7 @@ impl Surface {
                 return Err(DDERR_INVALIDRECT.into());
             }
         }
-        data.access = Access::Ready;
-        data.bump_uniqueness();
-        drop(data);
-        self.data.notify_ready();
-        self.refresh()
+        self.finish_unlock(data)
     }
 
     fn get_clipper_impl(&self) -> Result<IDirectDrawClipper> {

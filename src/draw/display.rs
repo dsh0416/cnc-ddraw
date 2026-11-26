@@ -307,6 +307,17 @@ impl DisplayShared {
         }
     }
 
+    /// Marks the primary surface dirty and schedules an asynchronous `WM_APP_FLUSH` without
+    /// ever blocking on `Display` or `wgpu` on the calling thread. Returns `false` when no
+    /// subclassed window message loop is attached so callers can fall back to `request_refresh`.
+    pub fn request_deferred_refresh(&self) -> bool {
+        if !window::can_schedule_flush() {
+            return false;
+        }
+        self.mark_dirty_and_schedule_flush();
+        true
+    }
+
     /// Requests a coalesced presentation. Safe to call from any thread: off-UI worker threads
     /// never block on `Display` or touch `Renderer`/`OverlayWindow`, instead posting `WM_APP_FLUSH`.
     pub fn request_refresh(&self) -> Result<()> {
