@@ -1,27 +1,25 @@
 //! Thin Win32 ABI hook stubs, host WndProc subclassing, and WH_GETMESSAGE installation.
-//! All hook decision logic lives in `hook_logic` (`#![forbid(unsafe_code)]`) and PE32 IAT patching
-//! lives in `crate::win32::iat`.
+//! Hook decisions live in `hook_logic`. Calls to the physical Win32 APIs use `win32::original`.
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use windows::core::{BOOL, PCSTR};
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient, HDC};
+use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::System::LibraryLoader::{
     FindResourceA, LoadResource, LockResource, SizeofResource,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CallWindowProcA, CallWindowProcW, CreateDialogIndirectParamA,
-    CreateDialogParamA, DialogBoxIndirectParamA, DialogBoxParamA, GetClientRect, GetClipCursor,
-    GetWindowLongA, GetWindowLongW, GetWindowRect, SendMessageA, SendMessageW, SetWindowLongA,
-    SetWindowLongW, SetWindowsHookExW, UnhookWindowsHookEx, CB_GETDROPPEDCONTROLRECT, DLGPROC,
-    DLGTEMPLATE, GWLP_WNDPROC, HHOOK, MSG, RT_DIALOG, WH_GETMESSAGE, WNDPROC,
+    CallNextHookEx, CallWindowProcA, CallWindowProcW, GetWindowLongA, GetWindowLongW,
+    SetWindowLongA, SetWindowLongW, SetWindowsHookExW, UnhookWindowsHookEx,
+    CB_GETDROPPEDCONTROLRECT, DLGPROC, DLGTEMPLATE, GWLP_WNDPROC, HHOOK, MSG, RT_DIALOG,
+    WH_GETMESSAGE, WNDPROC,
 };
 
 use crate::win32::geometry::is_window;
 use crate::win32::hwnd::{def_window_proc_a, def_window_proc_w, is_unicode, kill_timer};
-use crate::win32::{device_caps, iat, system_dpi, system_metrics, AtomicHwnd};
+use crate::win32::{device_caps, original, system_dpi, system_metrics, AtomicHwnd};
 
 use super::dialog_template::FontPatch;
 use super::hook_logic::{self, SubclassAction};
@@ -39,7 +37,7 @@ pub(crate) fn subclassed_hwnd() -> Option<HWND> {
     SUBCLASSED_HWND.load()
 }
 
-unsafe extern "system" fn hook_GetClientRect(hwnd: HWND, rect: *mut RECT) -> BOOL {
+pub(crate) unsafe extern "system" fn GetClientRect(hwnd: HWND, rect: *mut RECT) -> BOOL {
     if !rect.is_null() {
         if let Some(value) = hook_logic::virtual_window_rect(hwnd, false) {
             // SAFETY: Caller passed a non-null writable RECT pointer per Win32 GetClientRect.
@@ -48,10 +46,10 @@ unsafe extern "system" fn hook_GetClientRect(hwnd: HWND, rect: *mut RECT) -> BOO
         }
     }
     // SAFETY: Forwarding unchanged ABI arguments to Win32 GetClientRect.
-    BOOL::from(unsafe { GetClientRect(hwnd, rect) }.is_ok())
+    unsafe { original::GetClientRect(hwnd, rect) }
 }
 
-unsafe extern "system" fn hook_GetWindowRect(hwnd: HWND, rect: *mut RECT) -> BOOL {
+pub(crate) unsafe extern "system" fn GetWindowRect(hwnd: HWND, rect: *mut RECT) -> BOOL {
     if !rect.is_null() {
         if let Some(value) = hook_logic::virtual_window_rect(hwnd, true) {
             // SAFETY: Caller passed a non-null writable RECT pointer per Win32 GetWindowRect.
@@ -60,14 +58,14 @@ unsafe extern "system" fn hook_GetWindowRect(hwnd: HWND, rect: *mut RECT) -> BOO
         }
     }
     // SAFETY: Forwarding unchanged ABI arguments to Win32 GetWindowRect.
-    BOOL::from(unsafe { GetWindowRect(hwnd, rect) }.is_ok())
+    unsafe { original::GetWindowRect(hwnd, rect) }
 }
 
-unsafe extern "system" fn hook_GetSystemMetrics(index: i32) -> i32 {
+pub(crate) unsafe extern "system" fn GetSystemMetrics(index: i32) -> i32 {
     hook_logic::virtual_system_metrics(index).unwrap_or_else(|| system_metrics(index))
 }
 
-unsafe extern "system" fn hook_ClientToScreen(hwnd: HWND, pt: *mut POINT) -> BOOL {
+pub(crate) unsafe extern "system" fn ClientToScreen(hwnd: HWND, pt: *mut POINT) -> BOOL {
     if !pt.is_null() {
         // SAFETY: Caller passed a valid, initialized mutable POINT per Win32 ClientToScreen.
         let point = unsafe { &mut *pt };
@@ -76,10 +74,10 @@ unsafe extern "system" fn hook_ClientToScreen(hwnd: HWND, pt: *mut POINT) -> BOO
         }
     }
     // SAFETY: Forwarding unchanged ABI arguments to Win32 ClientToScreen.
-    unsafe { ClientToScreen(hwnd, pt) }
+    unsafe { original::ClientToScreen(hwnd, pt) }
 }
 
-unsafe extern "system" fn hook_ScreenToClient(hwnd: HWND, pt: *mut POINT) -> BOOL {
+pub(crate) unsafe extern "system" fn ScreenToClient(hwnd: HWND, pt: *mut POINT) -> BOOL {
     if !pt.is_null() {
         // SAFETY: Caller passed a valid, initialized mutable POINT per Win32 ScreenToClient.
         let point = unsafe { &mut *pt };
@@ -88,10 +86,10 @@ unsafe extern "system" fn hook_ScreenToClient(hwnd: HWND, pt: *mut POINT) -> BOO
         }
     }
     // SAFETY: Forwarding unchanged ABI arguments to Win32 ScreenToClient.
-    unsafe { ScreenToClient(hwnd, pt) }
+    unsafe { original::ScreenToClient(hwnd, pt) }
 }
 
-unsafe extern "system" fn hook_GetCursorPos(pt: *mut POINT) -> BOOL {
+pub(crate) unsafe extern "system" fn GetCursorPos(pt: *mut POINT) -> BOOL {
     if pt.is_null() {
         return BOOL(0);
     }
@@ -103,17 +101,17 @@ unsafe extern "system" fn hook_GetCursorPos(pt: *mut POINT) -> BOOL {
     BOOL(1)
 }
 
-unsafe extern "system" fn hook_SetCursorPos(x: i32, y: i32) -> BOOL {
+pub(crate) unsafe extern "system" fn SetCursorPos(x: i32, y: i32) -> BOOL {
     BOOL::from(hook_logic::set_virtual_cursor_pos(x, y))
 }
 
-unsafe extern "system" fn hook_ClipCursor(rect: *const RECT) -> BOOL {
+pub(crate) unsafe extern "system" fn ClipCursor(rect: *const RECT) -> BOOL {
     // SAFETY: Caller passes either NULL or a valid readable RECT per Win32 ClipCursor.
     let rect_ref = unsafe { rect.as_ref() };
     BOOL::from(hook_logic::clip_virtual_cursor(rect_ref))
 }
 
-unsafe extern "system" fn hook_GetClipCursor(rect: *mut RECT) -> BOOL {
+pub(crate) unsafe extern "system" fn GetClipCursor(rect: *mut RECT) -> BOOL {
     if !rect.is_null() {
         if let Some(value) = hook_logic::virtual_clip_cursor() {
             // SAFETY: Caller passed a non-null writable RECT pointer per Win32 GetClipCursor.
@@ -122,14 +120,14 @@ unsafe extern "system" fn hook_GetClipCursor(rect: *mut RECT) -> BOOL {
         }
     }
     // SAFETY: Forwarding unchanged ABI arguments to Win32 GetClipCursor.
-    BOOL::from(unsafe { GetClipCursor(rect) }.is_ok())
+    unsafe { original::GetClipCursor(rect) }
 }
 
-unsafe extern "system" fn hook_WindowFromPoint(point: POINT) -> HWND {
+pub(crate) unsafe extern "system" fn WindowFromPoint(point: POINT) -> HWND {
     hook_logic::virtual_window_from_point(point)
 }
 
-unsafe extern "system" fn hook_SetWindowPos(
+pub(crate) unsafe extern "system" fn SetWindowPos(
     hwnd: HWND,
     insert_after: HWND,
     x: i32,
@@ -149,15 +147,15 @@ unsafe extern "system" fn hook_SetWindowPos(
     ))
 }
 
-unsafe extern "system" fn hook_BringWindowToTop(hwnd: HWND) -> BOOL {
+pub(crate) unsafe extern "system" fn BringWindowToTop(hwnd: HWND) -> BOOL {
     BOOL::from(hook_logic::handle_bring_window_to_top(hwnd))
 }
 
-unsafe extern "system" fn hook_SetForegroundWindow(hwnd: HWND) -> BOOL {
+pub(crate) unsafe extern "system" fn SetForegroundWindow(hwnd: HWND) -> BOOL {
     BOOL::from(hook_logic::handle_set_foreground_window(hwnd))
 }
 
-unsafe extern "system" fn hook_MoveWindow(
+pub(crate) unsafe extern "system" fn MoveWindow(
     hwnd: HWND,
     x: i32,
     y: i32,
@@ -175,18 +173,18 @@ unsafe extern "system" fn hook_MoveWindow(
     ))
 }
 
-unsafe extern "system" fn hook_GetDeviceCaps(hdc: HDC, index: i32) -> i32 {
+pub(crate) unsafe extern "system" fn GetDeviceCaps(hdc: HDC, index: i32) -> i32 {
     hook_logic::virtual_device_caps(index).unwrap_or_else(|| device_caps(hdc, index))
 }
 
-unsafe extern "system" fn hook_SendMessageA(
+pub(crate) unsafe extern "system" fn SendMessageA(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
     // SAFETY: Forwarding unchanged ABI arguments to Win32 SendMessageA.
-    let result = unsafe { SendMessageA(hwnd, msg, wparam, lparam) };
+    let result = unsafe { original::SendMessageA(hwnd, msg, wparam, lparam) };
     if result.0 != 0 && msg == CB_GETDROPPEDCONTROLRECT && lparam.0 != 0 {
         // SAFETY: Per Win32 CB_GETDROPPEDCONTROLRECT, a non-zero return means `lparam` points
         // to the caller's initialized writable RECT filled with screen coordinates.
@@ -196,14 +194,14 @@ unsafe extern "system" fn hook_SendMessageA(
     result
 }
 
-unsafe extern "system" fn hook_SendMessageW(
+pub(crate) unsafe extern "system" fn SendMessageW(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
     // SAFETY: Forwarding unchanged ABI arguments to Win32 SendMessageW.
-    let result = unsafe { SendMessageW(hwnd, msg, Some(wparam), Some(lparam)) };
+    let result = unsafe { original::SendMessageW(hwnd, msg, wparam, lparam) };
     if result.0 != 0 && msg == CB_GETDROPPEDCONTROLRECT && lparam.0 != 0 {
         // SAFETY: Per Win32 CB_GETDROPPEDCONTROLRECT, a non-zero return means `lparam` points
         // to the caller's initialized writable RECT filled with screen coordinates.
@@ -291,7 +289,7 @@ unsafe fn patch_dialog_indirect_ptr(tpl: *const DLGTEMPLATE) -> Option<DialogSto
     unsafe { copy_patched_template(raw, patch.len, patch) }
 }
 
-unsafe extern "system" fn hook_CreateDialogParamA(
+pub(crate) unsafe extern "system" fn CreateDialogParamA(
     hinst: HINSTANCE,
     template_name: PCSTR,
     parent: HWND,
@@ -301,32 +299,24 @@ unsafe extern "system" fn hook_CreateDialogParamA(
     // SAFETY: Forwarding the caller's valid module and dialog resource identifier.
     if let Some(patched) = unsafe { load_and_patch_dialog_resource(hinst, template_name) } {
         // SAFETY: `patched` is a DWORD-aligned, valid DLGTEMPLATE clone alive during the call.
-        if let Ok(hwnd) = unsafe {
-            CreateDialogIndirectParamA(
-                Some(hinst),
+        let hwnd = unsafe {
+            original::CreateDialogIndirectParamA(
+                hinst,
                 patched.as_ptr().cast::<DLGTEMPLATE>(),
-                Some(parent),
+                parent,
                 dlg_proc,
                 init_param,
             )
-        } {
+        };
+        if !hwnd.is_invalid() {
             return hwnd;
         }
     }
     // SAFETY: Forwarding unchanged ABI arguments to Win32 CreateDialogParamA.
-    unsafe {
-        CreateDialogParamA(
-            Some(hinst),
-            template_name,
-            Some(parent),
-            dlg_proc,
-            init_param,
-        )
-    }
-    .unwrap_or_default()
+    unsafe { original::CreateDialogParamA(hinst, template_name, parent, dlg_proc, init_param) }
 }
 
-unsafe extern "system" fn hook_CreateDialogIndirectParamA(
+pub(crate) unsafe extern "system" fn CreateDialogIndirectParamA(
     hinst: HINSTANCE,
     template: *const DLGTEMPLATE,
     parent: HWND,
@@ -336,24 +326,24 @@ unsafe extern "system" fn hook_CreateDialogIndirectParamA(
     // SAFETY: Caller supplies a valid indirect dialog template per Win32 contract.
     if let Some(patched) = unsafe { patch_dialog_indirect_ptr(template) } {
         // SAFETY: `patched` is a DWORD-aligned, valid DLGTEMPLATE clone alive during the call.
-        if let Ok(hwnd) = unsafe {
-            CreateDialogIndirectParamA(
-                Some(hinst),
+        let hwnd = unsafe {
+            original::CreateDialogIndirectParamA(
+                hinst,
                 patched.as_ptr().cast::<DLGTEMPLATE>(),
-                Some(parent),
+                parent,
                 dlg_proc,
                 init_param,
             )
-        } {
+        };
+        if !hwnd.is_invalid() {
             return hwnd;
         }
     }
     // SAFETY: Forwarding unchanged ABI arguments to Win32 CreateDialogIndirectParamA.
-    unsafe { CreateDialogIndirectParamA(Some(hinst), template, Some(parent), dlg_proc, init_param) }
-        .unwrap_or_default()
+    unsafe { original::CreateDialogIndirectParamA(hinst, template, parent, dlg_proc, init_param) }
 }
 
-unsafe extern "system" fn hook_DialogBoxParamA(
+pub(crate) unsafe extern "system" fn DialogBoxParamA(
     hinst: HINSTANCE,
     template_name: PCSTR,
     parent: HWND,
@@ -364,28 +354,20 @@ unsafe extern "system" fn hook_DialogBoxParamA(
     if let Some(patched) = unsafe { load_and_patch_dialog_resource(hinst, template_name) } {
         // SAFETY: `patched` remains alive for the full modal lifetime of DialogBoxIndirectParamA.
         return unsafe {
-            DialogBoxIndirectParamA(
-                Some(hinst),
+            original::DialogBoxIndirectParamA(
+                hinst,
                 patched.as_ptr().cast::<DLGTEMPLATE>(),
-                Some(parent),
+                parent,
                 dlg_proc,
                 init_param,
             )
         };
     }
     // SAFETY: Forwarding unchanged ABI arguments to Win32 DialogBoxParamA.
-    unsafe {
-        DialogBoxParamA(
-            Some(hinst),
-            template_name,
-            Some(parent),
-            dlg_proc,
-            init_param,
-        )
-    }
+    unsafe { original::DialogBoxParamA(hinst, template_name, parent, dlg_proc, init_param) }
 }
 
-unsafe extern "system" fn hook_DialogBoxIndirectParamA(
+pub(crate) unsafe extern "system" fn DialogBoxIndirectParamA(
     hinst: HINSTANCE,
     template: *const DLGTEMPLATE,
     parent: HWND,
@@ -396,17 +378,17 @@ unsafe extern "system" fn hook_DialogBoxIndirectParamA(
     if let Some(patched) = unsafe { patch_dialog_indirect_ptr(template) } {
         // SAFETY: `patched` remains alive for the full modal lifetime of DialogBoxIndirectParamA.
         return unsafe {
-            DialogBoxIndirectParamA(
-                Some(hinst),
+            original::DialogBoxIndirectParamA(
+                hinst,
                 patched.as_ptr().cast::<DLGTEMPLATE>(),
-                Some(parent),
+                parent,
                 dlg_proc,
                 init_param,
             )
         };
     }
     // SAFETY: Forwarding unchanged ABI arguments to Win32 DialogBoxIndirectParamA.
-    unsafe { DialogBoxIndirectParamA(Some(hinst), template, Some(parent), dlg_proc, init_param) }
+    unsafe { original::DialogBoxIndirectParamA(hinst, template, parent, dlg_proc, init_param) }
 }
 
 unsafe extern "system" fn getmsg_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -536,123 +518,6 @@ pub(crate) fn uninstall_subclass() {
     }
 }
 
-pub(crate) fn install_iat_hooks() {
-    let targets: &[(&str, &str, usize)] = &[
-        (
-            "user32.dll",
-            "GetClientRect",
-            hook_GetClientRect as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "GetWindowRect",
-            hook_GetWindowRect as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "GetSystemMetrics",
-            hook_GetSystemMetrics as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "ClientToScreen",
-            hook_ClientToScreen as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "ScreenToClient",
-            hook_ScreenToClient as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "GetCursorPos",
-            hook_GetCursorPos as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "SetCursorPos",
-            hook_SetCursorPos as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "ClipCursor",
-            hook_ClipCursor as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "GetClipCursor",
-            hook_GetClipCursor as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "WindowFromPoint",
-            hook_WindowFromPoint as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "SetWindowPos",
-            hook_SetWindowPos as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "BringWindowToTop",
-            hook_BringWindowToTop as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "SetForegroundWindow",
-            hook_SetForegroundWindow as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "MoveWindow",
-            hook_MoveWindow as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "CreateDialogParamA",
-            hook_CreateDialogParamA as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "CreateDialogIndirectParamA",
-            hook_CreateDialogIndirectParamA as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "DialogBoxParamA",
-            hook_DialogBoxParamA as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "DialogBoxIndirectParamA",
-            hook_DialogBoxIndirectParamA as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "SendMessageA",
-            hook_SendMessageA as *const () as usize,
-        ),
-        (
-            "user32.dll",
-            "SendMessageW",
-            hook_SendMessageW as *const () as usize,
-        ),
-        (
-            "gdi32.dll",
-            "GetDeviceCaps",
-            hook_GetDeviceCaps as *const () as usize,
-        ),
-    ];
-    // SAFETY: Every hook function matches its Win32 import's exact stdcall ABI and remains
-    // loaded in this DLL until `uninstall_iat_hooks` restores the IAT.
-    unsafe { iat::install(targets) };
-}
-
-pub(crate) fn uninstall_iat_hooks() {
-    iat::uninstall();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,7 +526,8 @@ mod tests {
     use crate::window::dialog_template::tests::{build_ex_template, build_standard_template};
     use windows::core::w;
     use windows::Win32::UI::WindowsAndMessaging::{
-        WS_CHILD, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+        CreateDialogIndirectParamA, SendMessageA, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_POPUP,
+        WS_VISIBLE,
     };
 
     #[test]

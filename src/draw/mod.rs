@@ -544,6 +544,9 @@ impl IDirectDraw_Impl for Draw_Impl {
             }
         }
         let replacement = if change_hwnd && !hwnd.is_invalid() {
+            crate::win32::original::ensure_installed().inspect_err(|err| {
+                compat::log_msg(&format!("installing Win32 hooks: {err}"));
+            })?;
             Some(Renderer::new(hwnd.0 as isize).map_err(|message| Error::new(E_FAIL, message))?)
         } else {
             None

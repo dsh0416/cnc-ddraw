@@ -2,8 +2,10 @@
 #![allow(non_snake_case)]
 
 pub(crate) mod geometry;
+mod hotpatch;
+mod hotpatch_image;
 pub(crate) mod hwnd;
-pub(crate) mod iat;
+pub(crate) mod original;
 pub(crate) mod process;
 
 use std::ffi::c_void;
@@ -11,13 +13,11 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::core::Result;
 use windows::Win32::Foundation::{HMODULE, HWND};
-use windows::Win32::Graphics::Gdi::{
-    GetDC, GetDeviceCaps, ReleaseDC, GET_DEVICE_CAPS_INDEX, HDC, LOGPIXELSY,
-};
+use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC, HDC, LOGPIXELSY};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SetProcessDPIAware, SYSTEM_METRICS_INDEX,
-};
+use windows::Win32::System::ProcessStatus::{K32GetModuleInformation, MODULEINFO};
+use windows::Win32::System::Threading::GetCurrentProcess;
+use windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
 
 pub(crate) use process::{current_process_id, current_thread_id, module_path_at};
 
@@ -72,12 +72,27 @@ pub(crate) fn current_module_handle() -> Result<HMODULE> {
     unsafe { GetModuleHandleW(None) }
 }
 
+fn module_info(module: HMODULE) -> Result<MODULEINFO> {
+    let mut info = MODULEINFO::default();
+    // SAFETY: The handle identifies a loaded module and the buffer holds one MODULEINFO.
+    unsafe {
+        K32GetModuleInformation(
+            GetCurrentProcess(),
+            module,
+            &mut info,
+            size_of::<MODULEINFO>() as u32,
+        )
+        .ok()?;
+    }
+    Ok(info)
+}
+
 pub(crate) fn system_dpi() -> u32 {
     // SAFETY: GetDC(None) returns the screen DC which is released immediately via ReleaseDC.
     unsafe {
         let dc = GetDC(None);
         let dpi = if !dc.is_invalid() {
-            let v = GetDeviceCaps(Some(dc), LOGPIXELSY);
+            let v = device_caps(dc, LOGPIXELSY.0 as i32);
             let _ = ReleaseDC(None, dc);
             v
         } else {
@@ -93,10 +108,10 @@ pub(crate) fn system_dpi() -> u32 {
 
 pub(crate) fn system_metrics(index: i32) -> i32 {
     // SAFETY: GetSystemMetrics accepts any integer metric index and returns 0 if invalid.
-    unsafe { GetSystemMetrics(SYSTEM_METRICS_INDEX(index)) }
+    unsafe { original::GetSystemMetrics(index) }
 }
 
 pub(crate) fn device_caps(hdc: HDC, index: i32) -> i32 {
     // SAFETY: GetDeviceCaps validates the HDC and metric index internally.
-    unsafe { GetDeviceCaps(Some(hdc), GET_DEVICE_CAPS_INDEX(index as u32)) }
+    unsafe { original::GetDeviceCaps(hdc, index) }
 }

@@ -1,5 +1,5 @@
 //! Win32 windowing subsystem: host window mode management, owned presentation overlay,
-//! logical<->physical coordinate mapping, and PE32 IAT / WndProc / WH_GETMESSAGE hooks.
+//! logical<->physical coordinate mapping, and Win32 API / WndProc / WH_GETMESSAGE hooks.
 #![deny(unsafe_code)]
 #![allow(non_snake_case)]
 
@@ -125,7 +125,6 @@ pub fn bind_window(hwnd: HWND, scaling_active: bool) -> usize {
     LOGICAL_SCALING_ACTIVE.store(scaling_active, Ordering::Relaxed);
     MODE_ACTIVE.store(false, Ordering::Relaxed);
     IN_SIZE_MOVE.store(false, Ordering::Relaxed);
-    hooks::install_iat_hooks();
     hooks::install_subclass(hwnd);
     hooks::install_getmsg_hook(tid);
     id
@@ -178,7 +177,6 @@ pub fn unbind_window(bind_id: usize) {
     BOUND_THREAD.store(0, Ordering::Relaxed);
     hooks::uninstall_getmsg_hook();
     hooks::uninstall_subclass();
-    hooks::uninstall_iat_hooks();
 }
 
 fn flush_window() -> Option<HWND> {

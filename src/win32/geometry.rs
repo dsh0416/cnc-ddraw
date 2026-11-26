@@ -4,15 +4,15 @@ use std::mem::size_of;
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, EnumDisplaySettingsW, GetMonitorInfoW, MapWindowPoints, MonitorFromWindow,
-    ScreenToClient, DEVMODEW, ENUM_CURRENT_SETTINGS, MONITORINFO, MONITORINFOEXW,
-    MONITOR_DEFAULTTONEAREST,
+    EnumDisplaySettingsW, GetMonitorInfoW, MapWindowPoints, MonitorFromWindow, DEVMODEW,
+    ENUM_CURRENT_SETTINGS, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetCapture;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, ClipCursor, GetClientRect, GetCursorPos, GetWindowRect, IsWindow,
-    SetCursorPos, WindowFromPoint, WINDOW_EX_STYLE, WINDOW_STYLE,
+    AdjustWindowRectEx, IsWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
+
+use super::original;
 
 pub(crate) fn is_window(hwnd: HWND) -> bool {
     // SAFETY: IsWindow accepts stale or invalid handles.
@@ -22,25 +22,25 @@ pub(crate) fn is_window(hwnd: HWND) -> bool {
 pub(crate) fn client_rect(hwnd: HWND) -> Result<RECT> {
     let mut rect = RECT::default();
     // SAFETY: `rect` is a valid, aligned writable RECT.
-    unsafe { GetClientRect(hwnd, &mut rect)? };
+    unsafe { original::GetClientRect(hwnd, &mut rect).ok()? };
     Ok(rect)
 }
 
 pub(crate) fn window_rect(hwnd: HWND) -> Result<RECT> {
     let mut rect = RECT::default();
     // SAFETY: `rect` is a valid, aligned writable RECT.
-    unsafe { GetWindowRect(hwnd, &mut rect)? };
+    unsafe { original::GetWindowRect(hwnd, &mut rect).ok()? };
     Ok(rect)
 }
 
 pub(crate) fn client_to_screen(hwnd: HWND, point: &mut POINT) -> bool {
     // SAFETY: `point` is a valid mutable reference to a POINT.
-    unsafe { ClientToScreen(hwnd, point).as_bool() }
+    unsafe { original::ClientToScreen(hwnd, point).as_bool() }
 }
 
 pub(crate) fn screen_to_client(hwnd: HWND, point: &mut POINT) -> bool {
     // SAFETY: `point` is a valid mutable reference to a POINT.
-    unsafe { ScreenToClient(hwnd, point).as_bool() }
+    unsafe { original::ScreenToClient(hwnd, point).as_bool() }
 }
 
 pub(crate) fn map_rect(from: Option<HWND>, to: Option<HWND>, rect: RECT) -> RECT {
@@ -93,23 +93,23 @@ pub(crate) fn adjust_window_rect_ex(
 pub(crate) fn cursor_pos() -> Result<POINT> {
     let mut pt = POINT::default();
     // SAFETY: `pt` is a valid writable POINT.
-    unsafe { GetCursorPos(&mut pt)? };
+    unsafe { original::GetCursorPos(&mut pt).ok()? };
     Ok(pt)
 }
 
 pub(crate) fn set_cursor_pos(x: i32, y: i32) -> bool {
     // SAFETY: SetCursorPos accepts integer screen coordinates.
-    unsafe { SetCursorPos(x, y).is_ok() }
+    unsafe { original::SetCursorPos(x, y).as_bool() }
 }
 
 pub(crate) fn clip_cursor(rect: Option<&RECT>) -> bool {
     // SAFETY: `rect` is either None or a valid shared reference to a RECT.
-    unsafe { ClipCursor(rect.map(|r| r as *const RECT)).is_ok() }
+    unsafe { original::ClipCursor(rect.map_or(std::ptr::null(), std::ptr::from_ref)).as_bool() }
 }
 
 pub(crate) fn window_from_point(pt: POINT) -> HWND {
     // SAFETY: WindowFromPoint takes a POINT by value and returns a handle or NULL.
-    unsafe { WindowFromPoint(pt) }
+    unsafe { original::WindowFromPoint(pt) }
 }
 
 pub(crate) fn get_capture() -> HWND {

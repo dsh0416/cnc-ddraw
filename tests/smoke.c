@@ -28,6 +28,7 @@ typedef void (__cdecl *EnableZoomFn)(void);
 typedef FARPROC (WINAPI *DdGetProcAddressFn)(HMODULE, LPCSTR);
 typedef HRESULT (WINAPI *DllGetClassObjectFn)(REFCLSID, REFIID, void **);
 typedef HRESULT (WINAPI *DllCanUnloadNowFn)(void);
+typedef BOOL (WINAPI *GetClientRectFn)(HWND, LPRECT);
 
 static HRESULT WINAPI count_modes_cb(DDSURFACEDESC2 *desc, void *ctx) {
     unsigned *count = (unsigned *)ctx;
@@ -485,6 +486,8 @@ int main(int argc, char **argv) {
     CreateFn create;
     IDirectDraw *draw = NULL;
     HWND window = NULL;
+    GetClientRectFn cached_client_rect = NULL;
+    RECT physical_client, client;
     REQUIRE(sizeof(void *) == 4 && len && len < MAX_PATH);
     base = wcsrchr(path, L'\\');
     REQUIRE(base && (size_t)(base - path) + 11 < MAX_PATH);
@@ -502,6 +505,8 @@ int main(int argc, char **argv) {
         REQUIRE(window);
         ShowWindow(window, SW_SHOW);
         UpdateWindow(window);
+        cached_client_rect = (GetClientRectFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetClientRect");
+        REQUIRE(cached_client_rect && cached_client_rect(window, &physical_client));
         CHECK(IDirectDraw_SetCooperativeLevel(draw, window, DDSCL_NORMAL));
     } else {
         REQUIRE(argc == 1);
@@ -510,6 +515,7 @@ int main(int argc, char **argv) {
     if (window) {
         LONG old_style = GetWindowLongW(window, GWL_STYLE);
         RECT old_rect, fullscreen, restored;
+        RECT logical_client = {0, 0, 321, 201};
         MONITORINFO monitor = {0};
         monitor.cbSize = sizeof(monitor);
         REQUIRE(GetWindowRect(window, &old_rect));
@@ -518,9 +524,11 @@ int main(int argc, char **argv) {
         REQUIRE(GetWindowRect(window, &fullscreen));
         REQUIRE(EqualRect(&monitor.rcMonitor, &fullscreen));
         REQUIRE(exercise(draw, 16) == 0);
+        REQUIRE(cached_client_rect(window, &client) && EqualRect(&client, &logical_client));
         CHECK(IDirectDraw_SetCooperativeLevel(draw, window, DDSCL_NORMAL));
         REQUIRE(GetWindowLongW(window, GWL_STYLE) == old_style);
         REQUIRE(GetWindowRect(window, &restored) && EqualRect(&old_rect, &restored));
+        REQUIRE(cached_client_rect(window, &client) && EqualRect(&client, &physical_client));
     } else {
         REQUIRE(exercise(draw, 16) == 0);
     }
