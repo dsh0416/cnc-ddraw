@@ -9,9 +9,9 @@ use windows::Win32::Foundation::HWND;
 
 use crate::compat;
 use crate::config::{self, RendererBackend};
-use crate::shader::FilterChain;
 use crate::surface::{PixelFormat, SurfaceSlot};
 use crate::window::{self, compute_viewport, OverlayWindow};
+use shader_glslp::FilterChain;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentOutcome {

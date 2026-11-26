@@ -105,18 +105,15 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cnc-ddraw"
-version = "0.2.0"
+version = "0.1.2"
 dependencies = [
  "fearless_simd",
- "iced-x86",
- "naga",
- "object",
  "parking_lot",
- "png",
  "pollster",
  "raw-window-handle",
- "retour",
+ "shader-glslp",
  "wgpu",
+ "win32-hooks",
  "windows 0.62.2",
  "windows-core 0.62.2",
 ]
@@ -718,6 +715,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shader-glslp"
+version = "0.1.2"
+dependencies = [
+ "naga",
+ "png",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1024,6 +1031,17 @@ dependencies = [
  "log",
  "thiserror 2.0.21",
  "web-sys",
+]
+
+[[package]]
+name = "win32-hooks"
+version = "0.1.2"
+dependencies = [
+ "iced-x86",
+ "object",
+ "parking_lot",
+ "retour",
+ "windows 0.62.2",
 ]
 
 [[package]]

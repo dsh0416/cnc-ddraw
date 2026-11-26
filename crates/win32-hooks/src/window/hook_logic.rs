@@ -429,12 +429,16 @@ pub(super) fn handle_subclass_message(
     alt_was_down: &AtomicBool,
 ) -> SubclassAction {
     if msg == WM_APP_FLUSH {
-        crate::draw::flush_pending_present(false);
+        if let Some(cb) = super::host_callbacks() {
+            cb.flush_pending_present(false);
+        }
         return SubclassAction::Return(LRESULT(0));
     }
     if msg == WM_TIMER && wparam.0 == FLUSH_TIMER_ID {
         kill_timer(hwnd, FLUSH_TIMER_ID);
-        crate::draw::flush_pending_present(true);
+        if let Some(cb) = super::host_callbacks() {
+            cb.flush_pending_present(true);
+        }
         return SubclassAction::Return(LRESULT(0));
     }
     let is_bound = bound_hwnd() == Some(hwnd);
@@ -448,7 +452,9 @@ pub(super) fn handle_subclass_message(
             WM_EXITSIZEMOVE => {
                 set_in_size_move(false);
                 sync_popups_after_bound_move(hwnd);
-                crate::draw::on_host_window_changed();
+                if let Some(cb) = super::host_callbacks() {
+                    cb.on_host_window_changed();
+                }
                 return SubclassAction::DefWindowProc;
             }
             WM_CANCELMODE => {
@@ -473,7 +479,9 @@ pub(super) fn handle_subclass_message(
         }
         if toggle_vk != 0 && wparam.0 as u32 == toggle_vk && alt_down {
             if !was_down {
-                crate::draw::toggle_fullscreen_hotkey();
+                if let Some(cb) = super::host_callbacks() {
+                    cb.toggle_fullscreen_hotkey();
+                }
             }
             return SubclassAction::Return(LRESULT(0));
         }
@@ -493,8 +501,8 @@ pub(super) fn handle_subclass_message(
             return SubclassAction::Return(LRESULT(0));
         }
     }
-    let shield_focus = is_scaling_active()
-        && (config::get().noactivateapp || !crate::draw::is_fullscreen_active());
+    let is_fullscreen = super::host_callbacks().is_some_and(|cb| cb.is_fullscreen_active());
+    let shield_focus = is_scaling_active() && (config::get().noactivateapp || !is_fullscreen);
     if shield_focus && matches!(msg, WM_KILLFOCUS | WM_NCACTIVATE) {
         return SubclassAction::DefWindowProc;
     }
@@ -511,7 +519,9 @@ pub(super) fn handle_subclass_message(
             set_in_size_move(false);
             let _ = clip_cursor(None);
         } else {
-            crate::draw::on_host_window_changed();
+            if let Some(cb) = super::host_callbacks() {
+                cb.on_host_window_changed();
+            }
             if shield_focus && alt_was_down.swap(false, Ordering::Relaxed) {
                 let _ = post_message(hwnd, WM_SYSKEYUP, WPARAM(VK_MENU_CODE), LPARAM(0));
             }
@@ -526,7 +536,9 @@ pub(super) fn handle_subclass_message(
     }
     if matches!(msg, WM_MOVE | WM_SIZE | WM_WINDOWPOSCHANGED) && is_bound {
         sync_popups_after_bound_move(hwnd);
-        crate::draw::on_host_window_changed();
+        if let Some(cb) = super::host_callbacks() {
+            cb.on_host_window_changed();
+        }
     }
     // Only remap physical coordinates on `bound` when no owned presentation overlay exists;
     // when `PRESENT_HWND` is active, `present_wndproc` and `getmsg_hook` deliver logical coords.

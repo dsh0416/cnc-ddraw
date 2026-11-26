@@ -6,16 +6,13 @@
 #[cfg(not(all(windows, target_arch = "x86")))]
 compile_error!("Build ddraw.dll for 32-bit x86 Windows.");
 
+pub(crate) use win32_hooks::{compat, config, win32, window};
+
 mod clipper;
-mod compat;
-mod config;
 mod draw;
 mod exports;
 mod ffi;
 mod palette;
 mod renderer;
-mod shader;
 mod simd_blit;
 mod surface;
-mod win32;
-mod window;

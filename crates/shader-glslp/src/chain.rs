@@ -5,9 +5,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::shader::lut::load_png_rgba;
-use crate::shader::preset::{load_preset, FramebufferFormat, PassConfig, ShaderPreset, WrapMode};
-use crate::shader::translate::{
+use crate::lut::load_png_rgba;
+use crate::preset::{load_preset, FramebufferFormat, PassConfig, ShaderPreset, WrapMode};
+use crate::translate::{
     compile_retroarch_glsl, CompiledPass, TextureBinding, TextureSemantic, UniformField,
     UniformSemantic, UniformType,
 };

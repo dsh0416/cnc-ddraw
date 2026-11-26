@@ -2,10 +2,7 @@
 //! All display/presentation state lives in `display` (`#![forbid(unsafe_code)]`).
 mod display;
 
-pub use display::{
-    flush_pending_present, is_fullscreen_active, on_host_window_changed, toggle_fullscreen_hotkey,
-    DisplayShared,
-};
+pub use display::{is_fullscreen_active, register_host_callbacks, DisplayShared};
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;

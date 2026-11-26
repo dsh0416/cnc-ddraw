@@ -14,12 +14,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::original;
 
-pub(crate) fn is_window(hwnd: HWND) -> bool {
+pub fn is_window(hwnd: HWND) -> bool {
     // SAFETY: IsWindow accepts stale or invalid handles.
     unsafe { IsWindow(Some(hwnd)).as_bool() }
 }
 
-pub(crate) fn client_rect(hwnd: HWND) -> Result<RECT> {
+pub fn client_rect(hwnd: HWND) -> Result<RECT> {
     let mut rect = RECT::default();
     // SAFETY: `rect` is a valid, aligned writable RECT.
     unsafe { original::GetClientRect(hwnd, &mut rect).ok()? };
@@ -118,7 +118,7 @@ pub(crate) fn get_capture() -> HWND {
 }
 
 /// Queries the current display refresh rate (Hz) of the monitor hosting `hwnd` (or primary monitor).
-pub(crate) fn monitor_refresh_hz(hwnd: HWND) -> Option<u32> {
+pub fn monitor_refresh_hz(hwnd: HWND) -> Option<u32> {
     let mut mode = DEVMODEW {
         dmSize: size_of::<DEVMODEW>() as u16,
         ..Default::default()

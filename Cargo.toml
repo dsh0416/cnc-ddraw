@@ -1,24 +1,19 @@
-[package]
-name = "cnc-ddraw"
-version = "0.2.0"
-edition = "2021"
-license = "MIT"
-publish = false
+[workspace]
+members = [
+    ".",
+    "crates/shader-glslp",
+    "crates/win32-hooks",
+]
+default-members = [
+    ".",
+    "crates/shader-glslp",
+    "crates/win32-hooks",
+]
+resolver = "2"
 
-[lib]
-name = "ddraw"
-crate-type = ["cdylib"]
-
-[dependencies]
-fearless_simd = "1.2.0"
-iced-x86 = { version = "1.20", default-features = false, features = ["std", "decoder", "instr_info"] }
-naga = { version = "27.0.3", default-features = false, features = ["glsl-in"] }
-object = { version = "0.40", default-features = false, features = ["read_core", "pe", "unaligned"] }
+[workspace.dependencies]
 parking_lot = "0.12"
-png = "0.17"
 pollster = "0.4"
-raw-window-handle = "0.6.2"
-retour = "=0.4.0-alpha.4"
 wgpu = { version = "27.0.1", default-features = false, features = ["std", "dx12", "vulkan", "wgsl", "glsl", "naga-ir"] }
 windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
@@ -35,6 +30,28 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[package]
+name = "cnc-ddraw"
+version = "0.1.2"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "ddraw"
+crate-type = ["cdylib"]
+
+[dependencies]
+fearless_simd = "1.2.0"
+parking_lot = { workspace = true }
+pollster = { workspace = true }
+raw-window-handle = "0.6.2"
+shader-glslp = { path = "crates/shader-glslp" }
+wgpu = { workspace = true }
+win32-hooks = { path = "crates/win32-hooks" }
+windows-core = { workspace = true }
+windows = { workspace = true }
 
 [profile.release]
 lto = "thin"

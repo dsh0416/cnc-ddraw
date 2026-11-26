@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use crate::shader::preprocess::{preprocess_glsl, ShaderStage};
+use crate::preprocess::{preprocess_glsl, ShaderStage};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UniformSemantic {

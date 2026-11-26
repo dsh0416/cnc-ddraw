@@ -1,0 +1,13 @@
+[package]
+name = "win32-hooks"
+version = "0.1.2"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+iced-x86 = { version = "1.20", default-features = false, features = ["std", "decoder", "instr_info"] }
+object = { version = "0.40", default-features = false, features = ["read_core", "pe", "unaligned"] }
+parking_lot = { workspace = true }
+retour = "=0.4.0-alpha.4"
+windows = { workspace = true }

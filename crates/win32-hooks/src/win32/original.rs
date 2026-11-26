@@ -272,7 +272,7 @@ win32_hooks! {
 }
 
 /// Install once, outside the loader lock. Bind/unbind only changes the virtualization policy.
-pub(crate) fn ensure_installed() -> Result<()> {
+pub fn ensure_installed() -> Result<()> {
     let _guard = INSTALL.lock();
     if GAME_IMAGE.get().is_some() {
         return Ok(());

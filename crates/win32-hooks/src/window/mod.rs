@@ -12,14 +12,34 @@ pub mod input;
 pub mod overlay;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use windows::Win32::Foundation::HWND;
 
-pub(crate) use crate::win32::geometry::{client_rect, is_window};
+pub use crate::win32::geometry::{client_rect, is_window};
 use crate::win32::hwnd::{kill_timer, post_message_w, set_timer};
 use crate::win32::{current_thread_id, AtomicHwnd};
 pub use host::{HostWindow, PresentationMode};
 pub use overlay::OverlayWindow;
+
+/// Callbacks supplied by the display owner (e.g. DirectDraw) so `win32-hooks` has no
+/// reverse dependency on the presentation layer.
+pub trait HostCallbacks: Send + Sync + 'static {
+    fn flush_pending_present(&self, from_timer: bool);
+    fn on_host_window_changed(&self);
+    fn toggle_fullscreen_hotkey(&self);
+    fn is_fullscreen_active(&self) -> bool;
+}
+
+static HOST_CALLBACKS: OnceLock<&'static dyn HostCallbacks> = OnceLock::new();
+
+pub fn set_host_callbacks(callbacks: &'static dyn HostCallbacks) {
+    let _ = HOST_CALLBACKS.set(callbacks);
+}
+
+pub(crate) fn host_callbacks() -> Option<&'static dyn HostCallbacks> {
+    HOST_CALLBACKS.get().copied()
+}
 
 pub(crate) const WM_APP_FLUSH: u32 = 0x8000 + 0x4321;
 pub(crate) const FLUSH_TIMER_ID: usize = 0x434E_4344;

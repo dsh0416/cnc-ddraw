@@ -27,7 +27,34 @@ const FLUSH_MAX_DEFER: Duration = Duration::from_millis(16);
 
 static ACTIVE_DISPLAY: Mutex<Weak<DisplayShared>> = Mutex::new(Weak::new());
 
+struct DrawHostCallbacks;
+
+impl window::HostCallbacks for DrawHostCallbacks {
+    fn flush_pending_present(&self, from_timer: bool) {
+        flush_pending_present(from_timer);
+    }
+
+    fn on_host_window_changed(&self) {
+        on_host_window_changed();
+    }
+
+    fn toggle_fullscreen_hotkey(&self) {
+        toggle_fullscreen_hotkey();
+    }
+
+    fn is_fullscreen_active(&self) -> bool {
+        is_fullscreen_active()
+    }
+}
+
+static DRAW_HOST_CALLBACKS: DrawHostCallbacks = DrawHostCallbacks;
+
+pub fn register_host_callbacks() {
+    window::set_host_callbacks(&DRAW_HOST_CALLBACKS);
+}
+
 pub(super) fn set_active_display(display: &Arc<DisplayShared>) {
+    register_host_callbacks();
     *ACTIVE_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(display);
 }
 

@@ -28,6 +28,7 @@ pub extern "system" fn DllMain(_module: HINSTANCE, reason: u32, _reserved: *mut 
     if reason == DLL_PROCESS_ATTACH {
         // Must run before WinMain creates any HWND so host and overlay share one DPI space.
         window::enable_dpi_awareness();
+        draw::register_host_callbacks();
     } else if reason == DLL_THREAD_ATTACH {
         compat::on_thread_attach();
     }
