@@ -21,7 +21,6 @@ use windows::Win32::Graphics::DirectDraw::*;
 use windows::Win32::Graphics::Gdi::{HDC, HMONITOR, PALETTEENTRY};
 
 use crate::ffi::{descriptor, ptr as ffi_ptr};
-use crate::renderer::Renderer;
 use crate::win32::geometry::monitor_refresh_hz;
 use crate::win32::AtomicHwnd;
 use crate::window::{self, HostWindow, PresentationMode};
@@ -540,14 +539,11 @@ impl IDirectDraw_Impl for Draw_Impl {
                 return Ok(());
             }
         }
-        let replacement = if change_hwnd && !hwnd.is_invalid() {
+        if change_hwnd && !hwnd.is_invalid() {
             crate::win32::original::ensure_installed().inspect_err(|err| {
                 compat::log_msg(&format!("installing Win32 hooks: {err}"));
             })?;
-            Some(Renderer::new(hwnd.0 as isize).map_err(|message| Error::new(E_FAIL, message))?)
-        } else {
-            None
-        };
+        }
         let mut display = self.display.lock();
         if let Some(saved) = display.set_host(None) {
             saved.restore()?;
@@ -566,7 +562,7 @@ impl IDirectDraw_Impl for Draw_Impl {
         self.manage_window.store(manage_window, Ordering::Release);
         if change_hwnd {
             display.presentation.bound_hwnd = make_hwnd(hwnd);
-            display.presentation.renderer = replacement;
+            display.presentation.renderer = None;
             display.consecutive_present_failures = 0;
             self.hwnd.store((!hwnd.is_invalid()).then_some(hwnd));
             self.cached_hz.store(0, Ordering::Relaxed);

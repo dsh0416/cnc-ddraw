@@ -394,6 +394,7 @@ impl Display {
         primary: Option<&SurfaceSlot>,
         allow_current_thread_lock: bool,
     ) -> Result<()> {
+        // A Draw used only for probing or offscreen surfaces must not cover the game window.
         let Some(primary) = primary else {
             shared.dirty.store(false, Ordering::Release);
             shared.flush_scheduled.store(false, Ordering::Release);
@@ -410,10 +411,9 @@ impl Display {
                 Ok(renderer) => {
                     self.presentation.renderer = Some(renderer);
                     self.consecutive_present_failures = 0;
-                    compat::log_msg("recreated wgpu renderer after device/surface loss");
                 }
                 Err(err) => {
-                    compat::log_msg(&format!("renderer recreate deferred: {err}"));
+                    compat::log_msg(&format!("renderer initialization deferred: {err}"));
                     shared.dirty.store(true, Ordering::Release);
                     window::arm_flush_timer(50);
                     return Ok(());

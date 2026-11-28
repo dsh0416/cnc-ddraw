@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 use retour::{Function, GenericDetour};
-use windows::core::{Error, Owned, Result, BOOL, PCSTR, PCWSTR};
+use windows::core::{Error, Owned, Result, BOOL, HSTRING, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{
     E_FAIL, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
@@ -21,13 +21,40 @@ use windows::Win32::UI::WindowsAndMessaging::{DLGPROC, DLGTEMPLATE};
 use super::hotpatch::HotpatchSite;
 use crate::window::{bound_hwnd, hooks};
 
-static GAME_IMAGE: OnceLock<Range<usize>> = OnceLock::new();
+struct GameImages {
+    executable: Range<usize>,
+    poq_graphics: Option<Range<usize>>,
+}
+
+impl GameImages {
+    fn contains(&self, caller: usize, allow_poq_graphics: bool) -> bool {
+        self.executable.contains(&caller)
+            || (allow_poq_graphics
+                && self
+                    .poq_graphics
+                    .as_ref()
+                    .is_some_and(|image| image.contains(&caller)))
+    }
+}
+
+static GAME_IMAGES: OnceLock<GameImages> = OnceLock::new();
 static INSTALL: Mutex<()> = Mutex::new(());
 
-fn game_image() -> Result<Range<usize>> {
-    let info = super::module_info(super::current_module_handle()?)?;
+fn module_image(module: HMODULE) -> Result<Range<usize>> {
+    let info = super::module_info(module)?;
     let base = info.lpBaseOfDll as usize;
     Ok(base..base.checked_add(info.SizeOfImage as usize).ok_or(E_FAIL)?)
+}
+
+fn poq_graphics_image() -> Option<Range<usize>> {
+    let executable = std::env::current_exe().ok()?;
+    if !executable.file_name()?.eq_ignore_ascii_case("Poq.exe") {
+        return None;
+    }
+    let path = HSTRING::from(executable.with_file_name("Gfx3D.dll").as_path());
+    // SAFETY: The HSTRING supplies a terminated path. Poq.exe imports this DLL for its lifetime.
+    let module = unsafe { GetModuleHandleW(PCWSTR(path.as_ptr())) }.ok()?;
+    module_image(module).ok()
 }
 
 fn pin_image(address: *const ()) -> Result<()> {
@@ -181,7 +208,9 @@ macro_rules! win32_hooks {
                 }
 
                 extern "system" fn select(caller: usize) -> Proc {
-                    if GAME_IMAGE.get().is_some_and(|image| image.contains(&caller)) && bound_hwnd().is_some() {
+                    // POQ computes its DirectDraw blit destination in Gfx3D.dll.
+                    let allow_poq_graphics = matches!(stringify!($api), "GetClientRect" | "ClientToScreen");
+                    if GAME_IMAGES.get().is_some_and(|images| images.contains(caller, allow_poq_graphics)) && bound_hwnd().is_some() {
                         hooks::$api
                     } else {
                         super::$api
@@ -274,10 +303,13 @@ win32_hooks! {
 /// Install once, outside the loader lock. Bind/unbind only changes the virtualization policy.
 pub fn ensure_installed() -> Result<()> {
     let _guard = INSTALL.lock();
-    if GAME_IMAGE.get().is_some() {
+    if GAME_IMAGES.get().is_some() {
         return Ok(());
     }
-    let image = game_image()?;
+    let images = GameImages {
+        executable: module_image(super::current_module_handle()?)?,
+        poq_graphics: poq_graphics_image(),
+    };
     if HOOKS.get().is_none() {
         let hooks = Hooks::prepare()?;
         // Publish every original trampoline before internal callers can use any of them.
@@ -287,6 +319,6 @@ pub fn ensure_installed() -> Result<()> {
         .get()
         .expect("hooks prepared under install lock")
         .install()?;
-    let _ = GAME_IMAGE.set(image);
+    let _ = GAME_IMAGES.set(images);
     Ok(())
 }

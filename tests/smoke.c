@@ -46,6 +46,17 @@ static HRESULT WINAPI count_surfaces_cb(IDirectDrawSurface7 *surf, DDSURFACEDESC
     return DDENUMRET_OK;
 }
 
+static unsigned count_present_windows(HWND owner) {
+    unsigned count = 0;
+    HWND window = NULL;
+    while ((window = FindWindowExW(NULL, window, L"CncDdrawWgpuPresent", NULL))) {
+        if (GetWindow(window, GW_OWNER) == owner) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 static int exercise(IDirectDraw *draw, unsigned depth) {
     DDSURFACEDESC desc = {0}, lock = {0};
     IDirectDrawSurface *front = NULL, *back = NULL;
@@ -495,7 +506,7 @@ int main(int argc, char **argv) {
     wchar_t *base;
     HMODULE dll;
     CreateFn create;
-    IDirectDraw *draw = NULL;
+    IDirectDraw *draw = NULL, *secondary = NULL;
     HWND window = NULL;
     GetClientRectFn cached_client_rect = NULL;
     RECT physical_client, client;
@@ -518,7 +529,12 @@ int main(int argc, char **argv) {
         UpdateWindow(window);
         cached_client_rect = (GetClientRectFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetClientRect");
         REQUIRE(cached_client_rect && cached_client_rect(window, &physical_client));
+        // Prince of Qin binds a second DirectDraw object that never creates a primary surface.
+        CHECK(create(NULL, &secondary, NULL));
+        CHECK(IDirectDraw_SetCooperativeLevel(secondary, window, DDSCL_NORMAL));
+        CHECK(IDirectDraw_SetDisplayMode(secondary, 321, 201, 16));
         CHECK(IDirectDraw_SetCooperativeLevel(draw, window, DDSCL_NORMAL));
+        REQUIRE(count_present_windows(window) == 0);
     } else {
         REQUIRE(argc == 1);
     }
@@ -528,6 +544,8 @@ int main(int argc, char **argv) {
         RECT old_rect, fullscreen, restored;
         RECT logical_client = {0, 0, 321, 201};
         MONITORINFO monitor = {0};
+        REQUIRE(count_present_windows(window) == 1);
+        REQUIRE(IDirectDraw_Release(secondary) == 0);
         monitor.cbSize = sizeof(monitor);
         REQUIRE(GetWindowRect(window, &old_rect));
         REQUIRE(GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor));
