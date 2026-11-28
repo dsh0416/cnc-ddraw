@@ -65,8 +65,19 @@ static int exercise(IDirectDraw *draw, unsigned depth) {
     CHECK(IDirectDraw_CreateSurface(draw, &desc, &front, NULL));
     CHECK(IDirectDrawSurface_GetAttachedSurface(front, &caps, &back));
     if (depth == 8) {
+        const DWORD palette_caps = DDPCAPS_8BIT | DDPCAPS_ALLOW256;
+        IDirectDrawPalette *legacy_palette = NULL;
+        PALETTEENTRY readback[256] = {{0}};
+        DWORD reported_caps = 0;
         colors[color].peRed = 200;
-        CHECK(IDirectDraw_CreatePalette(draw, DDPCAPS_8BIT | DDPCAPS_ALLOW256, colors, &palette, NULL));
+        // Road Rash passes the original binary value of DDPCAPS_INITIALIZE.
+        CHECK(IDirectDraw_CreatePalette(draw, palette_caps | 0x08, colors, &legacy_palette, NULL));
+        CHECK(IDirectDrawPalette_GetCaps(legacy_palette, &reported_caps));
+        REQUIRE(reported_caps == palette_caps);
+        CHECK(IDirectDrawPalette_GetEntries(legacy_palette, 0, 0, 256, readback));
+        REQUIRE(memcmp(readback, colors, sizeof(colors)) == 0);
+        IDirectDrawPalette_Release(legacy_palette);
+        CHECK(IDirectDraw_CreatePalette(draw, palette_caps, colors, &palette, NULL));
         CHECK(IDirectDrawSurface_SetPalette(front, palette));
     }
 

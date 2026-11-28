@@ -3,12 +3,16 @@ use windows::core::{implement, IUnknownImpl, Interface, Ref, Result, HRESULT};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_POINTER};
 use windows::Win32::Graphics::DirectDraw::{
     IDirectDraw, IDirectDrawPalette, IDirectDrawPalette_Impl, DDPCAPS_8BIT, DDPCAPS_ALLOW256,
-    DDPCAPS_INITIALIZE, DDPCAPS_PRIMARYSURFACE, DDPCAPS_VSYNC,
+    DDPCAPS_PRIMARYSURFACE, DDPCAPS_VSYNC,
 };
 use windows::Win32::Graphics::Gdi::PALETTEENTRY;
 
 use crate::draw::DisplayShared;
 use crate::ffi::ptr as ffi_ptr;
+
+// Older SDKs encoded DDPCAPS_INITIALIZE as 0x08. DirectDraw now always
+// initializes the entries and omits this bit from GetCaps.
+const LEGACY_DDPCAPS_INITIALIZE: u32 = 0x08;
 
 #[implement(IDirectDrawPalette, Agile = false)]
 struct Palette {
@@ -24,11 +28,8 @@ pub unsafe fn create_palette(
     entries: *const PALETTEENTRY,
     display: Arc<DisplayShared>,
 ) -> Result<IDirectDrawPalette> {
-    let allowed = (DDPCAPS_8BIT
-        | DDPCAPS_ALLOW256
-        | DDPCAPS_INITIALIZE
-        | DDPCAPS_PRIMARYSURFACE
-        | DDPCAPS_VSYNC) as u32;
+    let flags = flags & !LEGACY_DDPCAPS_INITIALIZE;
+    let allowed = (DDPCAPS_8BIT | DDPCAPS_ALLOW256 | DDPCAPS_PRIMARYSURFACE | DDPCAPS_VSYNC) as u32;
     if flags & DDPCAPS_8BIT as u32 == 0 || flags & !allowed != 0 {
         return Err(E_NOTIMPL.into());
     }
