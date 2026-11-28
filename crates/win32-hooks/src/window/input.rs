@@ -5,15 +5,17 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     HTCLIENT, HTTRANSPARENT, MA_NOACTIVATE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCHITTEST, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WS_DISABLED,
+    WM_NCHITTEST, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WS_CHILD,
+    WS_DISABLED,
 };
 
 use crate::config;
 use crate::win32::current_process_id;
 use crate::win32::geometry::{client_rect, client_to_screen, screen_to_client, window_rect};
 use crate::win32::hwnd::{
-    children, class_name, def_window_proc_w, enum_thread_windows, is_child, is_visible, owner,
-    parent, post_message, send_message_w, style, window_process_id, window_thread_id,
+    children, class_name, def_window_proc_w, enum_thread_windows, foreground_window, is_child,
+    is_visible, owner, parent, post_message, send_message_w, style, window_process_id,
+    window_thread_id,
 };
 
 use super::overlay::keep_present_on_top;
@@ -142,8 +144,39 @@ pub(crate) fn is_related_dialog_window(bound: HWND, hwnd: HWND) -> bool {
     false
 }
 
+fn is_disabled(hwnd: HWND) -> bool {
+    (style(hwnd) as u32) & WS_DISABLED.0 != 0
+}
+
+pub(crate) fn is_native_modal_dialog(bound: HWND, hwnd: HWND) -> bool {
+    owner(hwnd).is_some_and(|dialog_owner| {
+        (dialog_owner == bound
+            || is_child(bound, dialog_owner)
+            || owner(dialog_owner) == Some(bound))
+            && is_disabled(dialog_owner)
+            && is_visible(hwnd)
+            && !is_disabled(hwnd)
+            && class_name(hwnd).as_deref() == Some("#32770")
+    })
+}
+
+pub(super) fn is_native_modal_dialog_target(bound: HWND, mut hwnd: HWND) -> bool {
+    while (style(hwnd) as u32) & WS_CHILD.0 != 0 {
+        let Some(parent) = parent(hwnd) else {
+            return false;
+        };
+        hwnd = parent;
+    }
+    is_native_modal_dialog(bound, hwnd)
+}
+
+fn native_modal_is_foreground(bound: HWND) -> bool {
+    let foreground = foreground_window();
+    foreground != bound && is_native_modal_dialog(bound, foreground)
+}
+
 fn hit_test_tree(bound: HWND, root: HWND, lx: i32, ly: i32) -> Option<HWND> {
-    if !is_visible(root) || (style(root) as u32) & WS_DISABLED.0 != 0 {
+    if !is_visible(root) || is_disabled(root) {
         return None;
     }
     let rc = window_rect_in_bound(bound, root)?;
@@ -167,7 +200,11 @@ pub(crate) fn hit_test_logical_child(bound: HWND, lx: i32, ly: i32) -> Option<HW
     if tid != 0 {
         let mut popups = Vec::new();
         enum_thread_windows(tid, |hwnd| {
-            if hwnd != bound && !is_present_hwnd(hwnd) && is_visible(hwnd) {
+            if hwnd != bound
+                && !is_present_hwnd(hwnd)
+                && is_visible(hwnd)
+                && !is_native_modal_dialog(bound, hwnd)
+            {
                 popups.push(hwnd);
             }
             true
@@ -210,19 +247,21 @@ pub(crate) fn present_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
     match msg {
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_NCHITTEST => {
-            return if logical_mode().is_some() {
+            return if logical_mode().is_some_and(|(bound, ..)| !native_modal_is_foreground(bound)) {
                 LRESULT(HTCLIENT as isize)
             } else {
                 LRESULT(HTTRANSPARENT as isize)
             };
         }
         WM_SETCURSOR => {
-            if let Some(bound) = bound_hwnd() {
+            if let Some(bound) = bound_hwnd().filter(|&bound| !native_modal_is_foreground(bound)) {
                 return send_message_w(bound, WM_SETCURSOR, WPARAM(bound.0 as usize), lparam);
             }
         }
         _ if is_mouse_message(msg) => {
-            if let Some((bound, w, h, _)) = logical_mode() {
+            if let Some((bound, w, h, _)) =
+                logical_mode().filter(|&(bound, ..)| !native_modal_is_foreground(bound))
+            {
                 if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
                     keep_present_on_top(bound, hwnd);
                 }

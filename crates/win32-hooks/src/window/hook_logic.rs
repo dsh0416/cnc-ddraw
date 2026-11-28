@@ -27,7 +27,8 @@ use crate::win32::hwnd::{
 
 use super::input::{
     client_origin_in_bound, client_to_logical, hit_test_logical_child, is_mouse_message,
-    is_related_dialog_window, is_same_process_window, logical_to_client,
+    is_native_modal_dialog_target, is_related_dialog_window, is_same_process_window,
+    logical_to_client,
 };
 use super::overlay::ensure_present_on_top_if_active;
 use super::{
@@ -375,7 +376,8 @@ pub(super) fn rewrite_getmsg(msg: &mut MSG) {
     };
     let is_bound = msg.hwnd == bound;
     let is_dialog = is_related_dialog_window(bound, msg.hwnd);
-    if !is_bound && !is_dialog {
+    // Native modal controls already receive native client coordinates from Windows.
+    if !is_bound && (!is_dialog || is_native_modal_dialog_target(bound, msg.hwnd)) {
         return;
     }
     let Ok(mut cursor) = cursor_pos() else {
