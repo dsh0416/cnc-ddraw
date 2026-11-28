@@ -5,7 +5,7 @@ This branch builds a 32-bit Windows `ddraw.dll` from Rust. A DirectDraw 1–7 cl
 ## Supported Games
 
 - Command & Conquer: Red Alert 2
-- Prince of Qin (秦殇, Steam)
+- Prince of Qin (秦殇)
 - Road Rash
 
 ## Build on Windows
