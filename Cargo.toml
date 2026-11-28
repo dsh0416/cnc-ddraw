@@ -33,7 +33,7 @@ windows = { version = "0.62.2", features = [
 
 [package]
 name = "cnc-ddraw"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "MIT"
 publish = false

@@ -2,6 +2,11 @@
 
 This branch builds a 32-bit Windows `ddraw.dll` from Rust. A DirectDraw 1–7 client calls `DirectDrawCreate`, `DirectDrawCreateEx`, or COM `CoCreateInstance`, binds its HWND with `SetCooperativeLevel`, sets a logical display mode, and creates primary or offscreen surfaces. Updates to the primary surface produce frames through wgpu. The default Cargo target is `i686-pc-windows-msvc`.
 
+## Supported Games
+
+- Command & Conquer: Red Alert 2
+- Road Rash
+
 ## Build on Windows
 
 Install Rust and the Visual Studio C++ x86 tools with the Windows SDK. From the **x86 Native Tools Command Prompt**, run
